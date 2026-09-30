@@ -93,7 +93,13 @@ asm(
     "BX    R3\n"                    /* -> R1 (magic 0xE12FFF13) */
     ".word   autoexec_bin_footer\n" /* -> R2 (footer address) */
     "rombaseaddr:\n"
+#ifdef CONFIG_DIGIC_X
+    // firmware_entry is Thumb code on DIGIC X (R6 1.9.0: 0xE0100000 starts with
+    // Thumb "ldr r0,[pc,#0x24]"); BX to the even address would run it as ARM.
+    ".word   "STR(MAIN_FIRMWARE_ADDR)" + 1\n"  /* -> R3 (reset address) */
+#else
     ".word   "STR(MAIN_FIRMWARE_ADDR)"\n"  /* -> R3 (reset address) */
+#endif
     
     /* embed some human-readable version info */
     /* (visible if you open autoexec.bin in e.g. Notepad or ML file manager) */
@@ -133,7 +139,11 @@ asm(
     "checksum_area:"
     ".word   _start\n"
     ".word   autoexec_bin_checksum_end\n"
+#ifdef CONFIG_DIGIC_X
+    ".word   "STR(MAIN_FIRMWARE_ADDR)" + 1\n"  // Thumb, see rombaseaddr
+#else
     ".word   "STR(MAIN_FIRMWARE_ADDR)"\n"
+#endif
     ".word   0x00000000\n"
 
     ".globl blob_start\n"
@@ -173,6 +183,12 @@ static void blink(int n)
 
 static void fail()
 {
+#if defined(CONFIG_DIGIC_X) && !defined(CONFIG_INSTALLER)
+    // disp_init() autodetects DIGIC 4/5 bootloader code around 0xFFFE0000,
+    // which does not exist on DIGIC X, so it would hang silently. Blink the
+    // card LED fast instead (never returns): wrong firmware is then visible.
+    blink(20);
+#endif
     disp_init();
 
 #ifdef CONFIG_INSTALLER

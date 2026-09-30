@@ -40,6 +40,11 @@ extern uint32_t ml_refresh_display_needed;
 /** Returns a pointer to the real BMP vram (or to idle BMP vram) */
 uint8_t * bmp_vram(void);
 
+#ifdef FEATURE_VRAM_RGBA
+/** 1 once bmp_init() has allocated the indexed buffer that bmp_vram() points into */
+int bmp_vram_indexed_ready(void);
+#endif
+
 #ifdef CONFIG_DIGIC_45
 /** Returns a pointer to the real BMP vram, as reported by Canon firmware.
  *  Not to be used directly - it may be somewhere in the middle of VRAM! */

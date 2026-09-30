@@ -336,9 +336,21 @@ static void hello_world()
         msleep(100);
 
     //DryosDebugMsg(0, 15, "==== HELLO WORLD ====");
+    #ifdef CONFIG_R6
+    // bring-up diagnostics: DISPLAY_IS_ON gates the redraw task (bmp.c)
+    DryosDebugMsg(0, 15, "hello_world: DISPLAY_IS_ON=%d", DISPLAY_IS_ON);
+    int led = 0;
+    #endif
     int colour = 4;
     while(1)
     {
+        #ifdef CONFIG_R6
+        // independent sign of life if the display stays dark: card LED blinks
+        // at 2.5 Hz while hello_world runs (non-blocking, unlike info_led_blink)
+        led = !led;
+        if (led) _card_led_on(); else _card_led_off();
+        #endif
+
         bmp_printf(FONT_LARGE, 140, 50, "Hello, World!");
         bmp_printf(FONT_LARGE, 140, 400, "firmware signature = 0x%x", sig);
 

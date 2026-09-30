@@ -346,7 +346,7 @@ void _update_vram_params()
     os.off_43 = 0;
     os.off_169 = 0;
     os.off_1610 = 0;
-#elif defined(CONFIG_R5)
+#elif defined(CONFIG_R5) || defined(CONFIG_R6)
     // false, depends on Panel, HDMI, EVF and if HDMI is clean or not.
     vram_lv.width = 1024;
     vram_lv.height = 682;

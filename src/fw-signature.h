@@ -46,6 +46,7 @@
 #define SIG_R_180    0x1474d0f5 // from E0040000
 #define SIG_R5_152   0xf10e9902 // from E0100000
 #define SIG_R6_150   0x129372a8 // from E0100000
+#define SIG_R6_190   0xe95feb0e // from E0100000
 #define SIG_RP_160   0xECDDA78C // from E0040000
 #define SIG_SX70_111 0x7c81fbc1 // from 0xe004000
 #define SIG_SX740_102 0x53535fe8 // from e0040000

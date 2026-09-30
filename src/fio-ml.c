@@ -197,6 +197,16 @@ static MENU_UPDATE_FUNC(card_test_update)
 
 static void startup_warning(char* msg)
 {
+#ifdef FEATURE_VRAM_RGBA
+    /* _find_ml_card() runs before bmp_init(); drawing now would write
+     * through a NULL buffer into low DryOS RAM. Log only. */
+    if (!bmp_vram_indexed_ready())
+    {
+        DryosDebugMsg(0, 15, "ML startup warning (no bmp yet): %s", msg);
+        return;
+    }
+#endif
+
     /* note: this function is called before load_fonts, so in order to print something, we need to load them */
     _load_fonts();
     
