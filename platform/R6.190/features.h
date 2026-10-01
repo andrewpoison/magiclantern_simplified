@@ -27,6 +27,12 @@
  * (also from the status task in "ON, refresh", only while the EVF is on). */
 #define FEATURE_LV_BUFFER_PROBE
 
+/* M7.3: Overlay > "Histogram (Canon)" (r6_overlays.c): Canon's own LV
+ * histogram bins (RAM reads, confirmed in M7.2a) drawn as a 128x64 box into
+ * ML's indexed buffer. Not FEATURE_GLOBAL_DRAW (zebra.c / lvinfo paths are
+ * not reviewed for the shared layer). Needs CONFIG_R6_LAYER_OWNERSHIP. */
+#define FEATURE_R6_CANON_HISTOGRAM
+
 #undef CONFIG_CRASH_LOG
 #undef CONFIG_PROP_REQUEST_CHANGE
 #undef CONFIG_AUTOBACKUP_ROM

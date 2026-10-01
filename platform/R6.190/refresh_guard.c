@@ -63,7 +63,18 @@
  *     MEM(MEM(0xEA40)+0x18), vrammgr_mode MEM(0xEA94), the GUI display type
  *     MEM(0x8D0C) (GUI_SetDisplayType 0xE0799D48: cmp [0x8D00+0xC] at
  *     0xE0799D4E, stored at 0xE0799DA6) or the XOC layer enable
- *     MEM(MEM(0x14B2E4)+4) (XOC_GetLayerEnable 0xE019E724). During the window
+ *     MEM(MEM(0x14B2E4)+4) (XOC_GetLayerEnable 0xE019E724), M7.3: or the
+ *     XOC handle MEM(0x14B2E4) itself. M7.3: only 300 ms when a poll sees
+ *     exactly the XOC enable change and nothing else, with the same handle,
+ *     readable in this and the previous poll (approved by the user
+ *     2026-10-01 for "only the XOC layer enable changed"; a handle swap or a
+ *     handle turning invalid/valid is a VMIX re-init: 1000 ms; M7.2a camera
+ *     test: 86 episodes > 500 ms, mostly this settle window, e.g. opening the
+ *     ML menu). The
+ *     window has its own start/length (t_settle, settle_len_ms; t_change is
+ *     statistics only); a later change restarts it only if its own window
+ *     ends later, so an XOC-only change never shortens a running 1 s window.
+ *     During the window
  *     a piggyback conversion is still done while Canon is active (RAM writes
  *     into ML's layer only, no XimrExe), so Canon's flushes keep showing ML's
  *     pixels. A late detection only starts the window later (more skipping).
@@ -87,6 +98,9 @@
  * A try-lock (LDREX/STREX via __sync_lock_test_and_set, CPU only, never
  * waited on) serializes the guarded refreshes and the poll: a second ML
  * refresh while one runs is skipped ("busy") and retried by redraw_task.
+ * M7.3: rgba_buffer_clear takes the same lock (r6g_clear_lock: try-lock,
+ * msleep(10) steps, at most 20 ms from bmp.c), so the clear and the
+ * conversion are single writers of ML's pixels in layer 0.
  *
  * Remaining gap (not closable from an ML task): Canon's TRV can start its
  * unlocked MakeContext between the last check (r6g_gate, after the take) and
@@ -135,6 +149,9 @@ extern int lv_action_raw_get(uint32_t * value, int * len);   /* propvalues.c */
 
 #define RG_TAKE_MS       100
 #define RG_SETTLE_MS     1000
+#define RG_SETTLE_XOC_MS 300                 /* XOC layer enable change only: approved 2026-10-01 */
+#define RG_CH_XOC        (1 << 3)            /* change mask bit of the XOC layer enable (w[3]) */
+#define RG_CH_XOC_H      (1 << 4)            /* change mask bit of the XOC handle MEM(0x14B2E4) (w[4]) */
 #define RG_ACT_MS        200                 /* Canon activity window, panel */
 #define RG_ACT_EVF_MS    1000                /* Canon activity window, EVF bit set or mask unknown */
 #define RG_PIG_CONFIRM_MS 500
@@ -155,6 +172,7 @@ static int rg_ep_last_call = 0;
 static int rg_took = 0;                     /* winsys_sem taken in this refresh */
 static uint64_t rg_take_t0_us = 0, rg_take_us = 0, rg_gate_us = 0, rg_exe_us = 0;
 static uint32_t rg_gate_idx = 0;
+static volatile int rg_clear_held = 0;      /* the lock is held by rgba_buffer_clear */
 
 /* ---- guarded reads (same rule as lvprobe.c) ---- */
 static int rg_uc_ok(void)
@@ -202,6 +220,30 @@ static int rg_since(int * t, int now)
 static int rg_recent(int * t, int ms, int now)
 {
     return rg_since(t, now) < ms;
+}
+
+static int rg_settling(int now)
+{
+    return rg_change_seen && rg_recent(&rg.t_settle, rg.settle_len_ms, now);
+}
+
+/* a watched value changed (mask = changed values): start or extend the
+ * settle window; xoc_ok = the XOC handle was readable in this and the
+ * previous poll. XOC enable only (same handle, readable) -> 300 ms,
+ * anything else -> 1000 ms; a running window is never shortened */
+static void rg_settle_start(uint32_t mask, int xoc_ok, int now)
+{
+    int xoc_only = (mask == RG_CH_XOC) && xoc_ok;
+    int len = xoc_only ? RG_SETTLE_XOC_MS : RG_SETTLE_MS;
+    if (xoc_only) rg.settle_xoc++;
+    else if (mask == RG_CH_XOC) rg.settle_xoc_full++;
+    if (rg_settling(now))
+    {
+        int left = (int) rg.settle_len_ms - rg_since(&rg.t_settle, now);
+        if (left >= len) { rg.settle_keep++; return; }
+    }
+    rg.t_settle = now;
+    rg.settle_len_ms = len;
 }
 
 /* DryOS semaphore handles are id << 1 (create_named_semaphore 0xE07D9EF0);
@@ -291,14 +333,17 @@ static void rg_poll_locked(int now)
 {
     rg.polls++;
 
-    uint32_t w[4];
+    uint32_t w[5], xe = 0;
     w[0] = rg_field_or(RD(RG_DISPDEV_PTR), 0x18);
     w[1] = RD(RG_VRAMMGR_MODE);
     w[2] = RD(RG_GUI_DISPTYPE);
-    w[3] = rg_field_or(RD(RG_XOC_TABLE), 4);
-    uint32_t old[4] = { rg.w_mask, rg.w_vm, rg.w_disptype, rg.w_xoc };
+    w[4] = RD(RG_XOC_TABLE);
+    /* validity kept apart from the value: 0xFFFFFFFF is also a real enable value */
+    int xoc_ok = rg_field(w[4], 4, &xe);
+    w[3] = xoc_ok ? xe : 0xFFFFFFFF;
+    uint32_t old[5] = { rg.w_mask, rg.w_vm, rg.w_disptype, rg.w_xoc, rg.w_xoc_h };
     uint32_t mask = 0;
-    for (int i = 0; i < 4; i++)
+    for (int i = 0; i < 5; i++)
         if (w[i] != old[i]) mask |= 1 << i;
     if (rg_w_init && mask)
     {
@@ -306,10 +351,12 @@ static void rg_poll_locked(int now)
         rg.change_mask = mask;
         rg.change_mask_all |= mask;
         rg.t_change = now;
+        rg_settle_start(mask, xoc_ok && rg.w_xoc_ok, now);
         rg_change_seen = 1;
     }
     rg_w_init = 1;
-    rg.w_mask = w[0]; rg.w_vm = w[1]; rg.w_disptype = w[2]; rg.w_xoc = w[3];
+    rg.w_mask = w[0]; rg.w_vm = w[1]; rg.w_disptype = w[2]; rg.w_xoc = w[3]; rg.w_xoc_h = w[4];
+    rg.w_xoc_ok = xoc_ok;
 
     uint32_t idx = RD(RG_BUF_INDEX);
     if (rg_idx_init && idx != rg_last_idx)
@@ -373,11 +420,6 @@ static uint32_t rg_canon_busy(int now)
     return r;
 }
 
-static int rg_settling(int now)
-{
-    return rg_change_seen && rg_recent(&rg.t_change, RG_SETTLE_MS, now);
-}
-
 static int rg_rate_limited(int now)
 {
     return rg_exe_seen && rg_in_lv() && rg_recent(&rg.t_exe_start, RG_RATE_MS, now);
@@ -390,6 +432,7 @@ int r6g_begin(void)
     if (__sync_lock_test_and_set(&rg_lock, 1))
     {
         rg.busy++;
+        if (rg_clear_held) rg.busy_clear++;
         return R6G_SKIP;
     }
 
@@ -547,6 +590,36 @@ void r6g_poll(void)
     if (__sync_lock_test_and_set(&rg_lock, 1))
         return;             /* a guarded refresh is running and polls itself */
     rg_poll_locked(get_ms_clock());
+    __sync_lock_release(&rg_lock);
+}
+
+/* M7.3: single writer for rgba_buffer_clear (see refresh_guard.h) */
+int r6g_clear_lock(int timeout_ms)
+{
+    int waited = 0;
+    while (__sync_lock_test_and_set(&rg_lock, 1))
+    {
+        if (waited >= timeout_ms)
+        {
+            rg.clear_timeouts++;
+            return 0;
+        }
+        msleep(10);
+        waited += 10;
+    }
+    rg_clear_held = 1;
+    rg.clear_locks++;
+    if (waited)
+    {
+        rg.clear_waits++;
+        if ((uint32_t) waited > rg.clear_wait_ms_max) rg.clear_wait_ms_max = waited;
+    }
+    return 1;
+}
+
+void r6g_clear_unlock(void)
+{
+    rg_clear_held = 0;
     __sync_lock_release(&rg_lock);
 }
 

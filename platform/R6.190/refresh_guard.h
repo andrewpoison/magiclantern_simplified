@@ -2,6 +2,8 @@
  * R6.190 M7.2a: guard for ML's OSD refresh, see refresh_guard.c.
  * Used by src/bmp.c and lvprobe.c (counters), both only under
  * CONFIG_R6_REFRESH_GUARD (platform/R6.190/internals.h).
+ * M7.3: the guard's try-lock also makes ML's refresh and rgba_buffer_clear
+ * single writers of ML's pixels in Canon's layer 0 (r6g_clear_lock).
  */
 #ifndef _r6_refresh_guard_h_
 #define _r6_refresh_guard_h_
@@ -39,6 +41,20 @@ void r6g_end(int outcome);
  * piggyback confirmation, duty counters */
 void r6g_poll(void);
 
+/* M7.3: rgba_buffer_clear (clrscr) takes the guard lock, so it never runs
+ * while a refresh converts (refresh has no BMP_LOCK; the conversion only
+ * runs between r6g_begin and r6g_end, which hold the lock). Try-lock, then
+ * msleep(10) steps up to timeout_ms (bmp.c: 20 ms, so clrscr under BMP_LOCK
+ * stalls its task, possibly Canon's GUI task, for at most ~20 ms);
+ * 1 = lock held (call r6g_clear_unlock), 0 = timed out (the caller must not
+ * touch the layer; bmp.c then only clears the indexed buffer and requests a
+ * refresh, which erases ML's owned pixels with the hash check). A refresh
+ * that finds the lock taken is skipped as "busy" and retried (flag stays 1).
+ * Never called with the lock held; refresh never takes BMP_LOCK, so no
+ * deadlock with clrscr's BMP_LOCK. */
+int  r6g_clear_lock(int timeout_ms);
+void r6g_clear_unlock(void);
+
 /* skip / delay reasons, OR-ed per starvation episode */
 #define R6G_R_SETTLE     0x0001
 #define R6G_R_RATE       0x0002
@@ -73,7 +89,7 @@ struct r6_refresh_guard_stats
     uint32_t size;           /* MEM(0x18418) != 0: VMIX output size change */
     uint32_t ctx;            /* XCM pointer invalid or context count != 1 */
     uint32_t img;            /* MEM(0x18424) != 0 && MEM(0x18428) == 0 at a gate: Canon frame in flight */
-    uint32_t settle;         /* < 1000 ms after a display change, Canon quiet: nothing done */
+    uint32_t settle;         /* inside a settle window (1000 ms; 300 ms after an XOC-only change), Canon quiet: nothing done */
     uint32_t rate;           /* < 200 ms after the last ML XimrExe (LV) */
     uint32_t pig_late;       /* Canon became active between r6g_begin and the XimrExe decision */
     uint32_t post_skip;      /* gate skips decided after the take (subset of the above) */
@@ -96,12 +112,29 @@ struct r6_refresh_guard_stats
     uint32_t d_pend, d_size, d_img, d_lock, d_disdraw, d_disref, d_seq, d_evf;
     /* change detection */
     uint32_t changes;        /* watched value changes (settle triggers) */
-    uint32_t change_mask;    /* last change: bit0 disp mask, bit1 vrammgr_mode, bit2 GUI disp type, bit3 XOC enable */
+    uint32_t change_mask;    /* last change: bit0 disp mask, bit1 vrammgr_mode, bit2 GUI disp type, bit3 XOC enable,
+                              * bit4 XOC handle MEM(0x14B2E4) (M7.3) */
     uint32_t change_mask_all;/* OR of all changes */
-    int      t_change;       /* ms */
+    int      t_change;       /* ms, last change (statistics only) */
+    /* M7.3: settle window, kept apart from t_change. 300 ms only when a
+     * change is exactly the XOC layer enable (change mask == bit 3: XOC
+     * handle unchanged) and the enable field was readable through that
+     * handle in this and the previous poll (approved 2026-10-01: "only the
+     * XOC layer enable changed"); a handle swap, a handle becoming invalid or
+     * valid, or any other change: 1000 ms. The enable value itself is not
+     * used for the decision (0xFFFFFFFF is a real enable value on the camera,
+     * M7.1/M7.2a). A later change never shortens a running window (it only
+     * extends it to now + its own length) */
+    int      t_settle;       /* ms, start of the current settle window */
+    uint32_t settle_len_ms;  /* its length: 1000 or 300 */
+    uint32_t settle_xoc;     /* changes that got the 300 ms window (pure XOC enable change, valid handle) */
+    uint32_t settle_xoc_full;/* changes with mask == XOC enable only but the handle invalid now or before: 1000 ms */
+    uint32_t settle_keep;    /* changes that did not shorten a longer running window */
     uint32_t idx_changes;    /* VMIX buffer index changes seen */
     int      t_idx_change;   /* ms */
     uint32_t w_mask, w_vm, w_disptype, w_xoc;   /* last watched values (0xFFFFFFFF = pointer invalid) */
+    uint32_t w_xoc_h;        /* M7.3: last XOC handle MEM(0x14B2E4) (watched value bit 4) */
+    uint32_t w_xoc_ok;       /* M7.3: 1 = the enable field was readable through that handle */
     /* ML XimrExe */
     int      t_exe_start, t_exe_end;            /* ms, last ML XimrExe */
     uint32_t exe_active;     /* 1 while ML is inside XimrExe */
@@ -119,6 +152,12 @@ struct r6_refresh_guard_stats
     int      t_overlap;
     /* clock: a stored timestamp in the future was clamped to now */
     uint32_t clock_back;
+    /* M7.3: rgba_buffer_clear vs refresh (single writer) */
+    uint32_t clear_locks;    /* r6g_clear_lock succeeded */
+    uint32_t clear_waits;    /* of these: had to wait (a refresh held the lock) */
+    uint32_t clear_timeouts; /* r6g_clear_lock timed out: layer not touched */
+    uint32_t clear_wait_ms_max;
+    uint32_t busy_clear;     /* refreshes skipped because a clear held the lock (subset of busy) */
     /* starvation */
     int      t_last_shown;   /* ms, last ML XimrExe or confirmed piggyback */
     uint32_t ep_active;      /* 1 = refresh requested, nothing shown since ep_start */

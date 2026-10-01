@@ -34,6 +34,9 @@
 #ifdef CONFIG_R6_REFRESH_GUARD
 #include "refresh_guard.h"      /* platform/R6.190 */
 #endif
+#ifdef CONFIG_R6_LAYER_OWNERSHIP
+#include "r6_layer.h"           /* platform/R6.190 */
+#endif
 
 //~ int bmp_enabled = 1;
 
@@ -214,6 +217,15 @@ void refresh_yuv_from_rgb(void)
         return;
     }
 
+#ifdef CONFIG_R6_LAYER_OWNERSHIP
+    /* R6: nothing to convert yet, or Canon's layer 0 not as expected (NULL
+     * bitmap_data, other width / height): no conversion, no XimrExe. The
+     * flag stays 1 (redraw_task retries; RAM reads only), counted in
+     * r6_layer_stats (bad_target). */
+    if (!b || !r6_layer_target_ok(rgb_vram_info))
+        return;
+#endif
+
 #ifdef CONFIG_R6_REFRESH_GUARD
     /* R6 (platform/R6.190/refresh_guard.c): settle window, Canon activity,
      * rate limit and Canon VMIX state decide before the conversion. SKIP
@@ -234,7 +246,10 @@ void refresh_yuv_from_rgb(void)
     uint64_t lvprobe_t0 = get_us_clock();
 #endif
 
-#if !defined(CONFIG_INSTALLER)
+#if !defined(CONFIG_INSTALLER) && !defined(CONFIG_R6_LAYER_OWNERSHIP)
+    /* R6 (CONFIG_R6_LAYER_OWNERSHIP): never on the shared Canon layer 0. The
+     * linear copy ignores the 2048 px pitch and would overwrite Canon's whole
+     * OSD in rows 0..253 on every refresh (M7 overlay analysis). */
     if(zebra_should_run()){
         // always draw our stuff, including full alpha
         for (size_t n = 0; n < BMP_VRAM_SIZE; n++){
@@ -245,6 +260,18 @@ void refresh_yuv_from_rgb(void)
     else{
 #endif
 #if defined(CONFIG_DIGIC_X) && !defined(CONFIG_COMPOSITOR_DEDICATED_LAYER)
+#ifdef CONFIG_R6_LAYER_OWNERSHIP
+        /* R6 (platform/R6.190/r6_layer.c): ownership-aware conversion. Skips
+         * empty 32-px blocks, writes ML's opaque pixels, and erases pixels ML
+         * gave up only where layer 0 still holds exactly what ML wrote there,
+         * and only when the guard saw Canon quiet (EXE path; a piggyback
+         * conversion keeps them owned and asks for another refresh below).
+         * Runs under the guard lock (r6g_begin .. r6g_end), so never at the
+         * same time as rgba_buffer_clear. 0 = no ownership table (malloc
+         * failed): the old loop below. */
+        if (!r6_layer_convert(b, rgb_data, r6g_mode == R6G_EXE))
+        {
+#endif
         // kitor FIXME this is the loop altered to work with 2048x1080 layers.
         // Resolution needs confirmation on R6.
         //
@@ -258,7 +285,11 @@ void refresh_yuv_from_rgb(void)
             for(uint x = 0; x < BMPPITCH; x++ )
             {
                 uint32_t rgb = indexed2rgb(*b);
+#ifdef CONFIG_R6_LAYER_OWNERSHIP
+                if ((rgb & 0xff000000) == 0x00000000)   /* alpha test (was '&&', i.e. rgb == 0) */
+#else
                 if ((rgb && 0xff000000) == 0x00000000)
+#endif
                     rgb_data++;
                 else
                     *rgb_data++ = rgb;
@@ -266,6 +297,9 @@ void refresh_yuv_from_rgb(void)
             }
             rgb_row = rgb_row + BMP_LAYER_WIDTH;
         }
+#ifdef CONFIG_R6_LAYER_OWNERSHIP
+        }
+#endif
 #else
         //SJE FIXME benchmark this loop, it probably wants optimising
         for (size_t n = 0; n < BMP_VRAM_SIZE; n++)
@@ -281,7 +315,7 @@ void refresh_yuv_from_rgb(void)
             b++;
         }
 #endif
-#if !defined(CONFIG_INSTALLER)
+#if !defined(CONFIG_INSTALLER) && !defined(CONFIG_R6_LAYER_OWNERSHIP)
     }
 #endif
 
@@ -297,6 +331,11 @@ void refresh_yuv_from_rgb(void)
     {
         /* PIG: Canon's next flushes compose layer 0; SKIP: flag back to 1 */
         r6g_end(r6g_g == R6G_GATE_PIG ? R6G_END_PIGGYBACK : R6G_END_GATE);
+#ifdef CONFIG_R6_LAYER_OWNERSHIP
+        /* piggyback kept given-up pixels: a later refresh (Canon quiet) erases them */
+        if (r6_layer_deferred())
+            ml_refresh_display_needed = 1;
+#endif
         return;
     }
     /* finite wait: on timeout no give, no XimrExe, flag back to 1 */
@@ -343,7 +382,51 @@ void refresh_yuv_from_rgb(void)
 void rgba_buffer_clear()
 {
     if (rgb_vram_info == NULL) return;
-#if defined(CONFIG_DIGIC_X) && !defined(CONFIG_COMPOSITOR_DEDICATED_LAYER)
+#if defined(CONFIG_DIGIC_X) && !defined(CONFIG_COMPOSITOR_DEDICATED_LAYER) && defined(CONFIG_R6_LAYER_OWNERSHIP)
+    /* R6 (platform/R6.190/r6_layer.c): erase only ML's own pixels, and only
+     * where layer 0 still holds exactly what ML wrote there (Canon's pixels
+     * stay). Single writer: the guard lock keeps a refresh (no BMP_LOCK; the
+     * conversion runs under this lock) out; refresh never takes BMP_LOCK, so
+     * waiting here under clrscr's BMP_LOCK cannot deadlock. The wait is
+     * short (20 ms: clrscr also runs in Canon's GUI task). On a timeout the
+     * layer is not touched: the table still owns those pixels, the indexed
+     * buffer is cleared and a refresh is requested, which erases them
+     * (verified). With the table, the whole indexed buffer is zeroed while
+     * the lock is held (clrscr's bmp_fill misses indexed row 539, and no
+     * refresh can re-own the old content before it). Without a table (malloc
+     * failed): the old per-pixel clear. */
+    if (bmp_vram_indexed == NULL || !r6_layer_target_ok(rgb_vram_info)) return;
+    if (!r6g_clear_lock(20))
+    {
+        if (r6_layer_has_table())
+        {
+            memset(bmp_vram_indexed, 0, BMP_VRAM_SIZE);
+            ml_refresh_display_needed = 1;
+        }
+        return;
+    }
+    if (r6_layer_clear((uint32_t *)rgb_vram_info->bitmap_data))
+    {
+        memset(bmp_vram_indexed, 0, BMP_VRAM_SIZE);
+    }
+    else
+    {
+        uint8_t *b = bmp_vram_indexed;
+        uint32_t *rgb_row = (uint32_t *)rgb_vram_info->bitmap_data;
+        for (int y = 0; y < BMP_H_PLUS - BMP_H_MINUS; y++, rgb_row += BMP_LAYER_WIDTH)
+        {
+            for (int x = 0; x < BMPPITCH; x++, b++)
+            {
+                if (indexed2rgb(*b) != 0x00000000)
+                {
+                    *b = 0;
+                    rgb_row[x] = 0x00000000;
+                }
+            }
+        }
+    }
+    r6g_clear_unlock();
+#elif defined(CONFIG_DIGIC_X) && !defined(CONFIG_COMPOSITOR_DEDICATED_LAYER)
     // We draw into Canon's own GUI layer (2048 px pitch, see refresh_yuv_from_rgb).
     // A linear bzero32 of BMP_VRAM_SIZE*4 would wipe layer rows 0..253 over the
     // full width (Canon's pixels included) and miss rows 254..539. Erase only

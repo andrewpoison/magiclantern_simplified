@@ -47,6 +47,15 @@
  * reads only, no Canon writes. */
 #define CONFIG_R6_REFRESH_GUARD
 
+/* M7.3: ownership-aware conversion into Canon's layer 0 (r6_layer.c, hooks
+ * in src/bmp.c refresh_yuv_from_rgb and rgba_buffer_clear): per 32-px block
+ * an ownership mask and a hash of what ML wrote (129.6 KB, ML heap). Pixels
+ * ML stops drawing are erased only where layer 0 still holds exactly ML's
+ * values; empty blocks are skipped; clear and refresh are single writers
+ * (guard lock); never the full-alpha (zebra_should_run) path; alpha test
+ * '&' instead of '&&'. Needs CONFIG_R6_REFRESH_GUARD. */
+#define CONFIG_R6_LAYER_OWNERSHIP
+
 #define CONFIG_TASK_STRUCT_V2_SMP
 #define CONFIG_TASK_ATTR_STRUCT_V5
 

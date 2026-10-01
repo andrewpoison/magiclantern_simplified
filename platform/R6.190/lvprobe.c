@@ -45,6 +45,19 @@
  * is NOT read unless LP_READ_PSR_MASK is defined (needs the user's approval),
  * and then only if the L1 descriptor of its section says Normal memory.
  *
+ * M7.3 (approved by the user 2026-10-01): the PSR mask word 0xDFFC4FA8 is
+ * read (LP_READ_PSR_MASK), still only if the DF section is Normal memory;
+ * "FaceYuv sample" (menu one-shot, and in every snapshot sample) reads a
+ * sparse grid of FaceYuv pixels: Canon's 640x426 8-bit YUV 4:2:2 image on
+ * IBus channel 1 (M7.2a: static window 5, plain RAM), outside IMGVRAM,
+ * only through the uncached alias of a static window 4..7, after checking
+ * the context, the geometry, the buffer pointer (channel 1, aligned) and that
+ * the whole 0x85200-byte buffer lies inside the window, inside channel 1's
+ * RAM end and inside the verified uncached region; recomputed per sample.
+ * 32-bit loads only, nothing written. The status line pads every line to a
+ * fixed width and shows the ownership refresh (r6_layer.c) and the histogram
+ * overlay (r6_overlays.c).
+ *
  * No Canon calls beyond what ML already uses: FIO through the ML wrappers,
  * msleep, task_create, vsnprintf, property handler registration via
  * PROP_HANDLER. No new MMIO by ML; existing M6 accesses: the DIGIC timer
@@ -71,6 +84,12 @@
 #include <stdarg.h>
 #ifdef CONFIG_R6_REFRESH_GUARD
 #include "refresh_guard.h"
+#endif
+#ifdef CONFIG_R6_LAYER_OWNERSHIP
+#include "r6_layer.h"
+#endif
+#ifdef FEATURE_R6_CANON_HISTOGRAM
+#include "r6_overlays.h"
 #endif
 
 /* CONFIG_LIVEVIEW compiles in force_liveview (fake_simple_button(BGMT_LV) in
@@ -147,7 +166,9 @@ extern int lv_action_raw_get(uint32_t * value, int * len);
 #define LP_FY_STATE      0x1ED68   /* LvFaceYuvController: +0xC = ctx (0xB060 bytes, 0xE0808F32), s8 [+0] ring
                                     * index; ctx+0x20: 4 x 64-bit IBus addresses (0xE08092DC..0xE0809386) */
 #define LP_FY_CTX_SIZE   0xB060
-#define LP_FY_RING       0x164614  /* 3 x {flag, CPU address} (per-frame step 0xE0809212, alias 0xE08090C4) */
+#define LP_FY_RING       0x164614  /* 3 x {flag, word}, index s8 MEM(0x1ED68) (per-frame step 0xE0809212); the
+                                    * word goes through 0xE08090C4 (& ~0xC0000000) but on the camera it is
+                                    * RandomData's FrameNum (M7.2a: newest entry == rd.framenum) */
 #define LP_LVIC_SIZE     0x11FC8   /* u16 w, u16 h (QEMU snapshot 0x01AA0280 = 640 x 426) */
 #define LP_MEMIF_DBG     0x7248    /* != 0: SetTarget 0xE01AF274 runs the arbiter and PSR checks (literal 0xE01AF384) */
 #define LP_ARB           0x13290   /* MemifArbiter: [0x13290] == 0xFF -> other branch (0xE081DD0E);
@@ -156,7 +177,8 @@ extern int lv_action_raw_get(uint32_t * value, int * len);
 #define LP_PSR_MASK      0xDFFC4FA8 /* bit ch-1 = DRAM channel in partial self-refresh (0xE013311C, check
                                     * MemifSelfRefresh 0xE0865560). Not an L1 word: in the DF on-chip area
                                     * next to CPU1 code/stack (QEMU: pc 0xDFFC491C, sp 0xDFFC5400) */
-/* #define LP_READ_PSR_MASK */      /* off: reading LP_PSR_MASK needs the user's approval (M7.2a review) */
+#define LP_READ_PSR_MASK            /* approved by the user 2026-10-01: read only if the DF section decodes as
+                                    * Normal memory (M7.2a camera: L1 0xDF054406 = normal) */
 #define LP_L1_DF         (LP_TTBR1 + (0xDFF00000 >> 20) * 4)   /* 0xDFFC37FC: L1 word of the DF section */
 #define LP_DWW_PTR       0xFE988   /* DWindowWrapper handle (init 0xE02A4B14): +0 slot, +0x20 in_use (Acquire 0xE02A4B40) */
 #define LP_GS            0x106EBC  /* GS: +4*drv semaphore, +0xC+4*drv table, drv 0..2 (PrepareGSAddrTbl 0xE03C5510) */
@@ -267,17 +289,21 @@ void lvprobe_refresh_timing(uint32_t conv_us, uint32_t wait_us, uint32_t ximr_us
 }
 
 /* ---- text buffer for the log ------------------------------------------- */
-struct lp_buf { char * p; int len; int cap; };
+struct lp_buf { char * p; int len; int cap; int trunc; };
 
+/* text that does not fit is cut and flagged (trunc), the trailer
+ * (log_truncated / log_bytes / # end) has its own reserve, see lp_snapshot_do */
 static void lp_printf(struct lp_buf * b, const char * fmt, ...)
 {
-    if (!b->p || b->len >= b->cap - 1) return;
+    if (!b->p) return;
+    if (b->len >= b->cap - 1) { b->trunc = 1; return; }
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(b->p + b->len, b->cap - b->len, fmt, ap);
     va_end(ap);
     b->p[b->cap - 1] = 0;
     b->len += strlen(b->p + b->len);
+    if (b->len >= b->cap - 1) b->trunc = 1;
 }
 
 /* a pointer that was not dereferenced */
@@ -463,6 +489,221 @@ static const char * lp_region_name(uint32_t a)
     return a ? "other" : "zero";
 }
 
+/* ---- M7.3: FaceYuv read-only sample (approved 2026-10-01) ---------------
+ * Buffer choice (ROM 1.9.0, LiveViewComp::LvFaceYuvController.c):
+ *  - ctx = MEM(0x1ED68+0xC) (0xB060 bytes); 4 YUV buffers as 64-bit IBus
+ *    addresses at ctx+0x20+8*k (MEMNAVI region 0x10004, count 4 asserted at
+ *    0xE08092E2; copied at 0xE0809376..0xE0809386)
+ *  - the next-buffer getter 0xE0809390 hands out ctx+0x20+8*[ctx+0xB029]
+ *    and then increments that byte mod 4 (0xE08093AC..0xE08093BE)
+ *  - the per-frame step 0xE0809212 stores {flag, FrameNum} into the 3-entry
+ *    ring 0x164614 at index s8 MEM(0x1ED68) and increments it mod 3
+ *    (0xE0809290..0xE08092B6); newest = (index + 2) % 3
+ *  - the consumer request 0xE0809550 (r0 type 0..2, r1 FrameNum, r2 request)
+ *    looks the frame up in that ring (0xE0809602..0xE080961A) and fills a
+ *    record ctx+0x40+0xA0*k, k = [ctx+0xB02A] then incremented mod 4
+ *    (0xE080958A..0xE0809598): +4 = FrameNum (strd at 0xE08095A2), +0x10 =
+ *    the request's 64-bit buffer address (ldrd/strd 0xE08095B8/0xE08095BC)
+ * So: FrameNum of the newest ring entry -> the record with that FrameNum ->
+ * its buffer address, accepted only if it equals one of the 4 buffers
+ * ("rec"). Else the newest record not newer than that frame ("rec_old").
+ * Else the getter rule: (ctx[0xB029] - 2) mod 4, i.e. the buffer handed out
+ * before the most recent one (the most recent may still be written) ("get").
+ * Camera M7.2a: [0xB029] == [0xB02A] in every sample (one buffer per frame). */
+#define LP_FY_W          640
+#define LP_FY_H          426
+#define LP_FY_PITCH      (LP_FY_W * 2)               /* 8-bit 4:2:2, 2 bytes per pixel */
+#define LP_FY_BYTES      (LP_FY_PITCH * LP_FY_H)     /* 0x85200 = burst stride (0xE08093D0) */
+#define LP_FY_GET_IDX    0xB029
+#define LP_FY_REC_IDX    0xB02A
+#define LP_FY_REC        0x40
+#define LP_FY_REC_STRIDE 0xA0
+#define LP_FY_GX         32                          /* sample grid 32 x 24 words */
+#define LP_FY_GY         24
+
+struct lp_fys
+{
+    int st;                  /* 1 = sampled, 0 = refused (why) */
+    const char * why;
+    int t_ms;
+    int ring_i;              /* s8 MEM(0x1ED68): next ring slot */
+    uint32_t ring_flag, ring_frame;
+    int gidx, ridx, gidx_after;
+    int pick, src;           /* buffer 0..3; src 1 rec, 2 rec_old, 3 get */
+    int rec;                 /* record used, -1 none */
+    uint32_t rec_frame;
+    uint32_t lo, hi, cpu;
+    int win;
+    uint32_t n;
+    uint32_t lsum[4], lmin[4], lmax[4];     /* per byte lane of the 32-bit words */
+    uint32_t w0;
+};
+static struct lp_fys lp_fy_last;            /* last menu one-shot */
+static char lp_fy_msg[40] = "";
+
+static int lp_fy_fail(struct lp_fys * r, const char * why)
+{
+    r->st = 0;
+    r->why = why;
+    return 0;
+}
+
+static int lp_fy_sample(struct lp_fys * r)
+{
+    memset(r, 0, sizeof(*r));
+    r->t_ms = get_ms_clock();
+    r->pick = r->rec = r->win = r->ring_i = -1;
+    r->why = "";
+    lp_uc_update();
+
+    uint32_t v, ctx = RD(LP_FY_STATE + 0xC);
+    if (!ctx) return lp_fy_fail(r, "ctx_null");
+    if (!ram_ok(ctx, LP_FY_CTX_SIZE)) return lp_fy_fail(r, "ctx_invalid");
+    if (!rd32(LP_LVIC_SIZE, &v) || v != (((uint32_t) LP_FY_H << 16) | LP_FY_W)) return lp_fy_fail(r, "size");
+    uint32_t g = 0, rr = 0;
+    rd8(ctx + LP_FY_GET_IDX, &g);
+    rd8(ctx + LP_FY_REC_IDX, &rr);
+    r->gidx = g; r->ridx = rr;
+    if (!rd8(LP_FY_STATE, &v)) return lp_fy_fail(r, "ring_idx");
+    r->ring_i = (int8_t) v;
+    if (r->ring_i < 0 || r->ring_i > 2) return lp_fy_fail(r, "ring_idx");
+    int newest = (r->ring_i + 2) % 3;
+    r->ring_flag = RD(LP_FY_RING + 8 * newest);
+    r->ring_frame = RD(LP_FY_RING + 8 * newest + 4);
+
+    uint32_t blo[4], bhi[4];
+    for (int k = 0; k < 4; k++)
+        if (rd64(ctx + 0x20 + 8 * k, &blo[k], &bhi[k]) != 1) return lp_fy_fail(r, "buf_unstable");
+
+    /* ring frame -> record -> buffer */
+    int best = -1, best_d = 1 << 30;
+    for (int k = 0; k < 4; k++)
+    {
+        uint32_t rb = ctx + LP_FY_REC + LP_FY_REC_STRIDE * k, lo, hi;
+        uint32_t f = RD(rb + 4);
+        if (rd64(rb + 0x10, &lo, &hi) != 1) continue;
+        int m = -1;
+        for (int j = 0; j < 4; j++) if (lo == blo[j] && hi == bhi[j]) m = j;
+        if (m < 0) continue;
+        int d = (int) (r->ring_frame - f);
+        if (d < 0 || d >= 16) continue;
+        if (d < best_d) { best_d = d; best = k; r->pick = m; r->rec_frame = f; }
+    }
+    if (best >= 0) { r->rec = best; r->src = best_d == 0 ? 1 : 2; }
+    else
+    {
+        if (g > 3) return lp_fy_fail(r, "get_idx");
+        r->pick = (g + 2) & 3;
+        r->src = 3;
+    }
+    r->lo = blo[r->pick]; r->hi = bhi[r->pick];
+
+    /* pointer: channel 1, aligned, a static window 4..7 (uncached alias),
+     * whole buffer inside the window, channel 1's RAM and the verified region */
+    if (r->hi != 1) return lp_fy_fail(r, "not_ch1");
+    if (r->lo & 3) return lp_fy_fail(r, "misaligned");
+    uint32_t win[12];
+    for (int i = 0; i < 12; i++) win[i] = RD(LP_MEMIF_WIN + 4 * i);
+    if (!win[11]) return lp_fy_fail(r, "win_table_not_copied");
+    if (!lp_uc_ok) return lp_fy_fail(r, "uncached_unverified");
+    r->win = lp_win_for(win, r->lo, r->hi);
+    if (r->win < 4 || r->win > 7) return lp_fy_fail(r, "no_uncached_window");
+    if ((r->lo & 0x0FFFFFFF) + LP_FY_BYTES > 0x10000000) return lp_fy_fail(r, "window_end");
+    uint32_t lim = 0;
+    if (!rd32(LP_CH_LIMIT, &lim) || !lim || r->lo + LP_FY_BYTES < r->lo || r->lo + LP_FY_BYTES > lim)
+        return lp_fy_fail(r, "ch1_end");
+    r->cpu = ((uint32_t) r->win << 28) | (r->lo & 0x0FFFFFFF);
+    if (!lp_is_uncached(r->cpu) || !ram_ok(r->cpu, LP_FY_BYTES)) return lp_fy_fail(r, "range");
+
+    for (int i = 0; i < 4; i++) { r->lmin[i] = 0xFF; r->lmax[i] = 0; }
+    for (int j = 0; j < LP_FY_GY; j++)
+    {
+        uint32_t y = 8 + j * 17;                       /* 8..399 */
+        for (int i = 0; i < LP_FY_GX; i++)
+        {
+            uint32_t x = 4 + i * 20;                   /* even: 4-byte aligned 4:2:2 pair */
+            uint32_t w = RD(r->cpu + y * LP_FY_PITCH + x * 2);
+            if (!r->n) r->w0 = w;
+            for (int l = 0; l < 4; l++)
+            {
+                uint32_t c = (w >> (8 * l)) & 0xFF;
+                r->lsum[l] += c;
+                if (c < r->lmin[l]) r->lmin[l] = c;
+                if (c > r->lmax[l]) r->lmax[l] = c;
+            }
+            r->n++;
+        }
+    }
+    rd8(ctx + LP_FY_GET_IDX, &g);
+    r->gidx_after = g;
+    r->st = 1;
+    return 1;
+}
+
+/* mean x10 of lane l, or of lanes a and b */
+static int lp_fy_m10(const struct lp_fys * r, int a, int b)
+{
+    uint32_t s = r->lsum[a] + (b >= 0 ? r->lsum[b] : 0), n = r->n * (b >= 0 ? 2 : 1);
+    return n ? (int) (s * 10 / n) : 0;
+}
+
+static void lp_fy_log(struct lp_buf * b, const char * p, const struct lp_fys * r)
+{
+    static const char * const srcs[4] = { "none", "rec", "rec_old", "get" };
+    if (r->st) lp_printf(b, "%s.status=ok\n", p);
+    else lp_printf(b, "%s.status=refused(%s)\n", p, r->why);
+    lp_printf(b, "%s.t_ms=%d\n", p, r->t_ms);
+    lp_printf(b, "%s.ring_i=%d\n", p, r->ring_i);
+    lp_printf(b, "%s.ring_frame=%d\n", p, (int) r->ring_frame);
+    lp_printf(b, "%s.ring_flag=%d\n", p, (int) r->ring_flag);
+    lp_printf(b, "%s.get_idx=%d\n", p, r->gidx);
+    lp_printf(b, "%s.rec_idx=%d\n", p, r->ridx);
+    lp_printf(b, "%s.pick=%d\n", p, r->pick);
+    lp_printf(b, "%s.src=%s\n", p, srcs[r->src & 3]);
+    lp_printf(b, "%s.rec=%d\n", p, r->rec);
+    lp_printf(b, "%s.rec_frame=%d\n", p, (int) r->rec_frame);
+    lp_printf(b, "%s.ibus=0x%x:%08x\n", p, (int) r->hi, (int) r->lo);
+    lp_printf(b, "%s.window=%d\n", p, r->win);
+    lp_printf(b, "%s.cpu=0x%08x\n", p, (int) r->cpu);
+    if (!r->st) return;
+    lp_printf(b, "%s.get_idx_after=%d\n", p, r->gidx_after);
+    lp_printf(b, "%s.n=%d\n", p, (int) r->n);
+    lp_printf(b, "%s.w0=0x%08x\n", p, (int) r->w0);
+    for (int l = 0; l < 4; l++)
+    {
+        lp_printf(b, "%s.lane[%d].mean_x10=%d\n", p, l, lp_fy_m10(r, l, -1));
+        lp_printf(b, "%s.lane[%d].min=%d\n", p, l, (int) r->lmin[l]);
+        lp_printf(b, "%s.lane[%d].max=%d\n", p, l, (int) r->lmax[l]);
+    }
+    /* UYVY: U Y0 V Y1 (lanes 0 1 2 3, little endian word); YUYV: Y0 U Y1 V */
+    lp_printf(b, "%s.uyvy.y_mean_x10=%d\n", p, lp_fy_m10(r, 1, 3));
+    lp_printf(b, "%s.uyvy.y_min=%d\n", p, (int) MIN(r->lmin[1], r->lmin[3]));
+    lp_printf(b, "%s.uyvy.y_max=%d\n", p, (int) MAX(r->lmax[1], r->lmax[3]));
+    lp_printf(b, "%s.uyvy.u_mean_x10=%d\n", p, lp_fy_m10(r, 0, -1));
+    lp_printf(b, "%s.uyvy.v_mean_x10=%d\n", p, lp_fy_m10(r, 2, -1));
+    lp_printf(b, "%s.yuyv.y_mean_x10=%d\n", p, lp_fy_m10(r, 0, 2));
+    lp_printf(b, "%s.yuyv.y_min=%d\n", p, (int) MIN(r->lmin[0], r->lmin[2]));
+    lp_printf(b, "%s.yuyv.y_max=%d\n", p, (int) MAX(r->lmax[0], r->lmax[2]));
+    lp_printf(b, "%s.yuyv.u_mean_x10=%d\n", p, lp_fy_m10(r, 1, -1));
+    lp_printf(b, "%s.yuyv.v_mean_x10=%d\n", p, lp_fy_m10(r, 3, -1));
+}
+
+/* text of the last one-shot (menu value; the QEMU test reads it) */
+const char * lvprobe_faceyuv_msg(void) { return lp_fy_msg; }
+
+/* menu one-shot; returns 1 if sampled (QEMU test calls it too) */
+int lvprobe_faceyuv_oneshot(void)
+{
+    int ok = lp_fy_sample(&lp_fy_last);
+    const struct lp_fys * r = &lp_fy_last;
+    if (ok)
+        snprintf(lp_fy_msg, sizeof(lp_fy_msg), "b%d UYVY Y%d, YUYV Y%d", r->pick,
+                 lp_fy_m10(r, 1, 3) / 10, lp_fy_m10(r, 0, 2) / 10);
+    else
+        snprintf(lp_fy_msg, sizeof(lp_fy_msg), "refused: %s", r->why);
+    return ok;
+}
+
 #ifdef CONFIG_R6_REFRESH_GUARD
 static void lp_guard_log(struct lp_buf * b)
 {
@@ -510,12 +751,24 @@ static void lp_guard_log(struct lp_buf * b)
     lp_printf(b, "guard.change_mask=0x%x\n", (int) g->change_mask);
     lp_printf(b, "guard.change_mask_all=0x%x\n", (int) g->change_mask_all);
     LG("t_change", g->t_change);
+    LG("t_settle", g->t_settle);
+    LG("settle_len_ms", g->settle_len_ms);
+    LG("settle_xoc", g->settle_xoc);
+    LG("settle_xoc_full", g->settle_xoc_full);
+    LG("settle_keep", g->settle_keep);
+    LG("clear_locks", g->clear_locks);
+    LG("clear_waits", g->clear_waits);
+    LG("clear_timeouts", g->clear_timeouts);
+    LG("clear_wait_ms_max", g->clear_wait_ms_max);
+    LG("busy_clear", g->busy_clear);
     LG("idx_changes", g->idx_changes);
     LG("t_idx_change", g->t_idx_change);
     LGX("w_mask", g->w_mask);
     LGX("w_vrammgr_mode", g->w_vm);
     LGX("w_gui_disptype", g->w_disptype);
     LGX("w_xoc_enable", g->w_xoc);
+    LGX("w_xoc_handle", g->w_xoc_h);
+    LG("w_xoc_ok", g->w_xoc_ok);
     LG("t_exe_start", g->t_exe_start);
     LG("t_exe_end", g->t_exe_end);
     LG("exe_active", g->exe_active);
@@ -563,6 +816,7 @@ static void lp_census_m72a(struct lp_buf * b)
     uint32_t v;
 
     lp_printf(b, "# M7.2a: LV histogram, RandomData, FaceYuv, dynamic window / GS stage 0, VMIX/WINSYS, guard\n");
+    lp_printf(b, "# M7.3: FaceYuv records + sample, ownership refresh (layer.*), histogram overlay (ovh.*)\n");
 
     /* -- Canon LV histogram (Option 1) -- */
     lp_globs(b, "hist.state", LP_HIST_STATE, 7);                 /* 0x11F44..+0x1B */
@@ -666,6 +920,28 @@ static void lp_census_m72a(struct lp_buf * b)
         lp_printf(b, "fy.lvic_w=%d\n", (int) (v & 0xFFFF));       /* MEM16(0x11FC8) */
         lp_printf(b, "fy.lvic_h=%d\n", (int) (v >> 16));          /* MEM16(0x11FCA) */
     }
+    /* M7.3: buffer indices and the consumer request records (frame -> buffer) */
+    if (fctx && ram_ok(fctx, LP_FY_CTX_SIZE))
+    {
+        if (rd8(fctx + LP_FY_GET_IDX, &v)) lp_printf(b, "fy.get_idx=%d\n", (int) v);
+        if (rd8(fctx + LP_FY_REC_IDX, &v)) lp_printf(b, "fy.rec_idx=%d\n", (int) v);
+        for (int i = 0; i < 4; i++)
+        {
+            uint32_t rb = fctx + LP_FY_REC + LP_FY_REC_STRIDE * i;
+            snprintf(k, sizeof(k), "fy.rec[%d].w0", i);           lp_printf(b, "%s=0x%08x\n", k, (int) RD(rb));
+            snprintf(k, sizeof(k), "fy.rec[%d].frame", i);        lp_printf(b, "%s=%d\n", k, (int) RD(rb + 4));
+            snprintf(k, sizeof(k), "fy.rec[%d].w0c", i);          lp_printf(b, "%s=0x%08x\n", k, (int) RD(rb + 0xC));
+            snprintf(k, sizeof(k), "fy.rec[%d].ibus", i);         lp_fld64(b, k, rb, 0x10);
+            snprintf(k, sizeof(k), "fy.rec[%d].w24", i);          lp_printf(b, "%s=0x%08x\n", k, (int) RD(rb + 0x24));
+        }
+    }
+    {
+        struct lp_fys fs;
+        lp_fy_sample(&fs);
+        lp_fy_log(b, "fy.sample", &fs);
+        if (lp_fy_last.t_ms) lp_fy_log(b, "fy.oneshot", &lp_fy_last);
+        else lp_printf(b, "fy.oneshot=none\n");
+    }
 
     /* -- dynamic memif window, stage 0 (Option 3): preconditions only -- */
     lp_glob(b, "dw.memif_debug", LP_MEMIF_DBG);
@@ -728,6 +1004,81 @@ static void lp_census_m72a(struct lp_buf * b)
     lp_guard_log(b);
 #else
     lp_printf(b, "guard=off\n");
+#endif
+
+#ifdef CONFIG_R6_LAYER_OWNERSHIP
+    {
+        const struct r6_layer_stats * s = r6_layer_stats();
+#define LL(name, val) lp_printf(b, "layer." name "=%d\n", (int) (val))
+        LL("table_bytes", s->table_bytes);
+        LL("alloc_failed", s->alloc_failed);
+        LL("conversions", s->conversions);
+        LL("clears", s->clears);
+        LL("resets", s->resets);
+        LL("slow_lut", s->slow_lut);
+        LL("blk_skip", s->blk_skip);
+        LL("blk_conv", s->blk_conv);
+        LL("blk_owned", s->blk_owned);
+        LL("px_owned", s->px_owned);
+        LL("px_cleared", s->px_cleared);
+        LL("veto_blk", s->veto_blk);
+        LL("veto_px", s->veto_px);
+        LL("clear_px", s->clear_px);
+        LL("clear_veto_blk", s->clear_veto_blk);
+        LL("clear_veto_px", s->clear_veto_px);
+        LL("us_last", s->us_last);
+        LL("us_max", s->us_max);
+        LL("us_min", s->conversions ? s->us_min : 0);
+        LL("us_avg", s->conversions ? (uint32_t) (s->us_sum / s->conversions) : 0);
+        LL("clear_us_last", s->clear_us_last);
+        LL("clear_us_max", s->clear_us_max);
+        LL("defer_blk", s->defer_blk);
+        LL("defer_px", s->defer_px);
+        LL("defer_convs", s->defer_convs);
+        LL("bad_target", s->bad_target);
+        LL("bad_w", s->bad_w);
+        LL("bad_h", s->bad_h);
+        lp_printf(b, "layer.bad_data=0x%08x\n", (int) s->bad_data);
+#undef LL
+    }
+#else
+    lp_printf(b, "layer=off\n");
+#endif
+
+#ifdef FEATURE_R6_CANON_HISTOGRAM
+    {
+        const struct r6_overlay_stats * o = r6_overlay_stats();
+#define LO(name, val) lp_printf(b, "ovh." name "=%d\n", (int) (val))
+        LO("mode", o->mode);
+        lp_printf(b, "ovh.state=%s\n", r6_overlay_reason(o->state));
+        LO("box", o->box);
+        LO("ticks", o->ticks);
+        LO("draws", o->draws);
+        LO("erases", o->erases);
+        LO("torn", o->torn);
+        LO("same_frame", o->same_frame);
+        LO("same_bins", o->same_bins);
+        LO("forced", o->forced);
+        LO("rate", o->rate);
+        for (int i = 0; i < R6H_NREASONS; i++)
+        {
+            snprintf(k, sizeof(k), "ovh.ticks[%d]", i);           lp_printf(b, "%s=%d\n", k, (int) o->reasons[i]);
+        }
+        LO("set", o->set);
+        LO("numpix", o->numpix);
+        LO("frame", o->frame);
+        LO("peak", o->peak);
+        for (int i = 0; i < 4; i++)
+        {
+            snprintf(k, sizeof(k), "ovh.clip[%d]", i);            lp_printf(b, "%s=%d\n", k, (int) o->clip[i]);
+        }
+        LO("t_draw", o->t_draw);
+        LO("draw_us_last", o->draw_us_last);
+        LO("draw_us_max", o->draw_us_max);
+#undef LO
+    }
+#else
+    lp_printf(b, "ovh=off\n");
 #endif
 }
 
@@ -1025,7 +1376,9 @@ static void lp_vmix_poll(struct lp_buf * b)
 }
 
 /* ---- log snapshot -------------------------------------------------------- */
-#define LP_LOG_SIZE (64 * 1024)   /* M7.2a: about 45 KB with the census extension */
+#define LP_LOG_SIZE (96 * 1024)   /* M7.2a camera: up to 51.5 KB; M7.3 adds ~7 KB (QEMU), ~60 KB expected;
+                                   * transient malloc, freed after the write */
+#define LP_LOG_TAIL 128           /* reserve for the trailer lines */
 #define LP_FILE_MAX 99999
 static char lp_snap_msg[32] = "";
 static volatile int lp_snap_busy = 0;     /* one snapshot at a time */
@@ -1058,7 +1411,7 @@ static void lp_snapshot_do(int delay_ms)
     char name[32];
     snprintf(lp_snap_msg, sizeof(lp_snap_msg), "running");
     if (delay_ms) msleep(delay_ms);
-    struct lp_buf b = { .p = malloc(LP_LOG_SIZE), .len = 0, .cap = LP_LOG_SIZE };
+    struct lp_buf b = { .p = malloc(LP_LOG_SIZE), .len = 0, .cap = LP_LOG_SIZE - LP_LOG_TAIL, .trunc = 0 };
     if (!b.p)
     {
         snprintf(lp_snap_msg, sizeof(lp_snap_msg), "no memory");
@@ -1067,7 +1420,7 @@ static void lp_snapshot_do(int delay_ms)
     lp_printf(&b, "# LVPROBE M7.0 snapshot\n");
     lp_printf(&b, "# format: key=value; raw words 0x%%08x, counts decimal, 64-bit IBus 0xHI:LO;\n");
     lp_printf(&b, "# NULL = Canon pointer 0; invalid(...) / uncached_unverified(...) = not dereferenced\n");
-    lp_printf(&b, "probe_stage=M7.2a\n");
+    lp_printf(&b, "probe_stage=M7.3\n");
     lp_printf(&b, "snapshot_seq=%d\n", ++lp_snap_seq);
     lp_printf(&b, "boot_ms=%d\n", get_ms_clock());
     lp_printf(&b, "ml_build_version=%s\n", build_version);
@@ -1079,6 +1432,9 @@ static void lp_snapshot_do(int delay_ms)
     msleep(500);
     lp_census(&b, "B");
     lp_vmix_poll(&b);
+    int trunc = b.trunc;
+    b.cap = LP_LOG_SIZE;                  /* the trailer always fits */
+    lp_printf(&b, "log_truncated=%d\n", trunc);
     lp_printf(&b, "log_bytes=%d\n# end\n", b.len);
     int ok = lp_write_log(&b, name, sizeof(name));
     const char * base = name[0] ? name + 8 : "?";     /* without "ML/LOGS/" */
@@ -1146,11 +1502,19 @@ static const char * lp_ms(char * s, uint32_t ms)
 }
 
 /* one status line: printed only if its text changed (or lp_sl_force);
- * padded with spaces to the width drawn last time */
-#define LP_SLINES 13
+ * M7.3: padded with spaces to a fixed width per font (and never narrower
+ * than the widest text drawn on that line), and, because FONT_MED is
+ * proportional (argnor23: space 7 px, digits 12 px, W 19 px), the pixel
+ * tail of the previous, wider text is filled with COLOR_EMPTY (the pixel
+ * width comes from bmp_printf). The ownership refresh then erases that tail
+ * in layer 0 as well. */
+#define LP_SLINES 15
 #define LP_SLINE_MAX 64
+#define LP_SLINE_PAD_MED   44     /* lines 0..6, FONT_MED */
+#define LP_SLINE_PAD_SMALL 50     /* lines 7.., FONT_SMALL (8 px) */
 static char lp_sl_prev[LP_SLINES][LP_SLINE_MAX];
 static int lp_sl_w[LP_SLINES];
+static int lp_sl_px[LP_SLINES];          /* pixel width drawn last time */
 static int lp_sl_force = 1;
 static uint32_t lp_sl_printed = 0;       /* lines printed (QEMU test reads it) */
 
@@ -1160,10 +1524,14 @@ static void lp_sline_put(int i, int font, int x, int y, char * t)
     if (!lp_sl_force && !strcmp(t, lp_sl_prev[i])) return;
     strcpy(lp_sl_prev[i], t);
     int n = strlen(t);
-    while (n < lp_sl_w[i] && n < LP_SLINE_MAX - 1) t[n++] = ' ';
+    int w = MAX(i < 7 ? LP_SLINE_PAD_MED : LP_SLINE_PAD_SMALL, lp_sl_w[i]);
+    while (n < w && n < LP_SLINE_MAX - 1) t[n++] = ' ';
     t[n] = 0;
     lp_sl_w[i] = n;
-    bmp_printf(font, x, y, "%s", t);
+    int px = bmp_printf(font, x, y, "%s", t);
+    if (px >= 0 && px < lp_sl_px[i])
+        bmp_fill(COLOR_EMPTY, x + px, y, lp_sl_px[i] - px, fontspec_height(font));
+    lp_sl_px[i] = MAX(px, 0);
     lp_sl_printed++;
 }
 /* snprintf (ML) instead of a va_list helper: no new call edge to Canon's vsnprintf */
@@ -1274,6 +1642,27 @@ static void lp_status_draw(int cnt)
              lp_dec(s1, hok & 1, mean[0]), lp_dec(s2, hok & 2, mean[1]),
              lp_dec(s3, hok & 4, mean[2]), lp_dec(s4, hok & 8, mean[3]),
              lp_cnt(c[1], y0), lp_cnt(c[2], y255));
+
+    /* M7.3 o: ownership refresh, last conversion: blocks skipped / converted,
+     * owned pixels, erased pixels and veto blocks (total), conversion us;
+     * v: histogram overlay state, draws, erases; FaceYuv one-shot */
+#ifdef CONFIG_R6_LAYER_OWNERSHIP
+    const struct r6_layer_stats * ls = r6_layer_stats();
+    lp_sline(13, fs, x, ys + 6 * dys, "o sk=%s cv=%s px=%s cl=%s vt=%s %dus",
+             lp_cnt(c[0], ls->blk_skip), lp_cnt(c[1], ls->blk_conv), lp_cnt(c[2], ls->px_owned),
+             lp_cnt(c[3], ls->px_cleared + ls->clear_px), lp_cnt(c[4], ls->veto_blk + ls->clear_veto_blk),
+             (int) ls->us_last);
+#else
+    lp_sline(13, fs, x, ys + 6 * dys, "o off");
+#endif
+#ifdef FEATURE_R6_CANON_HISTOGRAM
+    const struct r6_overlay_stats * os = r6_overlay_stats();
+    lp_sline(14, fs, x, ys + 7 * dys, "v %s d=%s e=%s fy=%s",
+             r6_overlay_reason(os->state), lp_cnt(c[0], os->draws), lp_cnt(c[1], os->erases),
+             lp_fy_msg[0] ? lp_fy_msg : "-");
+#else
+    lp_sline(14, fs, x, ys + 7 * dys, "v off fy=%s", lp_fy_msg[0] ? lp_fy_msg : "-");
+#endif
 }
 
 #define LP_STATUS_TICK_MS  200
@@ -1369,6 +1758,17 @@ static MENU_UPDATE_FUNC(lp_snapshot_update)
     if (lp_snap_msg[0]) MENU_SET_VALUE("%s", lp_snap_msg);
 }
 
+/* RAM reads only (sparse grid, uncached alias, every pointer checked) */
+static MENU_SELECT_FUNC(lp_fy_select)
+{
+    lvprobe_faceyuv_oneshot();
+}
+
+static MENU_UPDATE_FUNC(lp_fy_update)
+{
+    if (lp_fy_msg[0]) MENU_SET_VALUE("%s", lp_fy_msg);
+}
+
 static struct menu_entry lp_menu[] = {
     {
         .name   = "LV probe",
@@ -1398,6 +1798,13 @@ static struct menu_entry lp_menu[] = {
                 .update = lp_snapshot_update,
                 .help   = "Menu closes; show the LV screen within 4 s -> ML/LOGS/LVP*.LOG",
                 .help2  = "Read-only: Canon RAM values, key=value per line.",
+            },
+            {
+                .name   = "FaceYuv sample",
+                .select = lp_fy_select,
+                .update = lp_fy_update,
+                .help   = "One-shot: 32x24 FaceYuv words (Y mean as UYVY / as YUYV).",
+                .help2  = "Read-only, uncached alias; details in the next log snapshot.",
             },
             MENU_EOL
         },
