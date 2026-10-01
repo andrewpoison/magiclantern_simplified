@@ -2,7 +2,14 @@
 #define _tskmon_h_
 
 /* MAX_TASKS must be a value (1<<x) because its used to mask max values */
+#if defined(CONFIG_R6)
+/* R6 1.9.0: task_max 199, 149 tasks running, ML tasks get IDs 140..156;
+ * with 0x80 their stats would alias tasks ID-128 (and loads go out of bounds).
+ * Not for CONFIG_TSKMON_TRACE: its ISR markers 0x80/0x81 would collide. */
+#define TSKMON_MAX_TASKS      0x100
+#else
 #define TSKMON_MAX_TASKS      0x80
+#endif
 #define TSKMON_MAX_TIMER_VAL  0x00100000
 #define TSKMON_PCT_SCALING    1000
 
