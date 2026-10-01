@@ -205,6 +205,13 @@ static void tskmon_stack_checker(struct task *next_task)
             return; // uses 264 of 512, 248 free
         #endif
 
+        #if defined(CONFIG_R6)
+        // both idle tasks (one per core) have 256-byte stacks;
+        // QEMU 1.9.0 with ML hook + tskmon: 128 and 248 bytes free
+        if (streq(task_name, "idle") && free > 64)
+            return;
+        #endif
+
         bmp_printf(FONT(FONT_MED, free < 128 ? COLOR_RED : COLOR_WHITE, COLOR_BLACK), 0, 0, 
             "[%d] %s: stack %s: free=%d used=%d ",
             id, task_name,

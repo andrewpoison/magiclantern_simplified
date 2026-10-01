@@ -35,6 +35,8 @@
 
 // M-Fn 0x22/0x23, movie REC 0x2D/0x2E, AF-ON 0x46/0x47,
 // AE lock (*) 0x48/0x49, AF point select 0x4A/0x4B: not used by ML
+// AF stop (lens) 0x4E/0x4F, SwAfStop_ButtonCBR 0xE010907E: Canon reports the
+// released state (0x4F) once at startup (seen on camera); not used by ML
 
 #define BGMT_Q                       0x2B // SwUNAVI; dialog PRESS_UNAVI_BUTTON
 #define BGMT_UNPRESS_Q               0x2C
