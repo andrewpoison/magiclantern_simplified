@@ -31,6 +31,9 @@
 #include <stdarg.h>
 #include "propvalues.h"
 #include "zebra.h"
+#ifdef CONFIG_R6_REFRESH_GUARD
+#include "refresh_guard.h"      /* platform/R6.190 */
+#endif
 
 //~ int bmp_enabled = 1;
 
@@ -211,6 +214,19 @@ void refresh_yuv_from_rgb(void)
         return;
     }
 
+#ifdef CONFIG_R6_REFRESH_GUARD
+    /* R6 (platform/R6.190/refresh_guard.c): settle window, Canon activity,
+     * rate limit and Canon VMIX state decide before the conversion. SKIP
+     * leaves ml_refresh_display_needed at 1 (redraw_task retries every 50 ms).
+     * PIGGYBACK: Canon is flushing layer 0 itself, so only convert. Both
+     * other modes clear the flag BEFORE the conversion (draws during it set
+     * it again); every exit that shows nothing sets it back to 1 (r6g_end). */
+    int r6g_mode = r6g_begin();
+    if (r6g_mode == R6G_SKIP)
+        return;
+    ml_refresh_display_needed = 0;
+#endif
+
 #ifdef FEATURE_LV_BUFFER_PROBE
     /* R6 M7.0 probe build only: time the conversion, the winsys_sem wait
      * and XimrExe separately */
@@ -274,7 +290,38 @@ void refresh_yuv_from_rgb(void)
 #endif
 
     // trigger Ximr to render to OSD from RGB buffer
-#ifdef CONFIG_DIGIC_VI
+#ifdef CONFIG_R6_REFRESH_GUARD
+    /* Canon became active or a display change was seen during the conversion? */
+    int r6g_g = (r6g_mode == R6G_PIGGYBACK) ? R6G_GATE_PIG : r6g_pretake();
+    if (r6g_g != R6G_GATE_OK)
+    {
+        /* PIG: Canon's next flushes compose layer 0; SKIP: flag back to 1 */
+        r6g_end(r6g_g == R6G_GATE_PIG ? R6G_END_PIGGYBACK : R6G_END_GATE);
+        return;
+    }
+    /* finite wait: on timeout no give, no XimrExe, flag back to 1 */
+    if (take_semaphore(winsys_sem, 100) != 0)
+    {
+        r6g_end(R6G_END_TIMEOUT);
+        return;
+    }
+#ifdef FEATURE_LV_BUFFER_PROBE
+    lvprobe_t2 = get_us_clock();
+#endif
+    /* Canon state again, right before XimrExe */
+    r6g_g = r6g_gate();
+    if (r6g_g != R6G_GATE_OK)
+    {
+        give_semaphore(winsys_sem);
+        r6g_end(r6g_g == R6G_GATE_PIG ? R6G_END_PIGGYBACK : R6G_END_GATE);
+        return;
+    }
+    r6g_exe_begin();
+    XimrExe((void *)XIMR_CONTEXT);
+    r6g_exe_end();
+    give_semaphore(winsys_sem);
+    r6g_end(R6G_END_OK);
+#elif defined(CONFIG_DIGIC_VI)
     XimrExe((void *)XIMR_CONTEXT);
 #else
     take_semaphore(winsys_sem, 0);
@@ -284,7 +331,9 @@ void refresh_yuv_from_rgb(void)
     XimrExe((void *)XIMR_CONTEXT);
     give_semaphore(winsys_sem);
 #endif
+#ifndef CONFIG_R6_REFRESH_GUARD
     ml_refresh_display_needed = 0;
+#endif
 #ifdef FEATURE_LV_BUFFER_PROBE
     lvprobe_refresh_timing((uint32_t)(lvprobe_t1 - lvprobe_t0), (uint32_t)(lvprobe_t2 - lvprobe_t1),
                            (uint32_t)(get_us_clock() - lvprobe_t2));
@@ -336,6 +385,9 @@ void refresh_yuv_from_rgb_task(void *unused)
     #endif
     TASK_LOOP
     {
+#ifdef CONFIG_R6_REFRESH_GUARD
+        r6g_poll();     /* display change detection (settle), piggyback confirmation */
+#endif
         if (ml_refresh_display_needed && !ml_shutdown_requested && DISPLAY_IS_ON)
         {
             refresh_yuv_from_rgb();

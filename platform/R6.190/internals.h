@@ -36,6 +36,17 @@
 #define CONFIG_LIVEVIEW
 #define CONFIG_LV_FOLLOW_TOGGLE
 
+/* M7.2a: guard for ML's OSD refresh (refresh_guard.c, hooks in src/bmp.c
+ * refresh_yuv_from_rgb and refresh_yuv_from_rgb_task). Always on for R6,
+ * independent of the LV probe. ML runs XimrExe on Canon's XCM context 0 from
+ * its own tasks; Canon rebuilds that context without a lock in every
+ * VMIX_TransferRectangleToVram (XCM_MakeContext 0xE0260C16 before
+ * take_semaphore(winsys_sem, 5000) 0xE0260C22). The guard only suppresses or
+ * delays ML's XimrExe: finite take, Canon VMIX state gates, piggyback on
+ * Canon's own flushes, 1 s settle after display changes, 5 Hz in LV. RAM
+ * reads only, no Canon writes. */
+#define CONFIG_R6_REFRESH_GUARD
+
 #define CONFIG_TASK_STRUCT_V2_SMP
 #define CONFIG_TASK_ATTR_STRUCT_V5
 

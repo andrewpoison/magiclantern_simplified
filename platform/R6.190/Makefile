@@ -19,6 +19,7 @@ PLATFORM_ARCH = armv7-a
 ML_BOOT_OBJ = boot-d678.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/function_overrides.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/lvprobe.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/refresh_guard.o
 
 include ../Makefile
 .DEFAULT_GOAL := $(BUILD_DIR)/cam_complete
