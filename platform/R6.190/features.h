@@ -19,6 +19,14 @@
  * one SET press would write ROM (private) or LV buffers to the card */
 #define CONFIG_NO_DUMP_MENUS
 
+/* M7.0: Debug > "LV probe" (lvprobe.c), read-only LiveView census:
+ * plain RAM reads of Canon globals, status line in ML's own layer-0 pixels,
+ * one new file ML/LOGS/LVPnnnnn.LOG per snapshot. Also times
+ * refresh_yuv_from_rgb (bmp.c). No new MMIO by ML; existing M6 accesses:
+ * DIGIC timer 0xC0242014 (read more often in this build), Canon XimrExe
+ * (also from the status task in "ON, refresh", only while the EVF is on). */
+#define FEATURE_LV_BUFFER_PROBE
+
 #undef CONFIG_CRASH_LOG
 #undef CONFIG_PROP_REQUEST_CHANGE
 #undef CONFIG_AUTOBACKUP_ROM

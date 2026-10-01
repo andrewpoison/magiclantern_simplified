@@ -235,9 +235,52 @@ PROP_HANDLER(PROP_VIDEO_MODE)
 }
 
 #ifdef CONFIG_LIVEVIEW
+#ifdef CONFIG_LV_FOLLOW_TOGGLE
+/* R6.190 (M7.0, platform/R6.190/internals.h): lv follows PROP_LV_ACTION
+ * only while Debug > LV probe > "LV flag follows Canon" is on (default off,
+ * not saved in the config). With the switch off, lv stays 0 exactly as in
+ * M6; the raw value is still recorded, so switching on takes effect at once.
+ * Switching does not run the other PROP_LV_ACTION handlers (zebra, audio,
+ * fps-engio); they follow at the next delivery. */
+static volatile int lv_follows_canon = 0;
+static volatile int lv_action_seen = 0;
+static volatile uint32_t lv_action_raw = 0;
+static volatile int lv_action_len = 0;
+
+extern void vram_params_set_dirty();
+
+int lv_follow_canon_get(void) { return lv_follows_canon; }
+
+void lv_follow_canon_set(int on)
+{
+    lv_follows_canon = on ? 1 : 0;
+    asm volatile ("dmb" ::: "memory");   /* flag before lv (handler on the other core) */
+    lv = (lv_follows_canon && lv_action_seen) ? !lv_action_raw : 0;
+    vram_params_set_dirty();
+}
+
+/* returns 0 until PROP_LV_ACTION was delivered at least once */
+int lv_action_raw_get(uint32_t * value, int * len)
+{
+    if (value) *value = lv_action_raw;
+    if (len) *len = lv_action_len;
+    return lv_action_seen;
+}
+#endif
+
 PROP_HANDLER( PROP_LV_ACTION )
 {
+#ifdef CONFIG_LV_FOLLOW_TOGGLE
+    lv_action_raw = buf[0];
+    lv_action_len = len;
+    lv_action_seen = 1;
+    lv = lv_follows_canon ? !buf[0] : 0;
+    /* the menu task may have switched off meanwhile: never leave lv = 1 */
+    asm volatile ("dmb" ::: "memory");
+    if (!lv_follows_canon) lv = 0;
+#else
     lv = !buf[0];
+#endif
 }
 #endif
 

@@ -18,6 +18,24 @@
  * (get_malloc_info 0xE037C234 reads +4, +8, +0x18, +0x1C, +0x20) */
 #define CONFIG_MALLOC_STRUCT_V2
 
+/* LiveView flag (M7.0): ML sets lv = !PROP_LV_ACTION (propvalues.c).
+ * PROP_LV_ACTION 0x80050022: 0 = LV started, 1 = LV stopped.
+ * - DispOperator property handler compares 0x80050022 at 0xE0750DCA and
+ *   prints "PROP_LV_ACTION = %d" (string 0xE0751124)
+ * - GUI_SetLvAction 0xE07AA730 stores the value at [[0x16954]+0x1828] and
+ *   requests the property
+ * - GuiMainEventHandler.c handle_START_LV_XX calls GUI_SetLvAction(0) at
+ *   0xE0BD3830
+ * - GmtFactory lv_start requests PROP_LV_ACTION = 0 with length 4 at
+ *   0xE011DC16 (literal 0x80050022 at 0xE011DFCC, value r5 = 0 from
+ *   0xE011DBD2, bl _prop_request_change 0xE07C2854)
+ * On R6.190 lv only follows the property while Debug > LV probe > "LV flag
+ * follows Canon" is on (default off): CONFIG_LV_FOLLOW_TOGGLE, propvalues.c.
+ * CONFIG_LIVEVIEW also compiles in force_liveview and the LV AF frame code;
+ * lvprobe.c refuses to build with the features that call them. */
+#define CONFIG_LIVEVIEW
+#define CONFIG_LV_FOLLOW_TOGGLE
+
 #define CONFIG_TASK_STRUCT_V2_SMP
 #define CONFIG_TASK_ATTR_STRUCT_V5
 

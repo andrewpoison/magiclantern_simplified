@@ -211,6 +211,13 @@ void refresh_yuv_from_rgb(void)
         return;
     }
 
+#ifdef FEATURE_LV_BUFFER_PROBE
+    /* R6 M7.0 probe build only: time the conversion, the winsys_sem wait
+     * and XimrExe separately */
+    extern void lvprobe_refresh_timing(uint32_t conv_us, uint32_t wait_us, uint32_t ximr_us);
+    uint64_t lvprobe_t0 = get_us_clock();
+#endif
+
 #if !defined(CONFIG_INSTALLER)
     if(zebra_should_run()){
         // always draw our stuff, including full alpha
@@ -262,15 +269,26 @@ void refresh_yuv_from_rgb(void)
     }
 #endif
 
+#ifdef FEATURE_LV_BUFFER_PROBE
+    uint64_t lvprobe_t1 = get_us_clock(), lvprobe_t2 = lvprobe_t1;
+#endif
+
     // trigger Ximr to render to OSD from RGB buffer
 #ifdef CONFIG_DIGIC_VI
     XimrExe((void *)XIMR_CONTEXT);
 #else
     take_semaphore(winsys_sem, 0);
+#ifdef FEATURE_LV_BUFFER_PROBE
+    lvprobe_t2 = get_us_clock();
+#endif
     XimrExe((void *)XIMR_CONTEXT);
     give_semaphore(winsys_sem);
 #endif
     ml_refresh_display_needed = 0;
+#ifdef FEATURE_LV_BUFFER_PROBE
+    lvprobe_refresh_timing((uint32_t)(lvprobe_t1 - lvprobe_t0), (uint32_t)(lvprobe_t2 - lvprobe_t1),
+                           (uint32_t)(get_us_clock() - lvprobe_t2));
+#endif
 }
 
 void rgba_buffer_clear()
