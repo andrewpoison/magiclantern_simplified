@@ -412,10 +412,23 @@ PROP_HANDLER(PROP_ABORT)
 }
 
 #if defined(CONFIG_DIGIC_8X)
+#ifdef CONFIG_R6_BRINGUP
+volatile int r6_shutdown_reason = -1; // shown by the bring-up status line (init.c)
+#endif
 PROP_HANDLER(PROP_SHUTDOWN_REASON)
 {
     DryosDebugMsg(0, 15, "SHUTDOWN REASON %d", buf[0]);
+#ifdef CONFIG_R6_BRINGUP
+    r6_shutdown_reason = buf[0];
+#endif
+#ifdef CONFIG_R6
+    // R6: the value delivered at registration (before ml_started) is
+    // unverified; a non-zero value there must not stop ML silently
+    extern int ml_started;
+    if (buf[0] != 0 && ml_started)  ml_shutdown();
+#else
     if (buf[0] != 0)  ml_shutdown();
+#endif
 }
 #endif
 

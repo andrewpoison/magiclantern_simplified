@@ -5402,7 +5402,7 @@ handle_ml_menu_keys(struct event * event)
     case BGMT_UNPRESS_SET:
         return 0; // block Canon menu redraws
 
-#if defined(CONFIG_7D)
+#if defined(CONFIG_7D) || defined(CONFIG_R6)
     case BGMT_JOY_CENTER:
 #endif
     case BGMT_PRESS_SET:
@@ -5477,6 +5477,18 @@ handle_ml_menu_keys(struct event * event)
             arg4
         );
         */
+#ifdef CONFIG_R6
+        // The ML menu sits on top of Canon's (invisible) MENU dialog, which
+        // would act on keys ML does not handle (joystick centre = SET, touch,
+        // QCD1, lens ring, M-Fn, AF-ON, *, ...). Block button codes and touch
+        // (0xBF..0xCF); pass shutter (0x9F..0xA2) and GUICMD system events
+        // (lock switch, card/battery cover, OLC), ML's own fake events and
+        // internal ML events (param < 0, never passed to Canon anyway).
+        if (!IS_FAKE(event) && event->param >= 0 &&
+            (event->param < BGMT_PRESS_HALFSHUTTER ||
+             (event->param >= 0xBF && event->param <= 0xCF)))
+            return 0;
+#endif
         return 1;
     }
 

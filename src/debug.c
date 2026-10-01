@@ -123,6 +123,10 @@ void info_led_blink(int times, int delay_on, int delay_off)
     }
 }
 
+// CONFIG_NO_DUMP_MENUS (platform features.h): no "Dump ROM and RAM" /
+// "Dump image buffers" entries; they run on a single SET press and would put
+// ROM contents (private) or LV buffers from unverified addresses on the card.
+#ifndef CONFIG_NO_DUMP_MENUS
 #ifdef CONFIG_DIGIC_8X
 // This func is used when backing up ROM from Debug menu.
 //
@@ -308,6 +312,7 @@ static void dump_img_task(void* priv, int unused)
     NotifyBox(2000, "Done :)");
     beep();
 }
+#endif // CONFIG_NO_DUMP_MENUS
 
 #ifdef FEATURE_GUIMODE_TEST
 // beware, might be dangerous, some gui modes will give errors
@@ -978,6 +983,7 @@ static struct menu_entry debug_menus[] = {
         .help = "Dialog templates (up/dn) and color palettes (left/right)"
     },*/
 #endif
+#ifndef CONFIG_NO_DUMP_MENUS
     {
         .name        = "Dump ROM and RAM",
         .priv        = dump_rom_task,
@@ -996,6 +1002,7 @@ static struct menu_entry debug_menus[] = {
         .select      = run_in_separate_task,
         .help = "Dump all image buffers (LV, HD, RAW) from current video mode."
     },
+#endif // CONFIG_NO_DUMP_MENUS
 #ifdef FEATURE_UNMOUNT_SD_CARD
     {
         .name        = "Unmount SD card",

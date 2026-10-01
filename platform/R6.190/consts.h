@@ -41,7 +41,10 @@
  */
 #define GUIMODE_PLAY 0x2002
 #define GUIMODE_MENU 0x2003
-#define GUIMODE_ML_MENU (lv ? 0xC048 : GUIMODE_MENU) // 0xC048: R5, unverified
+// lv is always 0 on R6 for now (no CONFIG_LIVEVIEW), so this is 0x2003. 0xC048
+// exists on R6 (movw + SetGUIRequestMode at 0xE07543B4, compared in the
+// PRESS_UNAVI handler 0xE0790296); its meaning in LV is not verified.
+#define GUIMODE_ML_MENU (lv ? 0xC048 : GUIMODE_MENU)
 
 #define CANON_SHUTTER_RATING 300000 // Canon's official rating for R6
 
@@ -118,7 +121,9 @@ extern int winsys_bmp_dirty_bit_neg;
 #define AF_BTN_STAR 2
 // another block copied from 50D (via R5)
 #define GUIMODE_WB 5
-#define GUIMODE_FOCUS_MODE 9
+// 9 is the 50D value, unverified on R6. With BGMT_Q defined, a match would make
+// Q on the shooting screen open the ML focus menu (menu.c) - off until known.
+#define GUIMODE_FOCUS_MODE -1
 #define GUIMODE_DRIVE_MODE 8
 #define GUIMODE_PICTURE_STYLE 4
 #define GUIMODE_Q_UNAVI 0x18

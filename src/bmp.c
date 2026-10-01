@@ -276,7 +276,30 @@ void refresh_yuv_from_rgb(void)
 void rgba_buffer_clear()
 {
     if (rgb_vram_info == NULL) return;
+#if defined(CONFIG_DIGIC_X) && !defined(CONFIG_COMPOSITOR_DEDICATED_LAYER)
+    // We draw into Canon's own GUI layer (2048 px pitch, see refresh_yuv_from_rgb).
+    // A linear bzero32 of BMP_VRAM_SIZE*4 would wipe layer rows 0..253 over the
+    // full width (Canon's pixels included) and miss rows 254..539. Erase only
+    // the pixels ML has drawn, and clear the indexed pixel in the same pass
+    // (first), so a concurrent refresh_yuv_from_rgb (no BMP_LOCK) cannot
+    // write the old pixel back and then skip it as transparent forever.
+    if (bmp_vram_indexed == NULL) return;
+    uint8_t *b = bmp_vram_indexed;
+    uint32_t *rgb_row = (uint32_t *)rgb_vram_info->bitmap_data;
+    for (int y = 0; y < BMP_H_PLUS - BMP_H_MINUS; y++, rgb_row += BMP_LAYER_WIDTH)
+    {
+        for (int x = 0; x < BMPPITCH; x++, b++)
+        {
+            if (indexed2rgb(*b) != 0x00000000)
+            {
+                *b = 0;
+                rgb_row[x] = 0x00000000;
+            }
+        }
+    }
+#else
     bzero32(rgb_vram_info->bitmap_data, BMP_VRAM_SIZE*4);
+#endif
 }
 
 #if defined(CONFIG_INSTALLER)
@@ -304,7 +327,13 @@ void refresh_yuv_from_rgb_task(void *unused)
 }
 
 static uint32_t indexed2rgbLUT[RGB_LUT_SIZE] = {
+#ifdef CONFIG_R6
+    // R6: opaque 0xff000000 displays as see-through on Canon's layer 0
+    // (M5 photo); near-black as a test for a colour key on pure black
+    0x00000000, 0xffebebeb, 0xff010101, 0x00000000, 0xffa33800, // 0
+#else
     0x00000000, 0xffebebeb, 0xff000000, 0x00000000, 0xffa33800, // 0
+#endif
     0xff20bbd9, 0xff009900, 0xff01ad01, 0xffea0001, 0xff0042d4, // 5
     0xffb9bb8c, 0xff1c237e, 0xffc80000, 0xff0000a8, 0xffc9009a, // 10
     0xffd1c000, 0xffe800e8, 0xffd95e4c, 0xff003e4b, 0xffe76d00, // 15
@@ -735,10 +764,12 @@ getfilesize_fail:
 
 void clrscr()
 {
-    BMP_LOCK( bmp_fill( 0x0, BMP_W_MINUS, BMP_H_MINUS, BMP_TOTAL_WIDTH, BMP_TOTAL_HEIGHT ); )
     #ifdef FEATURE_VRAM_RGBA
-    // clear RGBA buffer
-    rgba_buffer_clear();
+    // clear RGBA buffer first: on DIGIC X (shared Canon layer) it needs
+    // the indexed buffer contents to know which pixels are ours
+    BMP_LOCK( rgba_buffer_clear(); bmp_fill( 0x0, BMP_W_MINUS, BMP_H_MINUS, BMP_TOTAL_WIDTH, BMP_TOTAL_HEIGHT ); )
+    #else
+    BMP_LOCK( bmp_fill( 0x0, BMP_W_MINUS, BMP_H_MINUS, BMP_TOTAL_WIDTH, BMP_TOTAL_HEIGHT ); )
     #endif
 
 }

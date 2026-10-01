@@ -104,6 +104,14 @@ struct gui_main_struct {
 
 extern struct gui_main_struct gui_main_struct;
 
+#ifdef CONFIG_R6_BRINGUP
+// real (non-ML) button events seen by ml_gui_main_task, shown by init.c:
+// count, last 4 codes (< 0x9F, press and release) and Erase presses
+volatile int r6_ev_count = 0;
+volatile int r6_ev_hist[4] = { -1, -1, -1, -1 };
+volatile int r6_ev_trash = 0;
+#endif
+
 void ml_gui_main_task()
 {
     struct event * event = NULL;
@@ -134,6 +142,20 @@ void ml_gui_main_task()
         }
 
         index = event->type;
+
+        #ifdef CONFIG_R6_BRINGUP
+        if (event->type == 0 && event->param >= 0 &&
+            event->param < BGMT_PRESS_HALFSHUTTER && !IS_FAKE(event))
+        {
+            r6_ev_count++;
+            r6_ev_hist[0] = r6_ev_hist[1];
+            r6_ev_hist[1] = r6_ev_hist[2];
+            r6_ev_hist[2] = r6_ev_hist[3];
+            r6_ev_hist[3] = event->param;
+            if (event->param == BGMT_TRASH)
+                r6_ev_trash++;
+        }
+        #endif
 
         if (!magic_is_off())
         {

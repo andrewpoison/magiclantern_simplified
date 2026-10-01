@@ -417,6 +417,70 @@ static void led_fade(int arg1, void * on)
     }
 }
 
+#ifdef CONFIG_R6_BRINGUP
+/* M6 bring-up diagnostics, remove after M6.
+ * Until ml_started: card LED flashes N times, then pauses (N = boot stage;
+ * 9 = bmp buffer missing after call_init_funcs, ML init stopped).
+ * From stage 3 (bmp_init done) until the ML menu has been opened and closed
+ * once: two status lines at (40,220), below Canon's top bar. */
+static volatile int r6_boot_stage = 0;
+extern volatile int r6_ev_count, r6_ev_hist[4], r6_ev_trash;   // gui.c
+extern volatile int r6_shutdown_reason;                         // tasks.c
+extern int dofpreview;                                          // propvalues.c
+
+static void r6_bringup_task()
+{
+    int menu_seen = 0;
+    /* an early ml_shutdown (before ml_started) is a failure to report (sd=1) */
+    while (!(ml_shutdown_requested && ml_started))
+    {
+        int stage = r6_boot_stage;
+        if (!ml_started)
+        {
+            for (int i = 0; i < stage; i++)
+            {
+                _card_led_on();  msleep(150);
+                _card_led_off(); msleep(250);
+            }
+            msleep(1200);
+        }
+        else
+        {
+            msleep(500);
+        }
+
+        if (gui_menu_shown()) { menu_seen = 1; continue; }
+        if (menu_seen) break;        /* menu opened and closed: done */
+        /* bmp buffer is allocated by bmp_init; if that malloc failed,
+         * drawing would scribble over low DryOS RAM */
+        if (stage < 3 || stage == 9 || !bmp_vram_indexed_ready()) continue;
+
+        char k[4][4];
+        for (int i = 0; i < 4; i++)
+        {
+            if (r6_ev_hist[i] < 0) snprintf(k[i], sizeof(k[i]), "--");
+            else snprintf(k[i], sizeof(k[i]), "%02x", r6_ev_hist[i] & 0xFF);
+        }
+
+        bmp_printf(FONT_MED, 40, 220,
+            "ML st=%d sd=%d sr=%d d=%d gs=%d gm=%x df=%d ",
+            stage, ml_shutdown_requested, r6_shutdown_reason,
+            (int)DISPLAY_IS_ON, gui_state, (int)CURRENT_GUI_MODE, dofpreview);
+        bmp_printf(FONT_MED, 40, 250,
+            "ev=%d t=%d k=%s %s %s %s ",
+            r6_ev_count, r6_ev_trash, k[0], k[1], k[2], k[3]);
+
+        if (ml_started)
+            ml_refresh_display_needed = 1;
+        else
+            refresh_yuv_from_rgb();  /* redraw_task not running yet */
+    }
+}
+#define R6_STAGE(n) r6_boot_stage = (n)
+#else
+#define R6_STAGE(n)
+#endif
+
 /* This runs ML initialization routines and starts user tasks.
  * Unlike init_task, from here we can do file I/O and others.
  */
@@ -473,6 +537,11 @@ static void my_big_init_task()
     // into the array, so we can find first item knowing any other.
     first_task = current_task->self - ((current_task->taskId & 0xffff) - 1);
 
+#ifdef CONFIG_R6_BRINGUP
+    R6_STAGE(1);
+    task_create("r6_bringup", 0x1e, 0x2000, r6_bringup_task, 0);
+#endif
+
 #ifdef CONFIG_HELLO_WORLD
     hello_world();
     return;
@@ -491,7 +560,18 @@ static void my_big_init_task()
     _ml_cbr_init();
     menu_init();
     debug_init();
+    R6_STAGE(2);
     call_init_funcs(); // among other things, this initialises modules
+    R6_STAGE(3);
+#ifdef CONFIG_R6_BRINGUP
+    if (!bmp_vram_indexed_ready())
+    {
+        /* bmp_init's malloc failed: menu, console and notify box would draw
+         * into low DryOS RAM. Stop here, LED shows 9 flashes. */
+        R6_STAGE(9);
+        return;
+    }
+#endif
     msleep(200); // leave some time for property handlers to run
 
 #ifdef CONFIG_XF605
@@ -506,6 +586,7 @@ static void my_big_init_task()
 
     /* Read ML config. if feature disabled, nothing happens */
     config_load();
+    R6_STAGE(4);
     
     debug_init_stuff();
 
@@ -538,11 +619,13 @@ static void my_big_init_task()
         ml_tasks++;
     }
     
+    R6_STAGE(5);
     msleep(500);
 #ifdef CONFIG_XF605
     uart_printf("hello from ML, after late tasks");
 #endif
 
+    R6_STAGE(6);
     ml_started = 1;
 }
 
