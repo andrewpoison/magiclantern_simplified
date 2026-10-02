@@ -33,6 +33,23 @@
  * not reviewed for the shared layer). Needs CONFIG_R6_LAYER_OWNERSHIP. */
 #define FEATURE_R6_CANON_HISTOGRAM
 
+/* M7.4: ML's own overlays from Canon's FaceYuv image (CONFIG_R6_GLOBAL_DRAW,
+ * internals.h), Overlay menu. All default OFF, Global Draw not saved.
+ * Deliberately left out (MMIO, writes into Canon image buffers, Canon GUI
+ * calls, files, or not reviewed): FEATURE_ZEBRA_FAST (EngDrvOut),
+ * FEATURE_FOCUS_PEAK (reads YUV422_LV_BUFFER_DISPLAY_ADDR = 0),
+ * FEATURE_MAGIC_ZOOM (writes the LV buffer), CONFIG_DISPLAY_FILTERS,
+ * FEATURE_VECTORSCOPE, FEATURE_CROPMARKS / FEATURE_GHOST_IMAGE (card files,
+ * Canon redraws), FEATURE_OVERLAYS_IN_PLAYBACK_MODE, FEATURE_LV_DISPLAY_PRESETS;
+ * r6_gdraw.c #errors on them. ML's histogram and "Histogram (Canon)" share
+ * the box position and are mutually exclusive (r6_overlays.c). */
+#define FEATURE_GLOBAL_DRAW
+#define FEATURE_ZEBRA
+#define FEATURE_FALSE_COLOR
+#define FEATURE_WAVEFORM
+#define FEATURE_SPOTMETER
+#define FEATURE_HISTOGRAM
+
 #undef CONFIG_CRASH_LOG
 #undef CONFIG_PROP_REQUEST_CHANGE
 #undef CONFIG_AUTOBACKUP_ROM

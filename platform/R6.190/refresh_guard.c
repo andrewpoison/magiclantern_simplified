@@ -173,6 +173,9 @@ static int rg_took = 0;                     /* winsys_sem taken in this refresh 
 static uint64_t rg_take_t0_us = 0, rg_take_us = 0, rg_gate_us = 0, rg_exe_us = 0;
 static uint32_t rg_gate_idx = 0;
 static volatile int rg_clear_held = 0;      /* the lock is held by rgba_buffer_clear */
+#ifdef CONFIG_R6_GLOBAL_DRAW
+static int rg_t_disp = 0, rg_disp_seen = 0;  /* M7.4: last display mask / vrammgr_mode change */
+#endif
 
 /* ---- guarded reads (same rule as lvprobe.c) ---- */
 static int rg_uc_ok(void)
@@ -353,6 +356,9 @@ static void rg_poll_locked(int now)
         rg.t_change = now;
         rg_settle_start(mask, xoc_ok && rg.w_xoc_ok, now);
         rg_change_seen = 1;
+#ifdef CONFIG_R6_GLOBAL_DRAW
+        if (mask & 3) { rg_t_disp = now; rg_disp_seen = 1; }
+#endif
     }
     rg_w_init = 1;
     rg.w_mask = w[0]; rg.w_vm = w[1]; rg.w_disptype = w[2]; rg.w_xoc = w[3]; rg.w_xoc_h = w[4];
@@ -444,6 +450,17 @@ int r6g_begin(void)
     int mode = R6G_EXE;
     uint32_t r;
     int act = rg_canon_active(now);
+#ifdef CONFIG_R6_GLOBAL_DRAW
+    /* M7.4: within 1 s of a display mask / vrammgr_mode change (LCD <-> EVF,
+     * display off/on: Canon rebuilds the display path, M7.1 hang) ML does not
+     * even convert into layer 0; ML's overlays erase their pixels exactly at
+     * such a switch and would otherwise piggyback right into the rebuild */
+    if (rg_settling(now) && rg_disp_seen && rg_recent(&rg_t_disp, RG_SETTLE_MS, now))
+    {
+        rg.settle++; rg.settle_disp++; rg_reason(R6G_R_SETTLE); mode = R6G_SKIP;
+    }
+    else
+#endif
     if (rg_settling(now))
     {
         if (act) { rg.settle_pig++; rg.pig++; rg_reason(R6G_R_SETTLE_PIG | R6G_R_PIG); mode = R6G_PIGGYBACK; }

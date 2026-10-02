@@ -91,6 +91,10 @@
 #ifdef FEATURE_R6_CANON_HISTOGRAM
 #include "r6_overlays.h"
 #endif
+#include "r6_faceyuv.h"
+#ifdef CONFIG_R6_GLOBAL_DRAW
+#include "r6_gdraw.h"
+#endif
 
 /* CONFIG_LIVEVIEW compiles in force_liveview (fake_simple_button(BGMT_LV) in
  * a loop while lv == 0) and the LV AF frame code. With lv pinned to 0 by
@@ -490,31 +494,11 @@ static const char * lp_region_name(uint32_t a)
 }
 
 /* ---- M7.3: FaceYuv read-only sample (approved 2026-10-01) ---------------
- * Buffer choice (ROM 1.9.0, LiveViewComp::LvFaceYuvController.c):
- *  - ctx = MEM(0x1ED68+0xC) (0xB060 bytes); 4 YUV buffers as 64-bit IBus
- *    addresses at ctx+0x20+8*k (MEMNAVI region 0x10004, count 4 asserted at
- *    0xE08092E2; copied at 0xE0809376..0xE0809386)
- *  - the next-buffer getter 0xE0809390 hands out ctx+0x20+8*[ctx+0xB029]
- *    and then increments that byte mod 4 (0xE08093AC..0xE08093BE)
- *  - the per-frame step 0xE0809212 stores {flag, FrameNum} into the 3-entry
- *    ring 0x164614 at index s8 MEM(0x1ED68) and increments it mod 3
- *    (0xE0809290..0xE08092B6); newest = (index + 2) % 3
- *  - the consumer request 0xE0809550 (r0 type 0..2, r1 FrameNum, r2 request)
- *    looks the frame up in that ring (0xE0809602..0xE080961A) and fills a
- *    record ctx+0x40+0xA0*k, k = [ctx+0xB02A] then incremented mod 4
- *    (0xE080958A..0xE0809598): +4 = FrameNum (strd at 0xE08095A2), +0x10 =
- *    the request's 64-bit buffer address (ldrd/strd 0xE08095B8/0xE08095BC)
- * So: FrameNum of the newest ring entry -> the record with that FrameNum ->
- * its buffer address, accepted only if it equals one of the 4 buffers
- * ("rec"). Else the newest record not newer than that frame ("rec_old").
- * Else the getter rule: (ctx[0xB029] - 2) mod 4, i.e. the buffer handed out
- * before the most recent one (the most recent may still be written) ("get").
- * Camera M7.2a: [0xB029] == [0xB02A] in every sample (one buffer per frame). */
-#define LP_FY_W          640
-#define LP_FY_H          426
-#define LP_FY_PITCH      (LP_FY_W * 2)               /* 8-bit 4:2:2, 2 bytes per pixel */
-#define LP_FY_BYTES      (LP_FY_PITCH * LP_FY_H)     /* 0x85200 = burst stride (0xE08093D0) */
-#define LP_FY_GET_IDX    0xB029
+ * M7.4: the buffer choice and all pointer checks moved to r6_fy_locate
+ * (r6_faceyuv.c, same rules and refusal names); this file only samples the
+ * pixel grid of the located buffer. */
+#define LP_FY_PITCH      R6_FY_PITCH
+#define LP_FY_GET_IDX    0xB029                      /* census keys (fy.get_idx / rec_idx / rec[k]) */
 #define LP_FY_REC_IDX    0xB02A
 #define LP_FY_REC        0x40
 #define LP_FY_REC_STRIDE 0xA0
@@ -552,68 +536,18 @@ static int lp_fy_sample(struct lp_fys * r)
 {
     memset(r, 0, sizeof(*r));
     r->t_ms = get_ms_clock();
-    r->pick = r->rec = r->win = r->ring_i = -1;
     r->why = "";
     lp_uc_update();
 
-    uint32_t v, ctx = RD(LP_FY_STATE + 0xC);
-    if (!ctx) return lp_fy_fail(r, "ctx_null");
-    if (!ram_ok(ctx, LP_FY_CTX_SIZE)) return lp_fy_fail(r, "ctx_invalid");
-    if (!rd32(LP_LVIC_SIZE, &v) || v != (((uint32_t) LP_FY_H << 16) | LP_FY_W)) return lp_fy_fail(r, "size");
-    uint32_t g = 0, rr = 0;
-    rd8(ctx + LP_FY_GET_IDX, &g);
-    rd8(ctx + LP_FY_REC_IDX, &rr);
-    r->gidx = g; r->ridx = rr;
-    if (!rd8(LP_FY_STATE, &v)) return lp_fy_fail(r, "ring_idx");
-    r->ring_i = (int8_t) v;
-    if (r->ring_i < 0 || r->ring_i > 2) return lp_fy_fail(r, "ring_idx");
-    int newest = (r->ring_i + 2) % 3;
-    r->ring_flag = RD(LP_FY_RING + 8 * newest);
-    r->ring_frame = RD(LP_FY_RING + 8 * newest + 4);
-
-    uint32_t blo[4], bhi[4];
-    for (int k = 0; k < 4; k++)
-        if (rd64(ctx + 0x20 + 8 * k, &blo[k], &bhi[k]) != 1) return lp_fy_fail(r, "buf_unstable");
-
-    /* ring frame -> record -> buffer */
-    int best = -1, best_d = 1 << 30;
-    for (int k = 0; k < 4; k++)
-    {
-        uint32_t rb = ctx + LP_FY_REC + LP_FY_REC_STRIDE * k, lo, hi;
-        uint32_t f = RD(rb + 4);
-        if (rd64(rb + 0x10, &lo, &hi) != 1) continue;
-        int m = -1;
-        for (int j = 0; j < 4; j++) if (lo == blo[j] && hi == bhi[j]) m = j;
-        if (m < 0) continue;
-        int d = (int) (r->ring_frame - f);
-        if (d < 0 || d >= 16) continue;
-        if (d < best_d) { best_d = d; best = k; r->pick = m; r->rec_frame = f; }
-    }
-    if (best >= 0) { r->rec = best; r->src = best_d == 0 ? 1 : 2; }
-    else
-    {
-        if (g > 3) return lp_fy_fail(r, "get_idx");
-        r->pick = (g + 2) & 3;
-        r->src = 3;
-    }
-    r->lo = blo[r->pick]; r->hi = bhi[r->pick];
-
-    /* pointer: channel 1, aligned, a static window 4..7 (uncached alias),
-     * whole buffer inside the window, channel 1's RAM and the verified region */
-    if (r->hi != 1) return lp_fy_fail(r, "not_ch1");
-    if (r->lo & 3) return lp_fy_fail(r, "misaligned");
-    uint32_t win[12];
-    for (int i = 0; i < 12; i++) win[i] = RD(LP_MEMIF_WIN + 4 * i);
-    if (!win[11]) return lp_fy_fail(r, "win_table_not_copied");
-    if (!lp_uc_ok) return lp_fy_fail(r, "uncached_unverified");
-    r->win = lp_win_for(win, r->lo, r->hi);
-    if (r->win < 4 || r->win > 7) return lp_fy_fail(r, "no_uncached_window");
-    if ((r->lo & 0x0FFFFFFF) + LP_FY_BYTES > 0x10000000) return lp_fy_fail(r, "window_end");
-    uint32_t lim = 0;
-    if (!rd32(LP_CH_LIMIT, &lim) || !lim || r->lo + LP_FY_BYTES < r->lo || r->lo + LP_FY_BYTES > lim)
-        return lp_fy_fail(r, "ch1_end");
-    r->cpu = ((uint32_t) r->win << 28) | (r->lo & 0x0FFFFFFF);
-    if (!lp_is_uncached(r->cpu) || !ram_ok(r->cpu, LP_FY_BYTES)) return lp_fy_fail(r, "range");
+    /* shared locate (r6_faceyuv.c): buffer choice, pointer and range checks */
+    struct r6_fy_loc loc;
+    int ok = r6_fy_locate(&loc);
+    r->ring_i = loc.ring_i; r->ring_flag = loc.ring_flag; r->ring_frame = loc.ring_frame;
+    r->gidx = loc.gidx; r->ridx = loc.ridx;
+    r->pick = loc.pick; r->src = loc.src; r->rec = loc.rec; r->rec_frame = loc.rec_frame;
+    r->lo = loc.lo; r->hi = loc.hi; r->cpu = loc.cpu; r->win = loc.win;
+    if (!ok) return lp_fy_fail(r, loc.why);
+    uint32_t g = 0, ctx = RD(LP_FY_STATE + 0xC);
 
     for (int i = 0; i < 4; i++) { r->lmin[i] = 0xFF; r->lmax[i] = 0; }
     for (int j = 0; j < LP_FY_GY; j++)
@@ -756,6 +690,7 @@ static void lp_guard_log(struct lp_buf * b)
     LG("settle_xoc", g->settle_xoc);
     LG("settle_xoc_full", g->settle_xoc_full);
     LG("settle_keep", g->settle_keep);
+    LG("settle_disp", g->settle_disp);
     LG("clear_locks", g->clear_locks);
     LG("clear_waits", g->clear_waits);
     LG("clear_timeouts", g->clear_timeouts);
@@ -817,6 +752,7 @@ static void lp_census_m72a(struct lp_buf * b)
 
     lp_printf(b, "# M7.2a: LV histogram, RandomData, FaceYuv, dynamic window / GS stage 0, VMIX/WINSYS, guard\n");
     lp_printf(b, "# M7.3: FaceYuv records + sample, ownership refresh (layer.*), histogram overlay (ovh.*)\n");
+    lp_printf(b, "# M7.4: ML LV image source (fyl.*), ML overlays / global draw (gd.*)\n");
 
     /* -- Canon LV histogram (Option 1) -- */
     lp_globs(b, "hist.state", LP_HIST_STATE, 7);                 /* 0x11F44..+0x1B */
@@ -1035,6 +971,16 @@ static void lp_census_m72a(struct lp_buf * b)
         LL("defer_blk", s->defer_blk);
         LL("defer_px", s->defer_px);
         LL("defer_convs", s->defer_convs);
+        LL("under_convs", s->under_convs);
+        LL("under_blocked_last", s->under_blocked_last);
+        LL("under_blocked_px", s->under_blocked_px);
+        LL("under_drop_blk", s->under_drop_blk);
+        LL("under_drop_px", s->under_drop_px);
+        LL("under_val_n", s->under_val_n);
+        for (int i = 0; i < 4; i++)
+        {
+            snprintf(k, sizeof(k), "layer.under_val[%d]", i);       lp_printf(b, "%s=0x%08x\n", k, (int) s->under_val[i]);
+        }
         LL("bad_target", s->bad_target);
         LL("bad_w", s->bad_w);
         LL("bad_h", s->bad_h);
@@ -1079,6 +1025,58 @@ static void lp_census_m72a(struct lp_buf * b)
     }
 #else
     lp_printf(b, "ovh=off\n");
+#endif
+
+    /* M7.4: ML's LV image source (r6_faceyuv.c) and ML's overlays (r6_gdraw.c) */
+    {
+        const struct r6_fy_stats * f = r6_fy_stats();
+        lp_printf(b, "fyl.calls=%d\n", (int) f->calls);
+        for (int i = 0; i < R6FY_NREASONS; i++)
+        {
+            snprintf(k, sizeof(k), "fyl.reason[%d]", i);          lp_printf(b, "%s=%d\n", k, (int) f->reasons[i]);
+        }
+        lp_printf(b, "fyl.last=%d\n", (int) f->last);
+        lp_printf(b, "fyl.last_why=%s\n", f->last_why ? f->last_why : "");
+        lp_printf(b, "fyl.cpu=0x%08x\n", (int) f->cpu);
+        lp_printf(b, "fyl.frame=%d\n", (int) f->frame);
+        lp_printf(b, "fyl.switches=%d\n", (int) f->switches);
+    }
+#ifdef CONFIG_R6_GLOBAL_DRAW
+    {
+        const struct r6_gd_stats * g = &r6_gd_st;
+        extern int get_global_draw_setting(void);
+#define LGD(name, val) lp_printf(b, "gd." name "=%d\n", (int) (val))
+        LGD("setting", get_global_draw_setting());
+        LGD("checks", g->checks);
+        for (int i = 0; i < R6GD_NREASONS; i++)
+        {
+            snprintf(k, sizeof(k), "gd.reason[%d]", i);           lp_printf(b, "%s=%d\n", k, (int) g->reasons[i]);
+        }
+        lp_printf(b, "gd.last=%s\n", r6_gd_reason(g->last));
+        lp_printf(b, "gd.last_outside_menu=%s\n", r6_gd_reason(g->last_outside_menu));
+        lp_printf(b, "gd.mask=0x%08x\n", (int) g->mask);
+        LGD("ovl", g->ovl);
+        LGD("zebra_n", g->zebra_n);        LGD("zebra_changed", g->zebra_changed);
+        LGD("zebra_us", g->zebra_us);      LGD("zebra_us_max", g->zebra_us_max);   LGD("zebra_nolv", g->zebra_nolv);
+        LGD("fc_n", g->fc_n);              LGD("fc_us", g->fc_us);                 LGD("fc_us_max", g->fc_us_max);
+        LGD("fc_nolv", g->fc_nolv);
+        LGD("hist_n", g->hist_n);          LGD("hist_us", g->hist_us);             LGD("hist_us_max", g->hist_us_max);
+        LGD("hist_nolv", g->hist_nolv);
+        LGD("hdraw_n", g->hdraw_n);        LGD("wdraw_n", g->wdraw_n);
+        LGD("draw_us", g->draw_us);        LGD("draw_us_max", g->draw_us_max);
+        LGD("spot_n", g->spot_n);          LGD("spot_us", g->spot_us);             LGD("spot_us_max", g->spot_us_max);
+        LGD("erase_n", g->erase_n);        LGD("refresh_req", g->refresh_req);     LGD("drawn", g->drawn);
+        LGD("reshow", g->reshow);
+        LGD("refresh_same", g->refresh_same);
+        LGD("spot_same", g->spot_same);
+        LGD("spot_y", g->spot_y);          LGD("spot_u", g->spot_u);               LGD("spot_v", g->spot_v);
+        LGD("spot_nu", g->spot_nu);        LGD("spot_nv", g->spot_nv);
+        LGD("cap_hold", g->cap_hold);      LGD("cap_ms", g->cap_ms);               LGD("resets_seen", g->resets_seen);
+        LGD("movie_sm", g->movie_sm);      LGD("movie_lvms", g->movie_lvms);
+        lp_printf(b, "gd.shooting_mode=0x%x\n", (int) g->shooting_mode);
+        LGD("lv_movie_select", g->lv_movie_select);
+#undef LGD
+    }
 #endif
 }
 
@@ -1149,6 +1147,9 @@ static void lp_census(struct lp_buf * b, const char * tag)
 
     /* GUI / LV state */
     lp_printf(b, "shooting_type=%d\n", shooting_type);
+    lp_printf(b, "shooting_mode=0x%x\n", shooting_mode);       /* M7.4: movie gate evidence */
+    lp_printf(b, "lv_movie_select=%d\n", lv_movie_select);
+    lp_printf(b, "is_movie_mode=%d\n", (int) is_movie_mode());
     lp_glob(b, "gui_mode", LP_GUI_MODE);
     lp_printf(b, "gui_state=%d\n", gui_state);
     lp_glob(b, "display_is_on", LP_DISPLAY_IS_ON);

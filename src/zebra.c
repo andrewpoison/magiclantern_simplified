@@ -48,6 +48,18 @@
 /* todo: move battery stuff in battery.c */
 #include "battery.h"
 
+#ifdef CONFIG_R6_GLOBAL_DRAW
+/* R6 M7.4 (platform/R6.190/r6_gdraw.h, internals.h): ML's overlays on
+ * Canon's shared layer 0, LV image = Canon's FaceYuv buffer. Every overlay
+ * defaults to OFF; Global Draw itself is not saved (OFF at every boot). */
+#include "r6_gdraw.h"
+#include "refresh_guard.h"      /* idx_changes: Canon repainted layer 0 */
+#include "r6_layer.h"           /* resets: layer 0 address changed */
+#define R6GD_T0() uint64_t r6gd_t0 = get_us_clock()
+#define R6GD_T1(n, us, mx) do { uint32_t _us = (uint32_t) (get_us_clock() - r6gd_t0); \
+    r6_gd_st.n++; r6_gd_st.us = _us; if (_us > r6_gd_st.mx) r6_gd_st.mx = _us; } while (0)
+#endif
+
 #ifdef FEATURE_LCD_SENSOR_SHORTCUTS
 #include "lcdsensor.h"
 #endif
@@ -160,7 +172,11 @@ static int show_lv_fps = 0; // for debugging
 #define WAVEFORM_FACTOR (1 << waveform_size) // 1, 2 or 4
 #define WAVEFORM_OFFSET (waveform_size <= 1 ? 80 : 0)
 
+#ifdef CONFIG_R6_GLOBAL_DRAW
+#define WAVEFORM_FULLSCREEN 0   /* R6: small waveform only (no size menu) */
+#else
 #define WAVEFORM_FULLSCREEN (waveform_draw && waveform_size == 2)
+#endif
 
 CONFIG_INT("lv.disp.profiles", disp_profiles_0, 0);
 
@@ -178,12 +194,20 @@ static CONFIG_INT( "transparent.overlay.autoupd", transparent_overlay_auto_updat
 static int transparent_overlay_hidden = 0;
 #endif
 
+#ifdef CONFIG_R6_GLOBAL_DRAW
+static int global_draw = 0;     /* R6 M7.4: plain variable, OFF at every boot until the first camera test passed */
+#else
 static CONFIG_INT( "global.draw",   global_draw, 3 );
+#endif
 
 #define ZEBRAS_IN_QUICKREVIEW (global_draw > 1)
 #define ZEBRAS_IN_LIVEVIEW (global_draw & 1)
 
+#ifdef CONFIG_R6_GLOBAL_DRAW
+static CONFIG_INT( "zebra.draw",    zebra_draw, 0 );    /* R6 M7.4: every overlay defaults to OFF */
+#else
 static CONFIG_INT( "zebra.draw",    zebra_draw, 1 );
+#endif
 #ifdef FEATURE_ZEBRA_FAST
 static CONFIG_INT( "zebra.colorspace",    zebra_colorspace,   2 );// luma/rgb/lumafast
 #else
@@ -362,7 +386,11 @@ static CONFIG_INT( "clear.preview.delay", clearscreen_delay, 1000); // ms
 //~ #define clearscreen (clearscreen_enabled ? clearscreen_mode+1 : 0)
 
 static CONFIG_INT( "spotmeter.size",        spotmeter_size, 5 );
+#ifdef CONFIG_R6_GLOBAL_DRAW
+static CONFIG_INT( "spotmeter.draw",        spotmeter_draw, 0 );  /* R6 M7.4: OFF by default */
+#else
 static CONFIG_INT( "spotmeter.draw",        spotmeter_draw, 1 );
+#endif
 static CONFIG_INT( "spotmeter.formula",     spotmeter_formula, 0 ); // 0 percent, 1 IRE AJ, 2 IRE Piers
 static CONFIG_INT( "spotmeter.position",        spotmeter_position, 1 ); // fixed / attached to AF frame
 
@@ -420,14 +448,21 @@ int get_global_draw() // menu setting, or off if
          * EOSM and 5D2 already used this value in the past, and it was also "3"
          * for clean overlays.
          */
+        #ifdef LV_OVERLAYS_MODE_ML_OK
+        /* R6: the INFO variants of the LV shooting screen (consts.h) */
+        lv_disp_mode = !LV_OVERLAYS_MODE_ML_OK(LV_OVERLAYS_MODE);
+        #else
         lv_disp_mode = LV_OVERLAYS_MODE != 3;
+        #endif
     #endif
 
     extern int ml_started;
     if (!ml_started) return 0;
     if (!global_draw) return 0;
     
+#ifndef CONFIG_R6_GLOBAL_DRAW   /* R6: no overlays in playback (no image source there) */
     if (PLAY_MODE) return 1; // exception, always draw stuff in play mode
+#endif
     
     #ifdef CONFIG_CONSOLE
     extern int console_visible;
@@ -437,6 +472,9 @@ int get_global_draw() // menu setting, or off if
     if (lv && ZEBRAS_IN_LIVEVIEW)
     {
         return 
+            #ifdef CONFIG_R6_GLOBAL_DRAW
+            r6_gd_screen_ok() == R6GD_OK &&     /* LCD shooting screen only (platform/R6.190/r6_gdraw.c); first, so its reason counters see every call */
+            #endif
             lv_disp_mode == 0 &&
             !idle_globaldraw_disable && 
             bmp_is_on() &&
@@ -452,10 +490,12 @@ int get_global_draw() // menu setting, or off if
             job_state_ready_to_take_pic();
     }
     
+    #ifndef CONFIG_R6_GLOBAL_DRAW   /* R6: overlays only in LV through r6_gd_screen_ok (Global Draw max 1, but never bypass the gate) */
     if (!lv && ZEBRAS_IN_QUICKREVIEW)
     {
         return DISPLAY_IS_ON;
     }
+    #endif
 #endif
     return 0;
 }
@@ -552,6 +592,8 @@ hist_build()
     {
         vectorscope_start();
     }
+    #else
+    const int vectorscope_draw = 0;
     #endif
     
     #ifdef FEATURE_RAW_HISTOGRAM
@@ -1037,6 +1079,11 @@ static void waveform_init()
 #ifdef FEATURE_WAVEFORM
     if (!waveform)
         waveform = malloc(WAVEFORM_WIDTH * WAVEFORM_HEIGHT);
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    /* R6: malloc failed -> no bzero32 at address 0 (page 0 unmapped);
+     * waveform_add_pixel / waveform_draw_image check for NULL */
+    if (!waveform) return;
+    #endif
     bzero32(waveform, WAVEFORM_WIDTH * WAVEFORM_HEIGHT);
 #endif
 }
@@ -1251,7 +1298,14 @@ static void draw_zebras( int Z )
         #endif
         
         uint8_t * lvram = get_yuv422_vram()->vram;
+        #ifdef CONFIG_R6_GLOBAL_DRAW
+        if (!lvram) { r6_gd_st.zebra_nolv++; return; }
+        R6GD_T0();
+        uint32_t r6_changed = 0;
+        r6_gd_st.drawn |= R6GD_DRAWN_MIRROR;
+        #else
         if (!lvram) return;
+        #endif
 
         int zlr = zlh;
         int zlg = zlh;
@@ -1259,8 +1313,13 @@ static void draw_zebras( int Z )
 
         // draw zebra in 16:9 frame
         // y is in BM coords
+        #ifdef CONFIG_R6_GLOBAL_DRAW
+        /* R6: only the band between Canon's top row and bottom bar (r6_gdraw.h) */
+        for(int y = os.y0 + R6_GD_Y0; y < os.y0 + R6_GD_Y1; y += 2 )
+        #else
         int off = get_y_skip_offset_for_overlays();
         for(int y = os.y0 + off; y < os.y_max - off; y += 2 )
+        #endif
         {
             #define color_over           zebra_color_word_row(COLOR_RED,  y)
             #define color_under          zebra_color_word_row(COLOR_BLUE, y)
@@ -1307,6 +1366,9 @@ static void draw_zebras( int Z )
                 if (BP != 0 && BP != MP) { little_cleanup(bp, mp); continue; }
                 if (BN != 0 && BN != MN) { little_cleanup(bp + (BMPPITCH >> 2), mp + (BMPPITCH >> 2)); continue; }
                 if ((MP & 0x80808080) || (MN & 0x80808080)) continue;
+                #ifdef CONFIG_R6_GLOBAL_DRAW
+                uint32_t r6_ob = BP, r6_on = BN;
+                #endif
                 
                 if (zebra_colorspace == 1 && !EXT_MONITOR_RCA) // rgb
                 {
@@ -1399,6 +1461,9 @@ static void draw_zebras( int Z )
                     else
                         BN = MN = BP = MP = 0;
                 }
+                #ifdef CONFIG_R6_GLOBAL_DRAW
+                r6_changed |= (BP ^ r6_ob) | (BN ^ r6_on);
+                #endif
                     
                 #undef MP
                 #undef BP
@@ -1406,6 +1471,11 @@ static void draw_zebras( int Z )
                 #undef MN
             }
         }
+        #ifdef CONFIG_R6_GLOBAL_DRAW
+        /* ML's indexed buffer only; the ownership refresh shows it */
+        if (r6_changed) { r6_gd_st.zebra_changed++; r6_gd_st.refresh_req++; ml_refresh_display_needed = 1; }
+        R6GD_T1(zebra_n, zebra_us, zebra_us_max);
+        #endif
     }
 }
 #endif
@@ -1892,11 +1962,28 @@ static void guess_focus_peaking_threshold()
 
 
 // clear only zebra, focus assist and whatever else is in BMP VRAM mirror
+#ifdef CONFIG_R6_GLOBAL_DRAW
+static void clrscr_mirror_do( void );
 static void
 clrscr_mirror( void )
 {
     if (!lv && !PLAY_OR_QR_MODE) return;
     if (!get_global_draw()) return;
+    clrscr_mirror_do();
+}
+
+/* R6 M7.4: the body of clrscr_mirror, also used by r6_gd_erase (without the
+ * global draw check: the screen state that allowed the overlays just ended) */
+static void
+clrscr_mirror_do( void )
+{
+#else
+static void
+clrscr_mirror( void )
+{
+    if (!lv && !PLAY_OR_QR_MODE) return;
+    if (!get_global_draw()) return;
+#endif
 
     uint8_t * const bvram = bmp_vram();
     if (!bvram) return;
@@ -2060,10 +2147,35 @@ static MENU_UPDATE_FUNC(global_draw_display)
     {
         MENU_SET_ENABLED(0);
     }
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    /* R6: the ML menu runs over Canon MENU (lv = 0 with LV flag follows
+     * Canon), so lv says nothing here; usable = ON + LV flag follows Canon */
+    extern int lv_follow_canon_get(void);       /* propvalues.c */
+    if (global_draw && !lv_follow_canon_get())
+    {
+        MENU_SET_ENABLED(0);
+    }
+    #else
     if (global_draw && !lv && !ZEBRAS_IN_QUICKREVIEW)
     {
         MENU_SET_ENABLED(0);
     }
+    #endif
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    if (global_draw && !lv_follow_canon_get())
+        MENU_SET_WARNING(MENU_WARN_ADVICE, "Needs Debug > LV probe > LV flag follows Canon = ON.");
+    else if (global_draw)
+    {
+        int r = r6_gd_st.last_outside_menu;
+        if (r == R6GD_MOVIE)
+            MENU_SET_WARNING(MENU_WARN_INFO, "Last LV screen: not drawn (movie mode: mode 0x%x, movie select %d).",
+                (int) r6_gd_st.shooting_mode, (int) r6_gd_st.lv_movie_select);
+        else if (r != R6GD_OK)
+            MENU_SET_WARNING(MENU_WARN_INFO, "Last LV screen: not drawn (%s). LCD shooting screen only.", r6_gd_reason(r));
+        else
+            MENU_SET_WARNING(MENU_WARN_INFO, "LCD shooting screen only. Not saved: OFF at boot.");
+    }
+    #endif
 }
 #endif
 
@@ -2191,6 +2303,9 @@ void get_spot_yuv_ex(int size_dxb, int dx, int dy, int* Y, int* U, int* V, int d
     
     unsigned sy = 0;
     int32_t su = 0, sv = 0; // Y is unsigned, U and V are signed
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    int nu = 0, nv = 0;     /* R6: U and V samples counted apart (as in spotmeter_step) */
+    #endif
     // Sum the values around the center
     for( y = ycl - dxl ; y <= ycl + dxl ; y++ )
     {
@@ -2198,15 +2313,25 @@ void get_spot_yuv_ex(int size_dxb, int dx, int dy, int* Y, int* U, int* V, int d
         {
             uint16_t p = vr[ x + y * width ];
             sy += (p >> 8) & 0xFF;
+            #ifdef CONFIG_R6_GLOBAL_DRAW
+            if (x % 2) { sv += (int8_t)(p & 0x00FF); nv++; } else { su += (int8_t)(p & 0x00FF); nu++; }
+            #else
             if (x % 2) sv += (int8_t)(p & 0x00FF); else su += (int8_t)(p & 0x00FF);
+            #endif
         }
     }
 
     const int dx1_two_plus1 = (2 * dxl + 1);
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    sy /= dx1_two_plus1 * dx1_two_plus1;
+    su = nu ? su / nu : 0;
+    sv = nv ? sv / nv : 0;
+    #else
     const int val = (dxl + 1) * dx1_two_plus1;
     sy /= dx1_two_plus1 * dx1_two_plus1;
     su /= val;
     sv /= val;
+    #endif
 
     *Y = sy;
     *U = su;
@@ -2382,8 +2507,14 @@ static void spotmeter_step()
     if( !vram->vram )
         return;
 
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    /* R6: the erase moved below - only when the value or the box changed */
+    R6GD_T0();
+    if (spotmeter_formula > 2) spotmeter_formula = 0;     /* "RAW (EV)" / RGB % not on R6 (menu max 2) */
+    #else
     if (!PLAY_OR_QR_MODE)
         spotmeter_erase();
+    #endif
     
     const uint16_t*     vr = (uint16_t*) vram->vram;
     const unsigned      width = vram->width;
@@ -2418,10 +2549,12 @@ static void spotmeter_step()
         ycb = COERCE(ycb, os.y0 + 50, os.y_max - 50);
     }
     
+    #ifndef CONFIG_R6_GLOBAL_DRAW   /* R6: below, after the erase of the previous box */
     // save coords, so we know where to erase the spotmeter from
     spot_prev_xcb = xcb;
     spot_prev_ycb = ycb;
     spotmeter_dirty = 1;
+    #endif
     
     int xcl = BM2LV_X(xcb);
     int ycl = BM2LV_Y(ycb);
@@ -2429,6 +2562,9 @@ static void spotmeter_step()
     
     unsigned sy = 0;
     int32_t su = 0, sv = 0; // Y is unsigned, U and V are signed
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    int nu = 0, nv = 0;     /* R6: U and V samples counted apart (odd centre column: 36 U, 45 V in 9x9) */
+    #endif
     // Sum the values around the center
     for( y = ycl - dxl ; y <= ycl + dxl ; y++ )
     {
@@ -2436,15 +2572,27 @@ static void spotmeter_step()
         {
             uint16_t p = vr[ x + y * width ];
             sy += (p >> 8) & 0xFF;
+            #ifdef CONFIG_R6_GLOBAL_DRAW
+            if (x % 2) { sv += (int8_t)(p & 0x00FF); nv++; } else { su += (int8_t)(p & 0x00FF); nu++; }
+            #else
             if (x % 2) sv += (int8_t)(p & 0x00FF); else su += (int8_t)(p & 0x00FF);
+            #endif
         }
     }
 
     const int two_dx1_plus1 = (2 * dxl + 1);
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    sy /= two_dx1_plus1 * two_dx1_plus1;
+    su = nu ? su / nu : 0;
+    sv = nv ? sv / nv : 0;
+    r6_gd_st.spot_y = sy; r6_gd_st.spot_u = su; r6_gd_st.spot_v = sv;
+    r6_gd_st.spot_nu = nu; r6_gd_st.spot_nv = nv;
+    #else
     const int val = (dxl + 1) * two_dx1_plus1;
     sy /= two_dx1_plus1 * two_dx1_plus1;
     su /= val;
     sv /= val;
+    #endif
 
     // Scale to 100%
     const unsigned      scaled = (101 * sy) >> 8;
@@ -2489,6 +2637,33 @@ static void spotmeter_step()
     // previous value otherwise
     
     // if false color is active, draw white on semi-transparent gray
+
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    /* R6: same reading, same place, same settings and ML's box still as
+     * drawn -> nothing to do (no erase, no bmp_printf, no refresh request) */
+    static uint32_t r6_spot_key = 0, r6_spot_box = 0;
+    static int r6_spot_valid = 0;
+    int r6_dx = spotmeter_formula == 2 ? 52 : 26;
+    #define R6_SPOT_BOX(xc, yc) r6_gd_bv_hash((xc) - r6_dx - 4, ((yc) & ~1) - 13, 2 * r6_dx + 12, 51)
+    uint32_t r6_key = 0x811C9DC5u;
+    {
+        const int kv[] = { (int) sy, su, sv, spotmeter_formula, spotmeter_size, xcb, ycb, falsecolor_draw, arrow_keys_shortcuts_active() };
+        for (int i = 0; i < (int) COUNT(kv); i++) r6_key = (r6_key ^ (uint32_t) kv[i]) * 0x01000193u;
+    }
+    if (r6_spot_valid && spotmeter_dirty && r6_key == r6_spot_key && xcb == spot_prev_xcb && ycb == spot_prev_ycb
+        && R6_SPOT_BOX(xcb, ycb) == r6_spot_box)
+    {
+        r6_gd_st.spot_same++;
+        R6GD_T1(spot_n, spot_us, spot_us_max);
+        return;
+    }
+    spotmeter_erase();          /* the previous box (spot_prev_*), as upstream does first */
+    spot_prev_xcb = xcb;
+    spot_prev_ycb = ycb;
+    spotmeter_dirty = 1;
+    r6_gd_st.drawn |= R6GD_DRAWN_SPOT;
+    const int r6_xcb0 = xcb, r6_ycb0 = ycb;
+    #endif
 
     // protect the surroundings from zebras
     #ifndef RAW_SPOTMETER_TEST
@@ -2585,6 +2760,16 @@ fallback_from_raw:
             R*100/255,"%", G*100/255, "%", B*100/255, "%"
         );
     }
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    /* drawn: remember what (bmp_printf / bmp_draw_rect changed ML's buffer) */
+    r6_spot_key = r6_key;
+    r6_spot_box = R6_SPOT_BOX(r6_xcb0, r6_ycb0);
+    r6_spot_valid = 1;
+    #undef R6_SPOT_BOX
+    r6_gd_st.refresh_req++;
+    ml_refresh_display_needed = 1;
+    R6GD_T1(spot_n, spot_us, spot_us_max);
+    #endif
 }
 
 #endif
@@ -2691,7 +2876,12 @@ struct menu_entry zebra_menus[] = {
         .update    = global_draw_display,
         .icon_type = IT_DICE_OFF,
         .choices = (const char *[]) {"OFF", "LiveView", "QuickReview", "ON, all modes"},
+        #ifdef CONFIG_R6_GLOBAL_DRAW
+        .help = "ML overlays (zebras, false color, histogram...) from Canon's FaceYuv.",
+        .help2 = "LCD shooting screen only, needs LV flag follows Canon. Not saved.",
+        #else
         .help = "Enable/disable ML overlay graphics (zebra, cropmarks...)",
+        #endif
         //.essential = FOR_LIVEVIEW,
     },
     #endif
@@ -2955,6 +3145,8 @@ struct menu_entry zebra_menus[] = {
                 .priv = &spotmeter_formula, 
                 #ifdef FEATURE_RAW_SPOTMETER
                 .max = 4,
+                #elif defined(CONFIG_R6_GLOBAL_DRAW)
+                .max = 2,           /* R6: Percent, 0..255, RGB (HTML); "RAW (EV)" would show nothing */
                 #else
                 .max = 3,
                 #endif
@@ -2994,7 +3186,11 @@ struct menu_entry zebra_menus[] = {
             {
                 .name = "Palette      ",
                 .priv = &falsecolor_palette,
+                #ifdef CONFIG_R6_GLOBAL_DRAW
+                .max = 4,           /* R6: no GreenScreen (green_screen_step, not reviewed) */
+                #else
                 .max = 5,
+                #endif
                 .icon_type = IT_DICE,
                 .choices = CHOICES("Marshall", "SmallHD", "50-55%", "67-72%", "Banding detection", "GreenScreen"),
                 .update = falsecolor_display_palette,
@@ -3017,7 +3213,9 @@ struct menu_entry zebra_menus[] = {
             {
                 .name = "Histogram type",
                 .priv = &hist_type,
+                #ifdef FEATURE_RAW_HISTOGRAM    /* histogram.c defines it only with RAW histograms */
                 .update = raw_histo_update,
+                #endif
                 #ifdef FEATURE_RAW_HISTOGRAM
                 .max = 3,
                 #else
@@ -3073,6 +3271,7 @@ struct menu_entry zebra_menus[] = {
         .max = 1,
         .help = "Exposure aid: useful for checking overall brightness.",
         .depends_on = DEP_GLOBAL_DRAW | DEP_EXPSIM,
+        #ifndef CONFIG_R6_GLOBAL_DRAW   /* R6: small waveform only (fixed place above Canon's bottom bar) */
         .children =  (struct menu_entry[]) {
             {
                 .name = "Waveform Size",
@@ -3084,6 +3283,7 @@ struct menu_entry zebra_menus[] = {
             },
             MENU_EOL
         },
+        #endif
         //.essential = FOR_LIVEVIEW | FOR_PLAYBACK,
     },
     #endif
@@ -3730,7 +3930,14 @@ void draw_histogram_and_waveform(int allow_play)
     #endif
         )
     {
+        #ifdef CONFIG_R6_GLOBAL_DRAW
+        if (!get_yuv422_vram()->vram) { r6_gd_st.hist_nolv++; return; }   /* no verified frame: nothing to show */
+        R6GD_T0();
         hist_build(); /* also updates waveform and vectorscope */
+        R6GD_T1(hist_n, hist_us, hist_us_max);
+        #else
+        hist_build(); /* also updates waveform and vectorscope */
+        #endif
     }
 #endif
     
@@ -3744,6 +3951,35 @@ void draw_histogram_and_waveform(int allow_play)
 #endif
 
 #ifdef FEATURE_HISTOGRAM
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    /* R6: at the place of Canon's histogram box (r6_overlays.c steps aside) */
+    if (hist_draw)
+    {
+        /* skipped while the bins and ML's box are as last drawn (the box
+         * hash also catches an erase / clear by someone else); a refresh is
+         * requested only if the drawing changed ML's buffer */
+        static uint32_t r6_hk = 0, r6_hbox = 0;
+        static int r6_hvalid = 0;
+        R6GD_T0();
+        uint32_t k = r6_gd_bv_hash_mem(&histogram, sizeof(histogram));
+        int changed = 0;
+        BMP_LOCK(
+            uint32_t pre = r6_gd_bv_hash(R6_GD_HIST_X - 1, R6_GD_HIST_Y - 1, HIST_WIDTH + 2, hist_height + 2);
+            if (!(r6_hvalid && k == r6_hk && pre == r6_hbox))
+            {
+                hist_draw_image( R6_GD_HIST_X, R6_GD_HIST_Y );
+                r6_gd_st.drawn |= R6GD_DRAWN_HIST;
+                r6_hbox = r6_gd_bv_hash(R6_GD_HIST_X - 1, R6_GD_HIST_Y - 1, HIST_WIDTH + 2, hist_height + 2);
+                r6_hk = k; r6_hvalid = 1;
+                changed = r6_hbox != pre;
+            }
+        )
+        if (changed) { r6_gd_st.refresh_req++; ml_refresh_display_needed = 1; }
+        else r6_gd_st.refresh_same++;
+        R6GD_T1(hdraw_n, draw_us, draw_us_max);
+    }
+    else
+    #endif
     if( hist_draw && !WAVEFORM_FULLSCREEN)
     {
         extern int console_visible;
@@ -3769,6 +4005,33 @@ void draw_histogram_and_waveform(int allow_play)
     if (is_zoom_mode_so_no_zebras()) return;
         
 #ifdef FEATURE_WAVEFORM
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    /* R6: small waveform only, above Canon's bottom bar */
+    if (waveform_draw && waveform)
+    {
+        /* same rule as the histogram box (waveform data + box hash) */
+        static uint32_t r6_wk = 0, r6_wbox = 0;
+        static int r6_wvalid = 0;
+        R6GD_T0();
+        uint32_t k = r6_gd_bv_hash_mem(waveform, WAVEFORM_WIDTH * WAVEFORM_HEIGHT);
+        int changed = 0;
+        BMP_LOCK(
+            uint32_t pre = r6_gd_bv_hash(R6_GD_WFM_X - 1, R6_GD_WFM_Y - 1, WAVEFORM_WIDTH + 2, R6_GD_WFM_H + 2);
+            if (!(r6_wvalid && k == r6_wk && pre == r6_wbox))
+            {
+                waveform_draw_image( R6_GD_WFM_X, R6_GD_WFM_Y, R6_GD_WFM_H );
+                r6_gd_st.drawn |= R6GD_DRAWN_WFM;
+                r6_wbox = r6_gd_bv_hash(R6_GD_WFM_X - 1, R6_GD_WFM_Y - 1, WAVEFORM_WIDTH + 2, R6_GD_WFM_H + 2);
+                r6_wk = k; r6_wvalid = 1;
+                changed = r6_wbox != pre;
+            }
+        )
+        if (changed) { r6_gd_st.refresh_req++; ml_refresh_display_needed = 1; }
+        else r6_gd_st.refresh_same++;
+        R6GD_T1(wdraw_n, draw_us, draw_us_max);
+    }
+    else
+    #endif
     if (waveform_draw)
     {
         #ifdef CONFIG_4_3_SCREEN
@@ -3994,6 +4257,40 @@ void schedule_transparent_overlay()
 }
 #endif
 
+#ifdef CONFIG_R6_GLOBAL_DRAW
+/* R6 M7.4: the overlay screen state ended (Canon MENU / Q / INFO settings,
+ * display off, EVF, LV off, Global Draw OFF): erase what ML's overlays put
+ * into ML's indexed buffer - zebra / false color pixels via the mirror (only
+ * pixels that still hold exactly what the overlay wrote), the spotmeter, the
+ * histogram and waveform boxes - and request a refresh. The ownership
+ * refresh (r6_layer.c) then erases them in layer 0 only where layer 0 still
+ * holds ML's values, under the refresh guard's gates. Instead of redraw(),
+ * which asks Canon to repaint (dialog_redraw(LiveViewApp_dialog)) while
+ * Canon's own screen is changing. Never while the ML menu is shown (the menu
+ * owns the indexed buffer and clears it on close). */
+static void r6_gd_erase(void)
+{
+    if (!r6_gd_st.drawn) return;
+    if (gui_menu_shown()) return;
+    BMP_LOCK(
+        if (bmp_vram_indexed_ready() && bvram_mirror && !gui_menu_shown())
+        {
+            uint32_t d = r6_gd_st.drawn;
+            if (d & R6GD_DRAWN_MIRROR) clrscr_mirror_do();
+            #ifdef FEATURE_SPOTMETER
+            if (d & R6GD_DRAWN_SPOT) spotmeter_erase();
+            #endif
+            if (d & R6GD_DRAWN_HIST) bmp_fill(COLOR_EMPTY, R6_GD_HIST_X - 1, R6_GD_HIST_Y - 1, HIST_WIDTH + 2, hist_height + 2);
+            if (d & R6GD_DRAWN_WFM) bmp_fill(COLOR_EMPTY, R6_GD_WFM_X - 1, R6_GD_WFM_Y - 1, WAVEFORM_WIDTH + 2, R6_GD_WFM_H + 2);
+            r6_gd_st.drawn = 0;
+            r6_gd_st.erase_n++;
+            r6_gd_st.refresh_req++;
+            ml_refresh_display_needed = 1;
+        }
+    )
+}
+#endif
+
 static int lens_display_dirty = 0;
 void lens_display_set_dirty() 
 { 
@@ -4078,7 +4375,11 @@ livev_hipriority_task( void* unused )
             if (!zebra_should_run())
             {
                 digic_zebra_cleanup();
+                #ifdef CONFIG_R6_GLOBAL_DRAW
+                r6_gd_erase();      /* ML's own pixels only, no Canon redraw */
+                #else
                 if (lv && !gui_menu_shown()) redraw();
+                #endif
                 #ifdef CONFIG_ELECTRONIC_LEVEL
                 if (lv) disable_electronic_level();
                 #endif
@@ -4088,6 +4389,9 @@ livev_hipriority_task( void* unused )
                 while (!zebra_should_run()) 
                 {
                     msleep(100);
+                    #ifdef CONFIG_R6_GLOBAL_DRAW
+                    r6_gd_erase();  /* e.g. the ML menu was open at the first try */
+                    #endif
                 }
                 vram_params_set_dirty();
                 zoom_overlay_triggered_by_focus_ring_countdown = 0;
@@ -4161,7 +4465,9 @@ livev_hipriority_task( void* unused )
         else
         #endif
         {
+            #ifndef CONFIG_R6_GLOBAL_DRAW   /* R6: no magic zoom, no cropmarks: no Canon redraw */
             if (!zoom_overlay_dirty) { redraw(); msleep(700); } // redraw cropmarks after MZ is turned off
+            #endif
             zoom_overlay_dirty = 1;
 
             msleep(10);
@@ -4175,12 +4481,23 @@ livev_hipriority_task( void* unused )
             #ifdef FEATURE_FALSE_COLOR
             if (falsecolor_draw)
             {
+                #ifdef CONFIG_R6_GLOBAL_DRAW
+                static int r6_fc_aux = 0;
+                if (should_run_polling_action(R6_GD_FALSE_MS, &r6_fc_aux))     /* R6: 1 x per second */
+                #else
                 if (k % 4 == 0)
+                #endif
                     BMP_LOCK( if (lv) draw_false_downsampled(); )
             }
             else
             #endif
             {
+                #ifdef CONFIG_R6_GLOBAL_DRAW
+                static int r6_zb_aux = 0;
+                int r6_z = zebra_draw && should_run_polling_action(R6_GD_ZEBRA_MS, &r6_zb_aux);   /* R6: 4 x per second */
+                if (r6_z)
+                    BMP_LOCK( if (lv) draw_zebra_and_focus(1, 0); )
+                #else
                 BMP_LOCK(
                     if (lv)
                         draw_zebra_and_focus(
@@ -4188,6 +4505,7 @@ livev_hipriority_task( void* unused )
                             k % 2 == 1  /* should redraw focus peaking? */
                         ); 
                 )
+                #endif
             }
         }
 
@@ -4196,6 +4514,27 @@ livev_hipriority_task( void* unused )
         static int spotmeter_aux = 0;
         if (spotmeter_draw && should_run_polling_action(1000, &spotmeter_aux))
             BMP_LOCK( if (lv) spotmeter_step(); )
+        #endif
+
+        #ifdef CONFIG_R6_GLOBAL_DRAW
+        /* R6: Canon repainted layer 0 (VMIX buffer index changed, seen by the
+         * refresh guard) while ML's overlays are on screen: ask for one refresh,
+         * whose conversion re-shows ML's pixels (a static scene would otherwise
+         * request none). At most every R6_GD_RESHOW_MS, never while nothing
+         * of ours is drawn. RAM reads only. */
+        {
+            static uint32_t r6_idx_seen = 0;
+            static int r6_ra_aux = 0;
+            uint32_t idx = r6_refresh_guard_stats()->idx_changes;
+            uint32_t rs = r6_layer_stats()->resets;     /* layer 0 address changed: nothing of ML's there yet */
+            if (r6_gd_st.drawn && (idx != r6_idx_seen || rs != r6_gd_st.resets_seen) && should_run_polling_action(R6_GD_RESHOW_MS, &r6_ra_aux))
+            {
+                r6_idx_seen = idx;
+                r6_gd_st.resets_seen = rs;
+                r6_gd_st.reshow++; r6_gd_st.refresh_req++;
+                ml_refresh_display_needed = 1;
+            }
+        }
         #endif
 
         #ifdef CONFIG_ELECTRONIC_LEVEL
@@ -4387,6 +4726,12 @@ void update_disp_mode_params_from_bits()
 int get_disp_mode() { return disp_mode; }
 
 static void toggle_disp_mode_menu(void *priv, int delta) {
+#ifdef CONFIG_R6_GLOBAL_DRAW
+    /* R6: no LV display presets (toggle_disp_mode calls display_on, i.e. a
+     * fake button, and redraw); Q only opens the submenu */
+    menu_toggle_submenu();
+    return;
+#endif
     if (!disp_profiles_0) menu_toggle_submenu();
     else toggle_disp_mode();
 }

@@ -644,7 +644,10 @@ PROP_HANDLER( PROP_LV_AFFRAME ) {
         return;
     }
 
-    #ifdef FEATURE_SPOTMETER
+    #if defined(FEATURE_SPOTMETER) && !defined(CONFIG_R6_GLOBAL_DRAW)
+    /* R6 M7.4: not from Canon's PropMgr task (no BMP_LOCK); the handler is
+     * denied on R6 anyway (property_whitelist.h), the spotmeter sits at the
+     * centre and erases its own box */
     spotmeter_erase();
     #endif
 
@@ -5415,6 +5418,10 @@ static void misc_shooting_info()
             #endif
             #endif
             
+            #ifndef CONFIG_R6_GLOBAL_DRAW
+            /* R6 M7.4: compiled out - live behind Global Draw now, ends in
+             * redraw() (Canon dialog_redraw), and PROP_USBRCA_MONITOR has no
+             * verified meaning on the R6 (no analog AV out) */
             if (EXT_MONITOR_RCA) 
             {
                 static int rca_warned = 0;
@@ -5432,6 +5439,7 @@ static void misc_shooting_info()
                     }
                 }
             }
+            #endif
         }
     }
 }

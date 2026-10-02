@@ -23,6 +23,7 @@ enum {
     R6H_SUM,         /* an array's bin sum != numPix */
     R6H_NO_FRAME,    /* RandomData FrameNum not readable */
     R6H_STALE,       /* FrameNum unchanged for 1 s */
+    R6H_MLHIST,      /* M7.4: ML's own histogram (Global Draw) is enabled: same box position */
     R6H_NREASONS
 };
 

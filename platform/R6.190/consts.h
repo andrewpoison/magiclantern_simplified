@@ -73,6 +73,12 @@
  * the values (3 = clean overlays) is not confirmed for R6.
  */
 #define LV_OVERLAYS_MODE MEM(0x20F70)
+/* M7.4: values on which ML's overlays may draw (get_global_draw, zebra.c;
+ * r6_gdraw.c). Camera (M7.1 census, M7.3 logs, 2026-10-02): 0, 1, 2, 3 on
+ * the INFO variants of the LV shooting screen, 6 on Canon's settings screen
+ * (OLC, also used by r6_overlays.c). 4, 5, 7, 8 never observed: not allowed.
+ * The R5/R180 meaning "3 = clean overlays" is not used on R6. */
+#define LV_OVERLAYS_MODE_ML_OK(m) ((uint32_t) (m) <= 3)
 
 // AeProcessSetting 0xE0725E9A; ISOMin via " >> ISOMin:%d" (LVAE_STRUCT - 0x48, as on R5)
 #define LVAE_ISO_STRUCT 0x1202EC

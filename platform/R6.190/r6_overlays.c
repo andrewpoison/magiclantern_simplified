@@ -61,8 +61,13 @@
 
 #ifdef FEATURE_R6_CANON_HISTOGRAM
 
-#if defined(FEATURE_GLOBAL_DRAW) || !defined(CONFIG_R6_LAYER_OWNERSHIP)
-#error "r6_overlays.c: R6 overlay path without global draw, needs the ownership-aware refresh"
+#if !defined(CONFIG_R6_LAYER_OWNERSHIP) || (defined(FEATURE_GLOBAL_DRAW) && !defined(CONFIG_R6_GLOBAL_DRAW))
+#error "r6_overlays.c: needs the ownership-aware refresh (and, with global draw, the R6 global draw rules)"
+#endif
+#ifdef FEATURE_HISTOGRAM
+#include "histogram.h"          /* hist_draw */
+extern int get_global_draw_setting(void);   /* zebra.c */
+extern int lv_follow_canon_get(void);       /* propvalues.c */
 #endif
 
 extern int lv_action_raw_get(uint32_t * value, int * len);   /* propvalues.c */
@@ -111,6 +116,7 @@ static int r6h_force = 1;                   /* next draw repaints the whole box 
 static const char * const r6h_names[R6H_NREASONS] = {
     "shown", "off", "no LV", "ML menu", "Canon GUI", "OLC", "display off", "not LCD",
     "no LV dialog", "no hist set", "bad pointer", "sum != numPix", "no FrameNum", "stale",
+    "ML histogram on",
 };
 
 const char * r6_overlay_reason(uint32_t s)
@@ -194,6 +200,12 @@ static int r6h_gui_state(void)
 {
     if (!r6h_mode) return R6H_OFF;
     if (gui_menu_shown()) return R6H_MENU;
+#ifdef FEATURE_HISTOGRAM
+    /* M7.4: ML's own histogram (Overlay > Global Draw + Histogram) uses the
+     * same box position: only one of them at a time. Only when ML's can
+     * draw at all (LV flag follows Canon ON), else no histogram would show */
+    if (hist_draw && get_global_draw_setting() && lv_follow_canon_get()) return R6H_MLHIST;
+#endif
     if (!ov_in_lv()) return R6H_NO_LV;
     if (CURRENT_GUI_MODE != 0) return R6H_GUI;
     if (LV_OVERLAYS_MODE == OV_OLC) return R6H_OLC;

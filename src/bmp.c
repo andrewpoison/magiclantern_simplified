@@ -37,6 +37,10 @@
 #ifdef CONFIG_R6_LAYER_OWNERSHIP
 #include "r6_layer.h"           /* platform/R6.190 */
 #endif
+#ifdef CONFIG_R6_GLOBAL_DRAW
+#include "r6_gdraw.h"           /* platform/R6.190: conversion cap */
+#include "menu.h"               /* gui_menu_shown */
+#endif
 
 //~ int bmp_enabled = 1;
 
@@ -92,6 +96,25 @@
         return bmp_buf;
     }
 
+#ifdef CONFIG_BMP_REAL_IS_INDEXED
+    /* R6 M7.4 (platform/R6.190/internals.h): with FEATURE_VRAM_RGBA,
+     * bmp_vram_raw() is Canon's RGBA layer 0 (2048 px pitch, 4 bytes per
+     * pixel), so the generic "real" pointer below would make zebras, false
+     * color etc. write 8-bit indices with pitch 960 into Canon's layer, and
+     * "idle" (real ^ 0x80000) is a wild pointer. Here both are ML's own
+     * indexed buffer (the one bmp_vram() returns); ML's pixels reach layer 0
+     * only through the ownership-aware refresh (r6_layer.c). NULL before
+     * bmp_init() allocated it (callers check). bmp_idle_copy is a no-op. */
+    uint8_t* bmp_vram_real()
+    {
+        return bmp_vram_indexed_ready() ? bmp_vram() : NULL;
+    }
+
+    uint8_t* bmp_vram_idle()
+    {
+        return bmp_vram_real();
+    }
+#else
     uint8_t* bmp_vram_real()
     {
         return (uint8_t *)((uintptr_t)BMP_VRAM_START(bmp_vram_raw()) + BMP_HDMI_OFFSET);
@@ -106,6 +129,7 @@
         return (uint8_t *)((uintptr_t)bmp_vram_real() ^ 0x80000);
     #endif
     }
+#endif /* CONFIG_BMP_REAL_IS_INDEXED */
 #endif
 
 static int bmp_idle_flag = 0;
@@ -159,6 +183,9 @@ uint8_t * bmp_vram(void)
 // 1 = copy idle to BMP
 void bmp_idle_copy(int direction, int fullsize)
 {
+#ifdef CONFIG_BMP_REAL_IS_INDEXED
+    return;     /* R6: real == idle == ML's indexed buffer, nothing to copy */
+#endif
     uint8_t* real = bmp_vram_real();
     uint8_t* idle = bmp_vram_idle();
     ASSERT(real)
@@ -226,6 +253,17 @@ void refresh_yuv_from_rgb(void)
         return;
 #endif
 
+#ifdef CONFIG_R6_GLOBAL_DRAW
+    /* R6 M7.4 (platform/R6.190/r6_gdraw.c): conversion cap while the ML menu
+     * is closed - the next conversion waits 10x the last conversion time
+     * (at most 2 s), so ML's conversions of large overlays (false color: the
+     * whole band) take at most ~10 % of a core. Both paths (own XimrExe and
+     * piggyback). The flag stays 1, redraw_task retries every 50 ms. RAM
+     * reads only. */
+    if (r6_gd_conv_hold())
+        return;
+#endif
+
 #ifdef CONFIG_R6_REFRESH_GUARD
     /* R6 (platform/R6.190/refresh_guard.c): settle window, Canon activity,
      * rate limit and Canon VMIX state decide before the conversion. SKIP
@@ -269,7 +307,18 @@ void refresh_yuv_from_rgb(void)
          * Runs under the guard lock (r6g_begin .. r6g_end), so never at the
          * same time as rgba_buffer_clear. 0 = no ownership table (malloc
          * failed): the old loop below. */
-        if (!r6_layer_convert(b, rgb_data, r6g_mode == R6G_EXE))
+        /* M7.4: write-under rule while the ML menu is closed (r6_layer.h):
+         * ML's overlays never cover Canon's UI pixels */
+#ifdef CONFIG_R6_GLOBAL_DRAW
+        int r6l_under = !gui_menu_shown();
+#else
+        int r6l_under = 0;
+#endif
+        int r6l_done = r6_layer_convert(b, rgb_data, r6g_mode == R6G_EXE, r6l_under);
+#ifdef CONFIG_R6_GLOBAL_DRAW
+        if (r6l_done) r6_gd_conv_done(r6_layer_stats()->us_last);
+#endif
+        if (!r6l_done && !r6l_under)    /* no table: no write-under possible, so nothing outside the ML menu */
         {
 #endif
         // kitor FIXME this is the loop altered to work with 2048x1080 layers.

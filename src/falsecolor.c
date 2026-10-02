@@ -6,6 +6,9 @@
 #include "zebra.h"
 #include "imgconv.h"
 #include "greenscreen.h"
+#ifdef CONFIG_R6_GLOBAL_DRAW
+#include "r6_gdraw.h"           /* platform/R6.190 */
+#endif
 
 CONFIG_INT( "falsecolor.draw", falsecolor_draw, 0);
 CONFIG_INT( "falsecolor.palette", falsecolor_palette, 0);
@@ -39,6 +42,12 @@ extern uint8_t* get_bvram_mirror();
 #ifdef FEATURE_FALSE_COLOR
 void draw_false_downsampled( void )
 {
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    /* R6: the screen gate right before drawing, as draw_zebra_and_focus /
+     * spotmeter_step do (livev_hipriority_task checks it once per loop, then
+     * sleeps before this pass) */
+    if (!get_global_draw()) return;
+    #endif
     //~ if (vram_lv.width > 720) return;
     if (!PLAY_OR_QR_MODE)
     {
@@ -48,7 +57,9 @@ void draw_false_downsampled( void )
     // exception: green screen palette is not fixed
     if (falsecolor_palette == 5)
     {
+        #ifndef CONFIG_R6_GLOBAL_DRAW   /* R6: not reviewed (menu max 4), nothing drawn */
         green_screen_step();
+        #endif
         return;
     }
 
@@ -61,8 +72,18 @@ void draw_false_downsampled( void )
     uint8_t * const lvram = get_yuv422_vram()->vram;
     uint8_t* fc = false_colour[falsecolor_palette];
 
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    /* R6: no verified FaceYuv frame -> nothing (page 0 is unmapped);
+     * only the band between Canon's top row and bottom bar (r6_gdraw.h) */
+    if (!lvram) { r6_gd_st.fc_nolv++; return; }
+    uint64_t r6_t0 = get_us_clock();
+    r6_gd_st.drawn |= R6GD_DRAWN_MIRROR;
+    uint32_t r6_changed = 0;
+    for(int y = os.y0 + R6_GD_Y0; y < os.y0 + R6_GD_Y1; y += 2 )
+    #else
     int off = get_y_skip_offset_for_overlays();
     for(int y = os.y0 + off; y < os.y_max - off; y += 2 )
+    #endif
     {
         uint32_t * const v_row = (uint32_t*)( lvram        + BM2LV_R(y)    );  // 2 pixels
         uint16_t * const b_row = (uint16_t*)( bvram        + BM_R(y)       );  // 2 pixels
@@ -88,6 +109,9 @@ void draw_false_downsampled( void )
             if ((MP & 0x80808080) || (MN & 0x80808080)) continue;
             
             int c = fc[*lvp]; c |= (c << 8);
+            #ifdef CONFIG_R6_GLOBAL_DRAW
+            r6_changed |= (BP ^ c) | (BN ^ c);
+            #endif
             MP = BP = c;
             MN = BN = c;
 
@@ -97,6 +121,15 @@ void draw_false_downsampled( void )
             #undef MN
         }
     }
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    /* ML's indexed buffer only; the ownership refresh shows it - only if
+     * this pass changed it (a static scene requests nothing) */
+    if (r6_changed) { r6_gd_st.refresh_req++; ml_refresh_display_needed = 1; }
+    else r6_gd_st.refresh_same++;
+    uint32_t r6_us = (uint32_t) (get_us_clock() - r6_t0);
+    r6_gd_st.fc_n++; r6_gd_st.fc_us = r6_us;
+    if (r6_us > r6_gd_st.fc_us_max) r6_gd_st.fc_us_max = r6_us;
+    #endif
 }
 
 char* falsecolor_palette_name()

@@ -2,7 +2,9 @@
 #define _imgconv_h_
 
 
-#ifdef CONFIG_DIGIC_678X
+/* R6 M7.4 (CONFIG_R6_FACEYUV_LV): ML's LV image is Canon's FaceYuv buffer,
+ * chroma signed (int8, 0 = neutral; camera M7.3), i.e. the DIGIC 4/5 layout */
+#if defined(CONFIG_DIGIC_678X) && !defined(CONFIG_R6_FACEYUV_LV)
 #define UYVY_PACK(u,y1,v,y2) ((u + 0x80) & 0xFF) | (((y1) & 0xFF) << 8) | (((v + 0x80) & 0xFF) << 16) | (((y2) & 0xFF) << 24)
 #define UYVY_GET_U(uyvy) ((((uyvy)      ) - 0x80) & 0xFF)
 #define UYVY_GET_V(uyvy) ((((uyvy) >> 16) - 0x80) & 0xFF)

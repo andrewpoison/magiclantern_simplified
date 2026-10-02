@@ -24,7 +24,11 @@ extern int FAST get_y_skip_offset_for_overlays();
 extern int nondigic_zoom_overlay_enabled();
 
 
+#ifdef CONFIG_R6_GLOBAL_DRAW
+CONFIG_INT( "hist.draw", hist_draw,  0 );   /* R6 M7.4: every overlay defaults to OFF */
+#else
 CONFIG_INT( "hist.draw", hist_draw,  1 );
+#endif
 #ifdef FEATURE_RAW_HISTOGRAM
 CONFIG_INT( "hist.type", hist_type,  2 );
 #else

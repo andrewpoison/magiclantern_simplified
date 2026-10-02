@@ -23,11 +23,18 @@ int r6_layer_target_ok(const struct MARV * m);
  * Canon is repainting layer 0 right now) = they are only verified and kept
  * owned, the next conversion with allow_erase erases them (r6_layer_deferred
  * tells the caller to request one).
+ * under (M7.4, ML menu closed): write-under rule. A pixel ML does not own
+ * yet is written (and owned) only where layer 0 shows nothing of Canon
+ * (alpha 0 or the colour key 0xFF000000); pixels ML owns are re-asserted
+ * only while their block still verifies (hash), otherwise the block's ML
+ * pixels are given up and only its empty pixels are claimed. So Canon's UI
+ * stays on top of ML's overlays and ML never erases a Canon pixel it painted
+ * over. under 0 (ML menu): ML paints over Canon (M6/M7.3).
  * Return 1 = done, 0 = not possible (no ownership table: allocation failed,
  * or a misaligned buffer); the caller then runs the old loop.
  * The caller makes them single writers (refresh: between r6g_begin and
  * r6g_end; clear: r6g_clear_lock). */
-int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase);
+int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int under);
 int r6_layer_clear(uint32_t * layer);
 /* 1 = an ownership table exists (the clear may leave the indexed buffer to
  * the next refresh) */
@@ -58,6 +65,13 @@ struct r6_layer_stats
     uint32_t defer_blk;      /* last conversion: blocks with kept given-up pixels */
     uint32_t defer_px;       /* total pixels kept that way (erased by a later conversion) */
     uint32_t defer_convs;    /* conversions with allow_erase 0 */
+    /* M7.4 write-under conversions (under 1) */
+    uint32_t under_convs;    /* conversions with under 1 */
+    uint32_t under_blocked_last;   /* last conversion: ML pixels not written, layer 0 showed Canon there */
+    uint32_t under_blocked_px;     /* total of these */
+    uint32_t under_drop_blk, under_drop_px;   /* blocks / still drawn ML pixels given up: Canon painted into an owned block */
+    uint32_t under_val_n;    /* distinct blocking layer values seen (the last 4 in under_val[n & 3]) */
+    uint32_t under_val[4];
     /* target check (r6_layer_target_ok) */
     uint32_t bad_target;     /* refresh / clear calls refused: layer 0 not as expected */
     uint32_t bad_w, bad_h;   /* MARV width / height of the last refusal */

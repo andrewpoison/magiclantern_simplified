@@ -228,6 +228,9 @@ update_lens_display(int top, int bottom)
 
 int should_draw_bottom_bar()
 {
+#ifdef CONFIG_NO_LVINFO_BARS
+    return 0;   /* R6 M7.4: ML's LV info bars stay off (not reviewed for the shared layer) */
+#endif
     if (gui_menu_shown()) return 1;
     if (!get_global_draw()) return 0;
     //~ if (EXT_MONITOR_CONNECTED) return 1;
@@ -485,6 +488,9 @@ int FAST get_ml_bottombar_pos()
 
 void draw_ml_bottombar()
 {
+#ifdef CONFIG_NO_LVINFO_BARS
+    return;     /* R6 M7.4: see should_draw_bottom_bar */
+#endif
     if (!should_draw_bottom_bar()) return;
 
     lvinfo_display(0,1);
@@ -665,6 +671,9 @@ void free_space_show_photomode()
 
 void draw_ml_topbar()
 {
+#ifdef CONFIG_NO_LVINFO_BARS
+    return;     /* R6 M7.4: see should_draw_bottom_bar */
+#endif
     if (!get_global_draw()) return;
     
     lvinfo_display(1,0);

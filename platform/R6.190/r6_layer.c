@@ -59,6 +59,16 @@
  *    Canon changed: up to 31 ML pixels may stay next to a Canon element
  *    (counted in veto_* / clear_veto_*; camera test item).
  *
+ * M7.4 write-under rule (r6_layer_convert with under = 1, i.e. whenever the
+ * ML menu is closed): ML's overlays never cover Canon's UI. A pixel ML does
+ * not own is written (and owned) only where layer 0 shows nothing of Canon
+ * (R6L_EMPTY); owned pixels are re-asserted only while their block still
+ * verifies. If Canon painted into an owned block, ML gives up the whole
+ * block ("drop", like the veto) and claims only its empty pixels. So ML
+ * never erases a Canon pixel it would have covered; its remaining pixels in
+ * such a block stay until Canon repaints there (cosmetic, counted in
+ * under_drop_*). The ML menu (under = 0) paints over Canon as in M6/M7.3.
+ *
  * Reads/writes: ML's indexed buffer and Canon's layer 0 (bitmap_data of
  * Canon's MARV, the same memory the old loop wrote); no Canon calls (the
  * caller holds the guard lock), get_us_clock for the timing.
@@ -81,6 +91,10 @@
 #define R6L_BLOCKS  (R6L_BPR * R6L_H)               /* 16200 */
 #define R6L_H0      0x811C9DC5u                     /* FNV-1a offset basis */
 #define R6L_PRIME   0x01000193u
+/* M7.4: a layer 0 pixel that shows nothing of Canon: alpha 0, or exactly
+ * 0xFF000000 (opaque black is see-through on layer 0, M5 photo: Canon's
+ * colour key, docs/m6_analyse.md) */
+#define R6L_EMPTY(c) (!((c) & 0xFF000000) || (c) == 0xFF000000)
 
 #if (R6L_W % 32) || (BMP_VRAM_SIZE != R6L_W * R6L_H)
 #error "r6_layer.c: unexpected indexed buffer geometry"
@@ -166,7 +180,7 @@ uint32_t r6_layer_deferred(void)
     return st.defer_blk;
 }
 
-int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase)
+int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int under)
 {
     st.defer_blk = 0;
     if (!idx || !layer || ((uintptr_t) idx & 3) || ((uintptr_t) layer & 3)) return 0;
@@ -176,7 +190,8 @@ int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase)
     int fast = r6l_build_lut();
     if (!fast) st.slow_lut++;
     if (!allow_erase) st.defer_convs++;
-    uint32_t skip = 0, conv = 0, owned_b = 0, owned_px = 0, defer_b = 0;
+    if (under) st.under_convs++;
+    uint32_t skip = 0, conv = 0, owned_b = 0, owned_px = 0, defer_b = 0, blocked_px = 0;
 
     struct r6l_blk * o = r6l_own;
     for (int y = 0; y < R6L_H; y++)
@@ -207,9 +222,12 @@ int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase)
             uint32_t * d = drow + bx * 32;
             uint32_t cm = om & ~nm;                      /* ML gave these up */
             uint32_t keep = 0;                           /* given up, verified, kept (piggyback) */
+            /* M7.4: the hash check is needed for the given-up pixels and, in
+             * the write-under mode, for the re-asserted ones */
+            int verified = om && (cm || under) ? r6l_hash_layer(d, om) == o->hash : 1;
             if (cm)
             {
-                if (r6l_hash_layer(d, om) != o->hash)
+                if (!verified)
                 {
                     st.veto_blk++;
                     st.veto_px += __builtin_popcount(cm);
@@ -228,15 +246,43 @@ int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase)
                 }
             }
 
+            /* pixels to write: all opaque ones (overpaint, ML menu), or in
+             * the write-under mode the owned ones of a verified block plus
+             * the ones where layer 0 is empty (Canon shows nothing there) */
+            uint32_t wm = nm;
+            if (under && nm)
+            {
+                wm = verified ? (nm & om) : 0;
+                if (!verified && om)
+                {
+                    st.under_drop_blk++;
+                    st.under_drop_px += __builtin_popcount(om & ~cm);
+                }
+                uint32_t blocked = 0;
+                for (uint32_t m = nm & ~wm; m; m &= m - 1)
+                {
+                    int i = __builtin_ctz(m);
+                    uint32_t c = d[i];
+                    if (R6L_EMPTY(c)) wm |= 1u << i;
+                    else
+                    {
+                        blocked++;
+                        if (c != st.under_val[st.under_val_n & 3] && c != st.under_val[(st.under_val_n - 1) & 3])
+                            st.under_val[++st.under_val_n & 3] = c;
+                    }
+                }
+                blocked_px += blocked;
+            }
+
             uint32_t h = R6L_H0;
-            for (uint32_t m = nm; m; m &= m - 1)
+            for (uint32_t m = wm; m; m &= m - 1)
             {
                 int i = __builtin_ctz(m);
                 uint32_t v = r6l_lut[s.b[i]];
                 d[i] = v;
                 h = r6l_mix(h, v);
             }
-            uint32_t mk = nm | keep;
+            uint32_t mk = wm | keep;
             if (keep) h = r6l_hash_layer(d, mk);         /* kept pixels hold ML's verified values */
             o->mask = mk;
             o->hash = h;
@@ -245,6 +291,8 @@ int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase)
     }
 
     st.defer_blk = defer_b;
+    st.under_blocked_last = blocked_px;
+    st.under_blocked_px += blocked_px;
     st.blk_skip = skip;
     st.blk_conv = conv;
     st.blk_owned = owned_b;

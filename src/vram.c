@@ -11,6 +11,9 @@
 #include "shoot.h"
 #include "zebra.h"
 #include "raw.h"
+#ifdef CONFIG_R6_FACEYUV_LV
+#include "r6_faceyuv.h"         /* platform/R6.190 */
+#endif
 
 //~ #define CONFIG_DEBUGMSG 1
 
@@ -147,7 +150,9 @@ void vram_params_set_dirty()
     afframe_set_dirty();
 }
 
+#ifndef CONFIG_R6_FACEYUV_LV   /* R6: no HD buffer size register */
 static uint32_t hd_size = 0;
+#endif
 
 static void vram_params_update_if_dirty()
 {
@@ -227,12 +232,20 @@ void _update_vram_params()
     if (!ext_monitor_hdmi) hdmi_code = 0; // 5D doesn't revert it, maybe other cameras too
 
     // force a redraw when you connect the external monitor
+#ifndef CONFIG_R6_FACEYUV_LV
+    /* R6 M7.4: not from here - get_yuv422_vram() runs in the overlay tasks
+     * several times per second, and redraw() asks Canon to repaint
+     * (dialog_redraw); ML's overlays are LCD-only on R6 anyway */
     static int prev_hdmi_code = 0;
     static int prev_EXT_MONITOR_RCA = 0;
     if (prev_hdmi_code != hdmi_code || prev_EXT_MONITOR_RCA != EXT_MONITOR_RCA) redraw();
     prev_hdmi_code = hdmi_code;
     prev_EXT_MONITOR_RCA = EXT_MONITOR_RCA;
+#endif
     
+#ifndef CONFIG_R6_FACEYUV_LV
+    /* R6 M7.4: skipped - os.* is set once to the fixed LCD values below, so
+     * an unlocked reader (hist_build) never sees the HDMI / RCA values */
     // LV crop area (black bars)
     os.x0   = hdmi_code >= 5 ?  75 - 120 : (hdmi_code == 2 ? 40 : EXT_MONITOR_RCA ? (video_system_pal ? 40 : 40) :    0);
     os.y0   = hdmi_code >= 5 ?   0 - 30  : (hdmi_code == 2 ? 24 : EXT_MONITOR_RCA ? (video_system_pal ? 29 : 25) :    0);
@@ -264,6 +277,7 @@ void _update_vram_params()
     os.off_43 = (os.x_ex - os.x_ex * 8/9) / 2;
     os.off_169 = (os.y_ex - os.y_ex * 3/2 * 9/16) / 2;
     os.off_1610 = (os.y_ex - os.y_ex * 3/2 * 10/16) / 2;
+#endif /* CONFIG_R6_FACEYUV_LV */
 
     // LV buffer (used for display)
     // these buffer sizes include any black bars
@@ -337,6 +351,25 @@ void _update_vram_params()
     vram_lv.width = 736;
     vram_lv.height = 480;
     vram_lv.pitch = vram_lv.width * 2;
+    os.x0 = 0;
+    os.y0 = 0;
+    os.x_ex = 720;
+    os.y_ex = 480;
+    os.x_max = os.x0 + os.x_ex;
+    os.y_max = os.y0 + os.y_ex;
+    os.off_43 = 0;
+    os.off_169 = 0;
+    os.off_1610 = 0;
+#elif defined(CONFIG_R6_FACEYUV_LV)
+    /* R6 M7.4: ML's LV image is Canon's FaceYuv buffer (r6_faceyuv.c):
+     * 640x426 UYVY, pitch 1280, the full 3:2 frame that the LCD shows on the
+     * whole screen, i.e. on ML's whole 720x480 LCD area (offset (152,30) in
+     * the 2048x1080 layer, M5). Fixed for the LCD; the overlays are gated to
+     * the LCD shooting screen (get_global_draw, r6_gdraw.c), so the EVF/HDMI
+     * geometry is not needed. No 16:9 bars (photo LV). */
+    vram_lv.width = R6_FY_W;
+    vram_lv.height = R6_FY_H;
+    vram_lv.pitch = R6_FY_PITCH;
     os.x0 = 0;
     os.y0 = 0;
     os.x_ex = 720;
@@ -440,6 +473,13 @@ void _update_vram_params()
     bm2lv.tx = 0;
     bm2lv.ty = 0;
     //~ bm2lv.ty = (PLAY_MODE || QR_MODE)? -48 : 0;     
+#elif defined(CONFIG_R6_FACEYUV_LV)
+    /* R6 M7.4: ML (0..719, 0..479) -> FaceYuv (0..638, 0..424); sx = 910,
+     * sy = 908 (/1024), so BM2LV never leaves the 640x426 buffer */
+    bm2lv.sx = 1024 * vram_lv.width / os.x_ex;
+    bm2lv.sy = 1024 * vram_lv.height / os.y_ex;
+    bm2lv.tx = 0;
+    bm2lv.ty = 0;
 #else
     // bmp to lv transformation
     // LCD: (0,0) -> (0,0)
@@ -467,6 +507,11 @@ void _update_vram_params()
 #elif defined(CONFIG_5DC)
     vram_hd.width = 1872;
     vram_hd.height = 1664;
+    vram_hd.pitch = vram_lv.pitch;
+#elif defined(CONFIG_R6_FACEYUV_LV)
+    /* R6 M7.4: no HD (recording) buffer is known; vram_hd = vram_lv */
+    vram_hd.width = vram_lv.width;
+    vram_hd.height = vram_lv.height;
     vram_hd.pitch = vram_lv.pitch;
 #else
     vram_hd.pitch = hd_size & 0xFFFF;
@@ -505,7 +550,11 @@ void _update_vram_params()
     lv2hd.ty = -LV2HD_DY(BM2LV_Y(os.y0 + bar_y));
 
 //~ #ifndef CONFIG_5DC
+#ifdef CONFIG_R6_FACEYUV_LV
+    if (1) // R6: HD = LV (FaceYuv), identity transform
+#else
     if (!lv) // HD buffer not active, use LV instead
+#endif
     {
         lv2hd.sx = lv2hd.sy = 1024;
         lv2hd.tx = lv2hd.ty = 0;
@@ -650,6 +699,44 @@ int first_video_clip = 1;
 #endif
 
 
+#ifdef CONFIG_R6_FACEYUV_LV
+/* R6 M7.4: never NULL. With a verified FaceYuv frame: &vram_lv, .vram = the
+ * uncached alias of the current buffer (re-verified on every call). Without:
+ * &vram_lv_none (same geometry, .vram = NULL). vram_lv.vram itself is never
+ * set back to NULL once a frame was verified (it keeps the last verified
+ * buffer, which stays plain RAM), so a caller that tests ->vram and then
+ * reads ->vram again cannot see a NULL that another task stored in between
+ * (page 0 is unmapped on R6). Nothing here writes Canon memory. */
+static struct vram_info vram_lv_none;
+
+struct vram_info * get_yuv422_vram()
+{
+    vram_params_update_if_dirty();
+
+    uint32_t cpu = 0;
+    if (r6_fy_lv_frame(&cpu) && cpu)
+    {
+        vram_lv.vram = (void *) cpu;
+        return &vram_lv;
+    }
+    vram_lv_none.width = vram_lv.width;
+    vram_lv_none.height = vram_lv.height;
+    vram_lv_none.pitch = vram_lv.pitch;
+    vram_lv_none.vram = NULL;
+    return &vram_lv_none;
+}
+
+struct vram_info * get_yuv422_hd_vram()
+{
+    /* no HD buffer on R6: the LV image (same struct rules) */
+    return get_yuv422_vram();
+}
+
+void vram_clear_lv()
+{
+    /* R6: never write Canon's FaceYuv buffer */
+}
+#else
 struct vram_info * get_yuv422_vram()
 {
     vram_params_update_if_dirty();
@@ -710,6 +797,7 @@ void vram_clear_lv()
     if (!lv_vram->vram) return;
     memset(lv_vram->vram, 0, lv_vram->height * lv_vram->pitch);
 }
+#endif /* CONFIG_R6_FACEYUV_LV */
 
 // those properties may signal a screen layout change
 

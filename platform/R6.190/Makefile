@@ -22,6 +22,8 @@ ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/lvprobe.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/refresh_guard.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_layer.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_overlays.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_faceyuv.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_gdraw.o
 
 include ../Makefile
 .DEFAULT_GOAL := $(BUILD_DIR)/cam_complete

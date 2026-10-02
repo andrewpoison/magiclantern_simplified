@@ -22,6 +22,10 @@
  */
 
 #include "dryos.h"
+#ifdef CONFIG_R6_GLOBAL_DRAW
+extern int lv_follow_canon_get(void);   /* propvalues.c (R6) */
+extern int get_global_draw_setting(void);   /* zebra.c */
+#endif
 #include "math.h"
 #include "version.h"
 #include "bmp.h"
@@ -2405,8 +2409,18 @@ static int check_default_warnings(struct menu_entry * entry, char* warning)
     }
     
     // default warnings
+#ifdef CONFIG_R6_GLOBAL_DRAW
+    /* R6 M7.4: the ML menu runs over Canon MENU (GUI mode 0x2003, Canon's LV
+     * stops), so get_global_draw() is always 0 in here; an overlay entry is
+     * usable when Global Draw is ON and the LV flag follows Canon, the screen
+     * gate (r6_gdraw.c) then decides per screen. No get_global_draw() / screen
+     * gate call from the menu task. */
+         if (DEPENDS_ON(DEP_GLOBAL_DRAW) && !(get_global_draw_setting() && lv_follow_canon_get()))
+        snprintf(warning, MENU_MAX_WARNING_LEN, get_global_draw_setting() ? "Needs Debug > LV probe > LV flag follows Canon = ON." : "GlobalDraw is OFF.");
+#else
          if (DEPENDS_ON(DEP_GLOBAL_DRAW) && !get_global_draw())
         snprintf(warning, MENU_MAX_WARNING_LEN, GDR_WARNING_MSG);
+#endif
     else if (DEPENDS_ON(DEP_MOVIE_MODE) && !is_movie_mode())
         snprintf(warning, MENU_MAX_WARNING_LEN, "This feature only works in movie mode.");
     else if (DEPENDS_ON(DEP_PHOTO_MODE) && is_movie_mode())
@@ -2454,7 +2468,11 @@ static int check_default_warnings(struct menu_entry * entry, char* warning)
     
     if (entry->selected) // check recommendations
     {
+#ifdef CONFIG_R6_GLOBAL_DRAW
+             if (WORKS_BEST_IN(DEP_GLOBAL_DRAW) && !(get_global_draw_setting() && lv_follow_canon_get()))
+#else
              if (WORKS_BEST_IN(DEP_GLOBAL_DRAW) && !get_global_draw())
+#endif
             snprintf(warning, MENU_MAX_WARNING_LEN, "This feature works best with GlobalDraw enabled.");
         else if (WORKS_BEST_IN(DEP_MOVIE_MODE) && !is_movie_mode())
             snprintf(warning, MENU_MAX_WARNING_LEN, "This feature works best in movie mode.");

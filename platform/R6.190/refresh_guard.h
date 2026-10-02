@@ -130,6 +130,7 @@ struct r6_refresh_guard_stats
     uint32_t settle_xoc;     /* changes that got the 300 ms window (pure XOC enable change, valid handle) */
     uint32_t settle_xoc_full;/* changes with mask == XOC enable only but the handle invalid now or before: 1000 ms */
     uint32_t settle_keep;    /* changes that did not shorten a longer running window */
+    uint32_t settle_disp;    /* M7.4: refreshes skipped (no piggyback) within 1 s of a display mask / vrammgr_mode change */
     uint32_t idx_changes;    /* VMIX buffer index changes seen */
     int      t_idx_change;   /* ms */
     uint32_t w_mask, w_vm, w_disptype, w_xoc;   /* last watched values (0xFFFFFFFF = pointer invalid) */
