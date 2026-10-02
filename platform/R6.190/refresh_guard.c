@@ -323,6 +323,12 @@ static void rg_act(int now)
 {
     rg.t_act = now;
     rg_act_seen = 1;
+    rg.act_seq++;           /* M7.5: r6g_canon_activity */
+}
+
+uint32_t r6g_canon_activity(void)
+{
+    return rg.act_seq;
 }
 
 static int rg_canon_active(int now)
@@ -356,6 +362,7 @@ static void rg_poll_locked(int now)
         rg.t_change = now;
         rg_settle_start(mask, xoc_ok && rg.w_xoc_ok, now);
         rg_change_seen = 1;
+        rg.act_seq++;       /* M7.5: a display path change counts as Canon activity (r6g_canon_activity) */
 #ifdef CONFIG_R6_GLOBAL_DRAW
         if (mask & 3) { rg_t_disp = now; rg_disp_seen = 1; }
 #endif

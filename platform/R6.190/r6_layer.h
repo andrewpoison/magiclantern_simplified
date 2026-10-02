@@ -30,11 +30,19 @@ int r6_layer_target_ok(const struct MARV * m);
  * pixels are given up and only its empty pixels are claimed. So Canon's UI
  * stays on top of ML's overlays and ML never erases a Canon pixel it painted
  * over. under 0 (ML menu): ML paints over Canon (M6/M7.3).
+ * lazy (M7.5, bmp.c: = under, i.e. not in the ML menu): if the refresh guard
+ * saw no Canon activity since the previous conversion (r6g_canon_activity
+ * unchanged) and the last full conversion is less than 2 s old, a block whose opaque
+ * pixels ML owns completely and whose new LUT values hash to the stored hash
+ * (= ML's content there is unchanged, layer 0 still holds it) is skipped
+ * without reading or writing layer 0. Every other block, and every block of
+ * a conversion after Canon activity (or with lazy 0), is converted exactly as
+ * in M7.4 (a verified unchanged block is not rewritten: same values).
  * Return 1 = done, 0 = not possible (no ownership table: allocation failed,
  * or a misaligned buffer); the caller then runs the old loop.
  * The caller makes them single writers (refresh: between r6g_begin and
  * r6g_end; clear: r6g_clear_lock). */
-int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int under);
+int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int under, int lazy);
 int r6_layer_clear(uint32_t * layer);
 /* 1 = an ownership table exists (the clear may leave the indexed buffer to
  * the next refresh) */
@@ -53,7 +61,7 @@ struct r6_layer_stats
     /* last conversion */
     uint32_t blk_skip;       /* 32-px blocks fully transparent and not owned: skipped */
     uint32_t blk_conv;       /* blocks converted */
-    uint32_t blk_owned;      /* blocks with ML pixels after the conversion */
+    uint32_t blk_owned;      /* blocks with ML pixels after the conversion (also the skipped unchanged ones) */
     uint32_t px_owned;       /* ML pixels in layer 0 after the conversion */
     /* totals */
     uint32_t px_cleared;     /* pixels ML gave up and erased (layer still held exactly ML's values) */
@@ -72,6 +80,16 @@ struct r6_layer_stats
     uint32_t under_drop_blk, under_drop_px;   /* blocks / still drawn ML pixels given up: Canon painted into an owned block */
     uint32_t under_val_n;    /* distinct blocking layer values seen (the last 4 in under_val[n & 3]) */
     uint32_t under_val[4];
+    /* M7.5 lazy conversions (lazy 1 and no Canon activity since the previous conversion) */
+    uint32_t lazy_convs;     /* conversions that ran lazily */
+    uint32_t full_convs;     /* conversions that checked every block (lazy 0, the first one, or Canon activity seen) */
+    uint32_t blk_same;       /* last conversion: unchanged blocks skipped without touching layer 0 (lazy) */
+    uint32_t blk_same_total;
+    uint32_t blk_keep;       /* last conversion: unchanged blocks verified in layer 0 and not rewritten (full, write-under) */
+    uint32_t blk_keep_total;
+    uint32_t us_lazy_last, us_lazy_max, us_full_last, us_full_max;
+    uint32_t full_forced;    /* fix round: full only because the last full one was >= 2 s old */
+    uint32_t lazy_streak, lazy_streak_max;   /* consecutive lazy conversions (current / longest) */
     /* target check (r6_layer_target_ok) */
     uint32_t bad_target;     /* refresh / clear calls refused: layer 0 not as expected */
     uint32_t bad_w, bad_h;   /* MARV width / height of the last refusal */

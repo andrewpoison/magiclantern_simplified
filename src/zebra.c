@@ -55,6 +55,12 @@
 #include "r6_gdraw.h"
 #include "refresh_guard.h"      /* idx_changes: Canon repainted layer 0 */
 #include "r6_layer.h"           /* resets: layer 0 address changed */
+#ifdef FEATURE_HISTOGRAM
+#ifndef FEATURE_R6_CANON_HISTOGRAM
+#error "R6 M7.5: ML's histogram needs Canon's bins (r6_overlays.c)"
+#endif
+#include "r6_overlays.h"        /* M7.5: r6_ml_hist_fill */
+#endif
 #define R6GD_T0() uint64_t r6gd_t0 = get_us_clock()
 #define R6GD_T1(n, us, mx) do { uint32_t _us = (uint32_t) (get_us_clock() - r6gd_t0); \
     r6_gd_st.n++; r6_gd_st.us = _us; if (_us > r6_gd_st.mx) r6_gd_st.mx = _us; } while (0)
@@ -566,6 +572,112 @@ static inline void waveform_add_pixel(int x, int Y)
 }
 #endif
 
+#if defined(FEATURE_HISTOGRAM) && defined(CONFIG_R6_GLOBAL_DRAW)
+/* R6 M7.5: hist_build without the per-pixel loop over FaceYuv (camera M7.4:
+ * histogram + waveform 50..75 ms per pass, peak 230 ms, ~86400 uncached
+ * pixel loads).
+ *  - histogram: Canon's own LV histogram bins (r6_ml_hist_fill, the checks
+ *    of the "Histogram (Canon)" box), filled like the loop below would
+ *    (128 bins, luma always, R/G/B for the RGB type, max without bin 0,
+ *    total_px = numPix); hist_draw_image keeps ML's log scale and clip
+ *    warnings. Not usable (set / sum / range / FrameNum check failed, torn)
+ *    -> the last good histogram is kept while it is at most R6_MLH_HOLD_MS
+ *    old (fix round: no flicker and no erase + redraw conversion for a
+ *    single bad read), then nothing (histogram.total_px 0,
+ *    r6_gd_st.hist_valid 0: the box is erased, draw_histogram_and_waveform);
+ *    stale (FrameNum frozen 1 s) -> nothing at once. No fallback pixel loop: it is the
+ *    cost being removed, and it would run exactly in Canon's transitions
+ *    (set switch, display path change) where FaceYuv is about to be refused
+ *    as well; a FaceYuv histogram also has another scale than Canon's (Y of
+ *    a white wall 85 vs 99, M7.3), so the box would jump between sources.
+ *  - waveform (only if enabled): one sample per waveform column (its first
+ *    ML x, 720 / 180 = 4 px) in every R6_WFM_YSTEP-th ML row = 180 x 60 =
+ *    10800 samples instead of 86400; each adds R6_WFM_WEIGHT (8 = 480 / 60
+ *    samples per column before) up to the same 250 cap, so the brightness of
+ *    the traces stays the same on average. Same columns (x -> column as in
+ *    waveform_add_pixel), same levels, same BM2LV mapping, same box.
+ *    Fix round: the row phase is staggered per column (0, 6, 4, 2 ML rows,
+ *    R6_WFM_PHASE), so together the columns sample every even ML row - all
+ *    rows of M7.4's loop - and a thin horizontal feature (horizon, a line
+ *    of highlights) shows in every 4th column instead of in none; static
+ *    per column, so a static scene still gives an unchanged waveform (no
+ *    redraw). The weight-8 samples make single hits visible (M7.4 hid cells
+ *    with fewer than 4 of 480 hits): sparser, speckled traces are the
+ *    accepted cost of 1/8 of the samples. */
+#define R6_WFM_YSTEP  8
+#define R6_WFM_WEIGHT 8
+#define R6_WFM_PHASE(c) (2 * (((c) * 3) & 3))   /* 0, 6, 4, 2, 0, ... (even ML rows: M7.4 sampled y += 2) */
+#define R6_MLH_HOLD_MS 1000
+static void r6_hist_build(const uint32_t * buf)
+{
+    static int r6_mlh_t_ok = 0, r6_mlh_ok = 0;  /* last good fill (ms), histogram holds it */
+    int rgb = (hist_type == 1 || hist_type == 2) && !EXT_MONITOR_RCA;   /* as below */
+    int s = R6H_OFF;
+    if (hist_draw)
+    {
+        R6GD_T0();
+        s = r6_ml_hist_fill(&histogram, rgb);   /* SHOWN: histogram refilled; else untouched */
+        r6_gd_st.hcanon_state = s;
+        if (s == R6H_SHOWN) r6_gd_st.hcanon_ok++; else r6_gd_st.hcanon_fail++;
+        R6GD_T1(hcanon_n, hcanon_us, hcanon_us_max);
+    }
+    int now = get_ms_clock();
+    if (s == R6H_SHOWN)
+    {
+        r6_mlh_t_ok = now;
+        r6_mlh_ok = 1;
+        r6_gd_st.hist_valid = 1;
+    }
+    else if (hist_draw && s != R6H_STALE && r6_mlh_ok && now >= r6_mlh_t_ok && now - r6_mlh_t_ok <= R6_MLH_HOLD_MS)
+    {
+        r6_gd_st.hist_hold++;                    /* last good histogram kept (at most 1 s old) */
+        r6_gd_st.hist_valid = 1;
+    }
+    else
+    {
+        memset(&histogram, 0, sizeof(histogram));
+        histogram.is_rgb = rgb;
+        r6_mlh_ok = 0;
+        r6_gd_st.hist_valid = 0;
+    }
+    #ifdef FEATURE_WAVEFORM
+    if (waveform_draw)
+    {
+        waveform_init();
+        if (!waveform) return;
+        R6GD_T0();
+        uint16_t xw[WAVEFORM_WIDTH];            /* LV word offset of each column's sample */
+        for (int c = 0; c < WAVEFORM_WIDTH; c++)
+        {
+            int x = os.x0 + (c * os.x_ex + WAVEFORM_WIDTH - 1) / WAVEFORM_WIDTH;   /* first ML x of column c */
+            xw[c] = (BM2LV_X(x) << 1) >> 2;
+        }
+        uint32_t n = 0;
+        int off = get_y_skip_offset_for_histogram();
+        int y1 = os.y_max - off;
+        for (int y = os.y0 + off; y < y1; y += R6_WFM_YSTEP)
+        {
+            const uint32_t * rows[R6_WFM_YSTEP];
+            for (int k = 0; k < R6_WFM_YSTEP; k++)
+                rows[k] = (y + k < y1) ? buf + (BM2LV_R(y + k) >> 2) : NULL;
+            for (int c = 0; c < WAVEFORM_WIDTH; c++)
+            {
+                const uint32_t * row = rows[R6_WFM_PHASE(c)];
+                if (!row) continue;                  /* last group: row past the end */
+                uint32_t pixel = row[xw[c]];
+                int Y = UYVY_GET_AVG_Y(pixel);
+                uint8_t * w = &WAVEFORM(c, (Y * WAVEFORM_HEIGHT) >> 8);
+                if (*w < 250) *w = MIN(*w + R6_WFM_WEIGHT, 250);
+                n++;
+            }
+        }
+        r6_gd_st.wfm_samples = n;
+        R6GD_T1(wfm_n, wfm_us, wfm_us_max);
+    }
+    #endif
+}
+#endif
+
 #if defined(FEATURE_HISTOGRAM)
 static void
 hist_build()
@@ -574,6 +686,9 @@ hist_build()
     uint32_t* buf = (uint32_t*)lv->vram;
     if (!buf) return;
 
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    r6_hist_build(buf);     /* R6 M7.5: Canon's bins + subsampled waveform (no vectorscope / RAW on R6) */
+    #else
     int x,y;
 
     memset(&histogram, 0, sizeof(histogram));
@@ -652,6 +767,7 @@ hist_build()
             #endif
         }
     }
+    #endif /* CONFIG_R6_GLOBAL_DRAW */
 }
 #endif // FEATURE_HISTOGRAM
 #endif // FEATURE_HISTOGRAM || FEATURE_WAVEFORM || FEATURE_VECTORSCOPE
@@ -3207,6 +3323,9 @@ struct menu_entry zebra_menus[] = {
         .max = 1,
         .update = hist_print,
         .help = "Exposure aid: shows the distribution of brightness levels.",
+        #ifdef CONFIG_R6_GLOBAL_DRAW
+        .help2 = "R6: Canon's LV histogram; zebras/waveform read FaceYuv.",
+        #endif
         .depends_on = DEP_GLOBAL_DRAW | DEP_EXPSIM,
         .submenu_width = 700,
         .children =  (struct menu_entry[]) {
@@ -3965,7 +4084,19 @@ void draw_histogram_and_waveform(int allow_play)
         int changed = 0;
         BMP_LOCK(
             uint32_t pre = r6_gd_bv_hash(R6_GD_HIST_X - 1, R6_GD_HIST_Y - 1, HIST_WIDTH + 2, hist_height + 2);
-            if (!(r6_hvalid && k == r6_hk && pre == r6_hbox))
+            if (!r6_gd_st.hist_valid)
+            {
+                /* M7.5: Canon's bins not usable (r6_hist_build): no
+                 * histogram - erase ML's box once (ML's pixels only) */
+                r6_gd_st.hist_none++;
+                if (r6_hvalid && !gui_menu_shown())
+                {
+                    bmp_fill(COLOR_EMPTY, R6_GD_HIST_X - 1, R6_GD_HIST_Y - 1, HIST_WIDTH + 2, hist_height + 2);
+                    r6_hvalid = 0;
+                    changed = r6_gd_bv_hash(R6_GD_HIST_X - 1, R6_GD_HIST_Y - 1, HIST_WIDTH + 2, hist_height + 2) != pre;
+                }
+            }
+            else if (!(r6_hvalid && k == r6_hk && pre == r6_hbox))
             {
                 hist_draw_image( R6_GD_HIST_X, R6_GD_HIST_Y );
                 r6_gd_st.drawn |= R6GD_DRAWN_HIST;
@@ -4483,7 +4614,7 @@ livev_hipriority_task( void* unused )
             {
                 #ifdef CONFIG_R6_GLOBAL_DRAW
                 static int r6_fc_aux = 0;
-                if (should_run_polling_action(R6_GD_FALSE_MS, &r6_fc_aux))     /* R6: 1 x per second */
+                if (should_run_polling_action(R6_GD_FALSE_MS, &r6_fc_aux))     /* R6: 3 x per second (R6_GD_FALSE_MS) */
                 #else
                 if (k % 4 == 0)
                 #endif

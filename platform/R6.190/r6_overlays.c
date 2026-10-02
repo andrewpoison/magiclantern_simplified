@@ -42,6 +42,11 @@
  * The setting is NOT saved in ML's config file (plain variable, OFF at every
  * boot) until the first camera test has passed.
  *
+ * M7.5: the same reads also feed ML's own histogram (r6_ml_hist_fill, called
+ * by src/zebra.c hist_build instead of its FaceYuv pixel loop), with its own
+ * copy buffer and FrameNum state; the box here steps aside while ML's
+ * histogram is enabled (R6H_MLHIST), so only one of them is drawn.
+ *
  * Box: 128 x 64 bins area + 2 px frame at ML (572,50)..(704,118), right
  * below Canon's Q icon and top bar on the LCD shooting screen (M5 photo:
  * Canon's top row ends at about y 48, the Q icon covers x 631..710 up to
@@ -65,7 +70,7 @@
 #error "r6_overlays.c: needs the ownership-aware refresh (and, with global draw, the R6 global draw rules)"
 #endif
 #ifdef FEATURE_HISTOGRAM
-#include "histogram.h"          /* hist_draw */
+#include "histogram.h"          /* hist_draw, struct Histogram (M7.5) */
 extern int get_global_draw_setting(void);   /* zebra.c */
 extern int lv_follow_canon_get(void);       /* propvalues.c */
 #endif
@@ -116,7 +121,7 @@ static int r6h_force = 1;                   /* next draw repaints the whole box 
 static const char * const r6h_names[R6H_NREASONS] = {
     "shown", "off", "no LV", "ML menu", "Canon GUI", "OLC", "display off", "not LCD",
     "no LV dialog", "no hist set", "bad pointer", "sum != numPix", "no FrameNum", "stale",
-    "ML histogram on",
+    "ML histogram on", "torn",
 };
 
 const char * r6_overlay_reason(uint32_t s)
@@ -218,17 +223,17 @@ static int r6h_gui_state(void)
     return R6H_SHOWN;
 }
 
-/* copy the arrays used by mode (Luma: Y = 0; RGB: 1..3); returns R6H_SHOWN,
- * a failure state, or -1 = torn (set changed during the copy: retry) */
-static int r6h_read(int mode, uint32_t * frame)
+/* copy Canon's arrays c0..c1 (Y = 0, R, G, B = 1..3) of the published DISP
+ * set into bins; returns R6H_SHOWN (*numpix, *frame set), a failure state,
+ * or -1 = torn (set changed during the copy: retry). *set_out = the set. */
+static int r6h_read_bins(uint32_t bins[4][256], int c0, int c1, uint32_t * frame, uint32_t * numpix, int * set_out)
 {
     int uc = ov_uc_ok();
     uint32_t ctx = RD(OV_HIST_STATE + 4), p[4], q[4];
     int set = ov_hist_set(ctx, p, uc);
-    st.set = set;
+    *set_out = set;
     if (set < 0) return R6H_NO_SET;
     uint32_t n = RD(ctx + 4);
-    int c0 = mode == 1 ? 0 : 1, c1 = mode == 1 ? 0 : 3;
     for (int c = c0; c <= c1; c++)
     {
         if (!p[c] || !ov_ram_ok(p[c], 0x400, uc)) return R6H_BAD_PTR;
@@ -236,7 +241,7 @@ static int r6h_read(int mode, uint32_t * frame)
         for (int i = 0; i < 256; i++)
         {
             uint32_t v = RD(p[c] + 4 * i);       /* 32-bit loads, uncached heap */
-            r6h_bins[c][i] = v;
+            bins[c][i] = v;
             s += v;
         }
         if (!n || s != n) return R6H_SUM;
@@ -244,8 +249,21 @@ static int r6h_read(int mode, uint32_t * frame)
     if (ov_hist_set(ctx, q, uc) != set || RD(ctx + 4) != n) return -1;
     for (int i = 0; i < 4; i++) if (q[i] != p[i]) return -1;
     if (!ov_framenum(frame, uc)) return R6H_NO_FRAME;
-    st.numpix = n;
+    *numpix = n;
     return R6H_SHOWN;
+}
+
+/* copy the arrays used by mode (Luma: Y = 0; RGB: 1..3); returns R6H_SHOWN,
+ * a failure state, or -1 = torn (set changed during the copy: retry) */
+static int r6h_read(int mode, uint32_t * frame)
+{
+    int c0 = mode == 1 ? 0 : 1, c1 = mode == 1 ? 0 : 3;
+    uint32_t n = 0;
+    int set = -1;
+    int s = r6h_read_bins(r6h_bins, c0, c1, frame, &n, &set);
+    st.set = set;
+    if (s == R6H_SHOWN) st.numpix = n;
+    return s;
 }
 
 /* R, G, B lit -> colour (additive) */
@@ -433,6 +451,87 @@ static void r6h_task(void * unused)
 }
 
 TASK_CREATE("r6_hist_task", r6h_task, 0, 0x1f, 0x1000);
+
+#ifdef FEATURE_HISTOGRAM
+/* ---- M7.5: ML's own histogram from Canon's bins (r6_overlays.h) ----
+ * Own buffer and FrameNum state (the box above keeps its own; both may read
+ * at the same time, the reads are plain loads). */
+#if HIST_WIDTH != 128
+#error "r6_ml_hist_fill: Canon's 256 bins map to 128 ML bins as pairs"
+#endif
+static struct r6_mlhist_stats mst = { .set = -1 };
+static uint32_t r6m_bins[4][256];
+static uint32_t r6m_frame = 0;
+static int r6m_t_frame = 0, r6m_seen = 0;
+
+const struct r6_mlhist_stats * r6_mlhist_stats(void)
+{
+    return &mst;
+}
+
+int r6_ml_hist_fill(struct Histogram * h, int rgb)
+{
+    uint64_t t0 = get_us_clock();
+    uint32_t fr = 0, n = 0;
+    int set = -1, s = -1;
+    mst.calls++;
+    /* torn, and (fix round) no DISP set - ov_hist_set also refuses a half
+     * published pointer set - are retried, at most 3 reads */
+    for (int i = 0; i < 3 && (s < 0 || s == R6H_NO_SET); i++)
+    {
+        s = r6h_read_bins(r6m_bins, 0, rgb ? 3 : 0, &fr, &n, &set);
+        if (s < 0) mst.torn++;
+        else if (s == R6H_NO_SET) mst.noset++;
+    }
+    if (s < 0) s = R6H_TORN;
+    mst.set = set;
+    int now = get_ms_clock();
+    if (s == R6H_SHOWN)
+    {
+        if (!r6m_seen || fr != r6m_frame)
+        {
+            r6m_seen = 1;
+            r6m_frame = fr;
+            r6m_t_frame = now;
+        }
+        else if (now - r6m_t_frame > R6H_STALE_MS || now < r6m_t_frame)
+            s = R6H_STALE;                       /* Canon's LV histogram frozen: nothing shown */
+    }
+    else if (s != R6H_TORN)
+        r6m_seen = 0;
+    if (s == R6H_SHOWN)
+    {
+        memset(h, 0, sizeof(*h));
+        h->is_rgb = rgb;
+        uint32_t mx = 0;
+        for (int i = 0; i < HIST_WIDTH; i++)
+        {
+            uint32_t y = r6m_bins[0][2 * i] + r6m_bins[0][2 * i + 1];
+            h->hist[i] = y;
+            if (i && y > mx) mx = y;             /* hist_add_pixel: bin 0 never sets the maximum */
+            if (rgb)
+            {
+                h->hist_r[i] = r6m_bins[1][2 * i] + r6m_bins[1][2 * i + 1];
+                h->hist_g[i] = r6m_bins[2][2 * i] + r6m_bins[2][2 * i + 1];
+                h->hist_b[i] = r6m_bins[3][2 * i] + r6m_bins[3][2 * i + 1];
+            }
+        }
+        /* fix round: max >= 2 - hist_draw_image's log scale divides by
+         * log_length(max), which is 0 for max 1 (a black frame: everything in bin 0) */
+        h->max = MAX(mx, 2);
+        h->total_px = n;
+        mst.ok++;
+        mst.numpix = n;
+        mst.frame = fr;
+    }
+    mst.last = s;
+    mst.reasons[s]++;
+    uint32_t us = (uint32_t) (get_us_clock() - t0);
+    mst.us_last = us;
+    if (us > mst.us_max) mst.us_max = us;
+    return s;
+}
+#endif /* FEATURE_HISTOGRAM */
 
 static MENU_UPDATE_FUNC(r6h_menu_update)
 {

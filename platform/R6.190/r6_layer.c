@@ -43,7 +43,11 @@
  *   previous indexed frame (518 KB): too big; only for owned blocks it is
  *     still up to 518 KB with the ML menu open (every block owned).
  *   mask + 32-bit hash per block (129.6 KB, chosen): bounded, exact up to a
- *     hash collision (2^-32 per check of a block Canon painted into);
+ *     hash collision (a single changed pixel is always detected: the
+ *     word-wise FNV-1a chain is bijective in each value; a collision needs
+ *     >= 2 changed pixels in the block, and value differences only in high
+ *     bits are weaker than 2^-32 - worst pair of R6 LUT colours: 18
+ *     effective bits; cosmetic either way: M7.5 lazy skip, see below);
  *     granularity: one Canon pixel in a block keeps ML's given-up pixels of
  *     that block (cosmetic, never destructive).
  *   mask + 16-bit hash (97.2 KB): possible fallback if memory gets tight.
@@ -69,6 +73,42 @@
  * such a block stay until Canon repaints there (cosmetic, counted in
  * under_drop_*). The ML menu (under = 0) paints over Canon as in M6/M7.3.
  *
+ * M7.5 lazy conversion (performance; camera M7.4: a conversion with the
+ * false color band owned took up to ~205 ms, mostly layer 0 accesses, and a
+ * small change such as the spotmeter text converted every owned block
+ * again). ML's model of layer 0 (mask + hash per block) can only go wrong
+ * through a Canon write into layer 0, and Canon shows such a write only with
+ * a flush (VMIX transfer: buffer index change, pending, frame in flight),
+ * which the refresh guard's polls count (r6g_canon_activity). If that count
+ * did not change since the previous conversion, a block is skipped without
+ * any layer 0 access when
+ *   - its opaque pixels are exactly the pixels ML owns (nm == mask: no
+ *     write-under pixel blocked by Canon, nothing kept by a piggyback), and
+ *   - the FNV-1a hash of the LUT values ML would write equals the stored hash
+ *     (= ML's own content of the block is unchanged; a LUT change changes it)
+ * i.e. exactly the blocks for which M7.4 would verify layer 0 and rewrite the
+ * same values (a no-op). Changed blocks, incomplete blocks (blocked or kept
+ * pixels: re-evaluated every time, so a pixel Canon frees is claimed as in
+ * M7.4) and given-up pixels (erased only after the hash check) go through the
+ * M7.4 path unchanged. After Canon activity (and with lazy 0) the whole
+ * conversion is the M7.4 one, which re-verifies every owned block, drops the
+ * blocks Canon painted into and re-shows ML's pixels Canon wiped (zebra.c's
+ * re-show after a VMIX index change requests that conversion); there, a
+ * write-under block that verifies and is unchanged is not rewritten (same
+ * values). A skip never writes layer 0, so it can neither erase nor cover a
+ * Canon pixel: polls that miss a Canon flush (even number of index flips)
+ * only delay the re-verification (cosmetic: e.g. ML's pixels that Canon
+ * wiped stay away until the next conversion after Canon activity). No extra
+ * memory: the stored block hash already is the hash of the values ML wrote.
+ * Fix round (review): bmp.c passes lazy only in the write-under mode (ML
+ * menu closed); the ML menu converts every block as in M7.4, so a missed
+ * Canon flush cannot leave a stale block hash that would veto the menu's
+ * clear (ML menu remnants). Unchanged complete blocks - also the "kept"
+ * ones of a full conversion - are re-verified only by a full conversion:
+ * after Canon activity, and at the latest R6L_LAZY_MAX_MS after the
+ * previous full one (bounds the effect of polls that missed a flush;
+ * longest lazy streak in lazy_streak_max).
+ *
  * Reads/writes: ML's indexed buffer and Canon's layer 0 (bitmap_data of
  * Canon's MARV, the same memory the old loop wrote); no Canon calls (the
  * caller holds the guard lock), get_us_clock for the timing.
@@ -78,6 +118,7 @@
 #include "bmp.h"
 #include "mem.h"
 #include "r6_layer.h"
+#include "refresh_guard.h"        /* M7.5: r6g_canon_activity */
 
 #ifdef CONFIG_R6_LAYER_OWNERSHIP
 
@@ -106,6 +147,10 @@ static struct r6l_blk * r6l_own = NULL;
 static uint32_t * r6l_layer = NULL;          /* layer the table describes */
 static uint32_t r6l_lut[256];
 static struct r6_layer_stats st = { .us_min = 0xFFFFFFFF };
+static uint32_t r6l_act = 0;                 /* M7.5: r6g_canon_activity() at the previous conversion */
+static int r6l_act_valid = 0;
+#define R6L_LAZY_MAX_MS 2000                 /* M7.5 fix: a full conversion at least every 2 s (while converting) */
+static uint32_t r6l_t_full = 0;              /* ms (us clock / 1000) of the last full conversion */
 
 static inline uint32_t r6l_mix(uint32_t h, uint32_t v)
 {
@@ -180,7 +225,7 @@ uint32_t r6_layer_deferred(void)
     return st.defer_blk;
 }
 
-int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int under)
+int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int under, int lazy)
 {
     st.defer_blk = 0;
     if (!idx || !layer || ((uintptr_t) idx & 3) || ((uintptr_t) layer & 3)) return 0;
@@ -191,7 +236,29 @@ int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int
     if (!fast) st.slow_lut++;
     if (!allow_erase) st.defer_convs++;
     if (under) st.under_convs++;
-    uint32_t skip = 0, conv = 0, owned_b = 0, owned_px = 0, defer_b = 0, blocked_px = 0;
+    /* M7.5: lazy only while Canon was quiet since the previous conversion */
+    uint32_t act = r6g_canon_activity();
+    uint32_t now_ms = (uint32_t) (t0 / 1000);
+    int lz = lazy && r6l_act_valid && act == r6l_act;
+    if (lz && now_ms - r6l_t_full >= R6L_LAZY_MAX_MS)
+    {
+        lz = 0;                                  /* re-verify the skipped / kept blocks now and then */
+        st.full_forced++;
+    }
+    r6l_act = act;
+    r6l_act_valid = 1;
+    if (lz)
+    {
+        st.lazy_convs++;
+        if (++st.lazy_streak > st.lazy_streak_max) st.lazy_streak_max = st.lazy_streak;
+    }
+    else
+    {
+        st.full_convs++;
+        st.lazy_streak = 0;
+        r6l_t_full = now_ms;
+    }
+    uint32_t skip = 0, conv = 0, owned_b = 0, owned_px = 0, defer_b = 0, blocked_px = 0, same = 0, kept = 0;
 
     struct r6l_blk * o = r6l_own;
     for (int y = 0; y < R6L_H; y++)
@@ -214,9 +281,33 @@ int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int
             if (fast && !any && !om) { skip++; continue; }
 
             uint32_t nm = 0;
-            for (int i = 0; i < 32; i++)
-                if (r6l_lut[s.b[i]] & 0xFF000000) nm |= 1u << i;
+            /* M7.5: for an owned block, the hash of the values ML would write
+             * (opaque pixels in bit order, as stored below) in the same pass */
+            uint32_t hn = R6L_H0;
+            if (om)
+            {
+                for (int i = 0; i < 32; i++)
+                {
+                    uint32_t v = r6l_lut[s.b[i]];
+                    if (v & 0xFF000000) { nm |= 1u << i; hn = r6l_mix(hn, v); }
+                }
+            }
+            else
+            {
+                for (int i = 0; i < 32; i++)
+                    if (r6l_lut[s.b[i]] & 0xFF000000) nm |= 1u << i;
+            }
             if (!nm && !om) { skip++; continue; }       /* slow LUT path only */
+
+            /* M7.5: ML's content of a complete block unchanged (same opaque
+             * pixels, hash of the new values == stored hash of the values written)? */
+            int unchanged = om && nm == om && hn == o->hash;
+            if (unchanged && lz)
+            {
+                same++;                                  /* lazy: no layer 0 access at all */
+                owned_b++; owned_px += __builtin_popcount(om);
+                continue;
+            }
             conv++;
 
             uint32_t * d = drow + bx * 32;
@@ -225,6 +316,15 @@ int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int
             /* M7.4: the hash check is needed for the given-up pixels and, in
              * the write-under mode, for the re-asserted ones */
             int verified = om && (cm || under) ? r6l_hash_layer(d, om) == o->hash : 1;
+            if (unchanged && under && verified)
+            {
+                /* M7.5: layer 0 holds exactly ML's unchanged values (M7.4
+                 * rewrote the same values): keep, no writes (re-verified
+                 * by the next full conversion, see the header) */
+                kept++;
+                owned_b++; owned_px += __builtin_popcount(om);
+                continue;
+            }
             if (cm)
             {
                 if (!verified)
@@ -295,6 +395,10 @@ int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int
     st.under_blocked_px += blocked_px;
     st.blk_skip = skip;
     st.blk_conv = conv;
+    st.blk_same = same;
+    st.blk_same_total += same;
+    st.blk_keep = kept;
+    st.blk_keep_total += kept;
     st.blk_owned = owned_b;
     st.px_owned = owned_px;
     st.conversions++;
@@ -303,6 +407,8 @@ int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int
     if (us > st.us_max) st.us_max = us;
     if (us < st.us_min) st.us_min = us;
     st.us_sum += us;
+    if (lz) { st.us_lazy_last = us; if (us > st.us_lazy_max) st.us_lazy_max = us; }
+    else    { st.us_full_last = us; if (us > st.us_full_max) st.us_full_max = us; }
     return 1;
 }
 

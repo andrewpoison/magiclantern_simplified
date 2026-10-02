@@ -314,7 +314,10 @@ void refresh_yuv_from_rgb(void)
 #else
         int r6l_under = 0;
 #endif
-        int r6l_done = r6_layer_convert(b, rgb_data, r6g_mode == R6G_EXE, r6l_under);
+        /* M7.5: lazy - unchanged blocks are skipped while Canon was quiet
+         * (r6_layer.h); only in the write-under mode: the ML menu converts
+         * every block as in M7.4 (its clear must find exact block hashes) */
+        int r6l_done = r6_layer_convert(b, rgb_data, r6g_mode == R6G_EXE, r6l_under, r6l_under);
 #ifdef CONFIG_R6_GLOBAL_DRAW
         if (r6l_done) r6_gd_conv_done(r6_layer_stats()->us_last);
 #endif

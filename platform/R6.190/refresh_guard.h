@@ -102,6 +102,8 @@ struct r6_refresh_guard_stats
     int      t_act;          /* ms, last observation */
     uint32_t act_idx, act_pend, act_img;        /* observations per kind */
     uint32_t act_win_ms;     /* window used last: 200 (panel) or 1000 (EVF bit 0x10 / mask unknown) */
+    uint32_t act_seq;        /* M7.5: +1 per Canon activity observation (index change, pending, frame in flight)
+                              * and per watched value change; r6g_canon_activity() */
     /* log-only flags, counted after a successful take ("would skip") */
     uint32_t would_lock;     /* MEM(0x18438) != 0 */
     uint32_t would_disdraw;  /* (int) MEM(0x1843C) > 0 */
@@ -172,6 +174,16 @@ struct r6_refresh_guard_stats
 };
 
 const struct r6_refresh_guard_stats * r6_refresh_guard_stats(void);
+
+/* M7.5: Canon activity sequence (rg.act_seq): changes whenever a poll saw
+ * Canon working on its display (VMIX buffer index change, transfer pending,
+ * frame in flight) or a watched display value change. r6_layer.c compares it
+ * between two conversions: unchanged = Canon was quiet in between as far as
+ * the polls saw, so layer 0 still holds what ML wrote last (RAM read, no
+ * Canon access). The polls can miss an even number of index flips; the
+ * consumer must therefore only use it to skip work that changes nothing in
+ * layer 0 (never to erase or overwrite) */
+uint32_t r6g_canon_activity(void);
 /* current episode length in ms (0 if none) */
 uint32_t r6_refresh_guard_starve_ms(void);
 

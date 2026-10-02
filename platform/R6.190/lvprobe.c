@@ -668,6 +668,7 @@ static void lp_guard_log(struct lp_buf * b)
     LG("act_pend", g->act_pend);
     LG("act_img", g->act_img);
     LG("act_win_ms", g->act_win_ms);
+    LG("act_seq", g->act_seq);
     LG("would_lock", g->would_lock);
     LG("would_disdraw", g->would_disdraw);
     LG("would_disref", g->would_disref);
@@ -753,6 +754,7 @@ static void lp_census_m72a(struct lp_buf * b)
     lp_printf(b, "# M7.2a: LV histogram, RandomData, FaceYuv, dynamic window / GS stage 0, VMIX/WINSYS, guard\n");
     lp_printf(b, "# M7.3: FaceYuv records + sample, ownership refresh (layer.*), histogram overlay (ovh.*)\n");
     lp_printf(b, "# M7.4: ML LV image source (fyl.*), ML overlays / global draw (gd.*)\n");
+    lp_printf(b, "# M7.5: lazy conversion (layer.lazy_*, blk_same, blk_keep, full_forced), ML histogram from Canon's bins (gd.hcanon_*, gd.hist_hold, mlh.*), subsampled waveform (gd.wfm_*)\n");
 
     /* -- Canon LV histogram (Option 1) -- */
     lp_globs(b, "hist.state", LP_HIST_STATE, 7);                 /* 0x11F44..+0x1B */
@@ -977,6 +979,18 @@ static void lp_census_m72a(struct lp_buf * b)
         LL("under_drop_blk", s->under_drop_blk);
         LL("under_drop_px", s->under_drop_px);
         LL("under_val_n", s->under_val_n);
+        LL("lazy_convs", s->lazy_convs);
+        LL("full_convs", s->full_convs);
+        LL("blk_same", s->blk_same);
+        LL("blk_same_total", s->blk_same_total);
+        LL("blk_keep", s->blk_keep);
+        LL("blk_keep_total", s->blk_keep_total);
+        LL("us_lazy_last", s->us_lazy_last);
+        LL("us_lazy_max", s->us_lazy_max);
+        LL("us_full_last", s->us_full_last);
+        LL("us_full_max", s->us_full_max);
+        LL("full_forced", s->full_forced);
+        LL("lazy_streak_max", s->lazy_streak_max);
         for (int i = 0; i < 4; i++)
         {
             snprintf(k, sizeof(k), "layer.under_val[%d]", i);       lp_printf(b, "%s=0x%08x\n", k, (int) s->under_val[i]);
@@ -1075,7 +1089,29 @@ static void lp_census_m72a(struct lp_buf * b)
         LGD("movie_sm", g->movie_sm);      LGD("movie_lvms", g->movie_lvms);
         lp_printf(b, "gd.shooting_mode=0x%x\n", (int) g->shooting_mode);
         LGD("lv_movie_select", g->lv_movie_select);
+        LGD("hcanon_n", g->hcanon_n);      LGD("hcanon_us", g->hcanon_us);         LGD("hcanon_us_max", g->hcanon_us_max);
+        LGD("hcanon_ok", g->hcanon_ok);    LGD("hcanon_fail", g->hcanon_fail);
+        lp_printf(b, "gd.hcanon_state=%s\n", r6_overlay_reason(g->hcanon_state));
+        LGD("hist_valid", g->hist_valid);  LGD("hist_none", g->hist_none);       LGD("hist_hold", g->hist_hold);
+        LGD("wfm_n", g->wfm_n);            LGD("wfm_us", g->wfm_us);               LGD("wfm_us_max", g->wfm_us_max);
+        LGD("wfm_samples", g->wfm_samples);
 #undef LGD
+    }
+#endif
+#if defined(CONFIG_R6_GLOBAL_DRAW) && defined(FEATURE_HISTOGRAM)
+    {
+        const struct r6_mlhist_stats * m = r6_mlhist_stats();
+#define LMH(name, val) lp_printf(b, "mlh." name "=%d\n", (int) (val))
+        LMH("calls", m->calls);            LMH("ok", m->ok);                       LMH("torn", m->torn);
+        LMH("noset", m->noset);
+        for (int i = 0; i < R6H_NREASONS; i++)
+        {
+            snprintf(k, sizeof(k), "mlh.reason[%d]", i);          lp_printf(b, "%s=%d\n", k, (int) m->reasons[i]);
+        }
+        lp_printf(b, "mlh.last=%s\n", r6_overlay_reason(m->last));
+        LMH("set", m->set);                LMH("numpix", m->numpix);               LMH("frame", m->frame);
+        LMH("us_last", m->us_last);        LMH("us_max", m->us_max);
+#undef LMH
     }
 #endif
 }

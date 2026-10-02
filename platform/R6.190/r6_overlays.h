@@ -24,6 +24,7 @@ enum {
     R6H_NO_FRAME,    /* RandomData FrameNum not readable */
     R6H_STALE,       /* FrameNum unchanged for 1 s */
     R6H_MLHIST,      /* M7.4: ML's own histogram (Global Draw) is enabled: same box position */
+    R6H_TORN,        /* M7.5 (ML histogram only): the published set changed during every copy attempt */
     R6H_NREASONS
 };
 
@@ -46,5 +47,31 @@ struct r6_overlay_stats
 
 const struct r6_overlay_stats * r6_overlay_stats(void);
 const char * r6_overlay_reason(uint32_t state);
+
+/* M7.5: ML's own histogram (src/zebra.c hist_build, FEATURE_HISTOGRAM) from
+ * Canon's LV histogram bins instead of a pixel loop over FaceYuv. Same reads
+ * and checks as the "Histogram (Canon)" box (DISP set 0/1, every used array
+ * in range and summing to numPix, set unchanged after the copy, RandomData
+ * FrameNum readable and not frozen for 1 s). On R6H_SHOWN h is cleared and
+ * filled like hist_build's pixel loop: 128 bins = Canon's bin pairs (ML:
+ * Y * 128 >> 8), luma always, R/G/B if rgb (is_rgb = rgb), total_px =
+ * numPix, max = highest luma bin except bin 0 (hist_add_pixel ignores bin
+ * 0), at least 2 (log scale). Torn reads and "no DISP set" are retried (at
+ * most 3 reads). Any other result: a reason, h untouched (the caller keeps
+ * or clears it). Caller: one task (livev_loprio_task). RAM reads only. */
+struct Histogram;
+int r6_ml_hist_fill(struct Histogram * h, int rgb);
+
+struct r6_mlhist_stats
+{
+    uint32_t calls, ok, torn;        /* torn: copy attempts that saw the set change (retried, at most 3) */
+    uint32_t noset;                  /* fix round: reads without a DISP set (retried as well) */
+    uint32_t reasons[R6H_NREASONS];  /* results per state */
+    uint32_t last;                   /* R6H_* of the last call */
+    int      set;                    /* DISP set of the last read, -1 none */
+    uint32_t numpix, frame;          /* last good read */
+    uint32_t us_last, us_max;        /* read + fill */
+};
+const struct r6_mlhist_stats * r6_mlhist_stats(void);
 
 #endif

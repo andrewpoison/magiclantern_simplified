@@ -33,9 +33,13 @@
  * waveform boxes: hash before / after; spotmeter: skipped while value and
  * box are unchanged); the guard caps ML's own XimrExe at 5 per second in LV,
  * and the conversion cap (bmp.c, r6_gd_conv_hold) keeps the conversions at
- * about 10 % of a core ---- */
+ * about 10 % of a core. M7.5: the conversion skips unchanged blocks while
+ * Canon is quiet (r6_layer.c), so a small change costs only its blocks and
+ * the cap waits correspondingly less; the histogram comes from Canon's bins
+ * and the waveform from a 180 x 60 subsample (zebra.c r6_hist_build) ---- */
 #define R6_GD_ZEBRA_MS    250       /* zebras recomputed at most 4 x per second (ML default: ~15 x) */
-#define R6_GD_FALSE_MS    1000      /* false color at most 1 x per second (full band: costly conversion) */
+#define R6_GD_FALSE_MS    333       /* M7.5: false color at most 3 x per second (M7.4: 1 x; the lazy conversion,
+                                     * r6_layer.c, converts only the blocks that changed; the cap below stays) */
 #define R6_GD_RESHOW_MS   500       /* after Canon repainted layer 0 (VMIX index changed): re-show ML's pixels, at most 2 x per second */
 #define R6_GD_CAP_DUTY    10        /* conversion cap: wait 10 x the last conversion time (~10 % of a core) */
 #define R6_GD_CAP_MAX_MS  2000      /* ... but at most 2 s */
@@ -86,6 +90,14 @@ struct r6_gd_stats
     uint32_t zebra_n, zebra_changed, zebra_us, zebra_us_max, zebra_nolv;
     uint32_t fc_n, fc_us, fc_us_max, fc_nolv;
     uint32_t hist_n, hist_us, hist_us_max, hist_nolv;   /* hist_build (+ waveform accumulation) */
+    /* M7.5: hist_build parts (zebra.c r6_hist_build) */
+    uint32_t hcanon_n, hcanon_us, hcanon_us_max;        /* ML histogram from Canon's bins (r6_ml_hist_fill) */
+    uint32_t hcanon_ok, hcanon_fail;
+    uint32_t hcanon_state;           /* R6H_* of the last fill (r6_overlays.h) */
+    uint32_t hist_valid;             /* 1 = histogram holds Canon's current bins (else nothing is shown) */
+    uint32_t hist_none;              /* box passes with nothing to show (box erased once) */
+    uint32_t hist_hold;              /* fix round: failed fills that kept the last good histogram (<= 1 s old) */
+    uint32_t wfm_n, wfm_us, wfm_us_max, wfm_samples;    /* subsampled waveform accumulation */
     uint32_t hdraw_n, wdraw_n, draw_us, draw_us_max;    /* histogram / waveform box drawing */
     uint32_t spot_n, spot_us, spot_us_max;
     uint32_t erase_n;                /* ML overlay pixels erased when the screen state ended (r6_gd_erase) */

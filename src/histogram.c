@@ -203,7 +203,13 @@ static int hist_dot_radius(int over, int hist_total_px)
     if (p > 1) return 10;
 
     // for smaller overexposure percentages, use dot radius to suggest the amount
+#ifdef CONFIG_R6_GLOBAL_DRAW
+    /* R6 M7.5: total = Canon's numPix (EVF 1093120): here over < 2 % of it,
+     * unsigned 100000 * over stays below 2^32 up to a total of 2.1 M */
+    unsigned p1000 = 100u * 1000u * (unsigned) over / (unsigned) hist_total_px;
+#else
     unsigned p1000 = 100 * 1000 * over / hist_total_px;
+#endif
     int plog = p1000 ? (int)log2f(p1000) : 0;
     return MIN(plog, 10);
 }
