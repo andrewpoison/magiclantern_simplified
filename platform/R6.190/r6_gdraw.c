@@ -18,8 +18,8 @@
  *  - LV_OVERLAYS_MODE is one of the INFO variants of the LV shooting screen
  *    (consts.h LV_OVERLAYS_MODE_ML_OK: 0..3; 6 = Canon's settings screen)
  *  - DISPLAY_IS_ON, display mask MEM(MEM(0xEA40)+0x18) exactly 0x01 = LCD
- *    only (not the EVF 0x10, not HDMI/LINE 0x1100: other geometry, and the
- *    one-off EVF -> LCD hang of M7.1 is not explained yet)
+ *    or, M7.6, exactly 0x10 = EVF (same ML coordinates, see r6_gdraw.h);
+ *    not HDMI/LINE 0x1100 (other geometry) and not both bits at once
  *  - LiveViewApp dialog (0x1624C) != 0
  *  - a verified FaceYuv frame (r6_fy_lv_frame via get_yuv422_vram)
  * Same rules as the M7.3 histogram overlay (r6_overlays.c). RAM reads only,
@@ -42,7 +42,7 @@
  || !defined(CONFIG_NO_LVINFO_BARS) || !defined(LV_OVERLAYS_MODE_ML_OK)
 #error "R6 global draw needs the ownership refresh, the FaceYuv LV image, ML-only bmp_vram_real, no lvinfo bars and the LV_OVERLAYS_MODE mapping"
 #endif
-#if defined(FEATURE_ZEBRA_FAST) || defined(FEATURE_FOCUS_PEAK) || defined(FEATURE_MAGIC_ZOOM) || defined(CONFIG_DISPLAY_FILTERS) \
+#if defined(FEATURE_ZEBRA_FAST) || defined(FEATURE_MAGIC_ZOOM) || defined(CONFIG_DISPLAY_FILTERS) \
  || defined(FEATURE_FOCUS_PEAK_DISP_FILTER) || defined(FEATURE_VECTORSCOPE) || defined(FEATURE_CROPMARKS) \
  || defined(FEATURE_GHOST_IMAGE) || defined(FEATURE_OVERLAYS_IN_PLAYBACK_MODE) || defined(FEATURE_RAW_HISTOGRAM) \
  || defined(FEATURE_RAW_ZEBRAS) || defined(FEATURE_RAW_SPOTMETER) || defined(CONFIG_RAW_LIVEVIEW) \
@@ -56,12 +56,14 @@ extern struct dialog * LiveViewApp_dialog;                    /* stubs.S DATA_PT
 
 #define GD_DISPDEV_PTR 0xEA40     /* [[0xEA40]+0x18] = display mask (0xE01694C8): bit0 PNL, bit4 EVF, 0x1100 LINE */
 #define GD_MASK_PNL    0x01
+#define GD_MASK_EVF    0x10
 
 struct r6_gd_stats r6_gd_st = { .mask = 0xFFFFFFFF };
+int r6_gd_evf = 0;
 
 static const char * const gd_names[R6GD_NREASONS] = {
     "drawn", "Canon LV off", "Canon GUI mode", "GUI state", "INFO/settings screen",
-    "display off", "not the LCD", "no LV dialog", "no FaceYuv frame", "movie mode",
+    "display off", "not LCD/EVF", "no LV dialog", "no FaceYuv frame", "movie mode",
 };
 
 const char * r6_gd_reason(int r)
@@ -88,11 +90,15 @@ static int gd_check(void)
     if (!dd || !r6_fy_ram_ok(dd, 0x1C)) { r6_gd_st.mask = 0xFFFFFFFF; return R6GD_NOT_PANEL; }
     uint32_t mask = MEM(dd + 0x18);
     r6_gd_st.mask = mask;
-    if (mask != GD_MASK_PNL) return R6GD_NOT_PANEL;     /* LCD only: no EVF, no HDMI/LINE bits */
+    if (mask != GD_MASK_PNL && mask != GD_MASK_EVF) return R6GD_NOT_PANEL;     /* LCD or EVF alone: no HDMI/LINE bits */
     if (!LiveViewApp_dialog) return R6GD_NO_DIALOG;
     /* the image source itself: without a verified frame nothing may draw, and
      * what was drawn is erased (instead of zebras frozen on a stale frame) */
     if (!get_yuv422_vram()->vram) return R6GD_NO_IMAGE;
+    /* M7.6: the band (r6_gdraw.h) follows the screen; set only here, where
+     * the overlays are allowed to draw */
+    r6_gd_evf = mask == GD_MASK_EVF;
+    if (r6_gd_evf) r6_gd_st.evf_ok++;
     return R6GD_OK;
 }
 

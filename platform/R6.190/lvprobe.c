@@ -3,8 +3,9 @@
  *
  * Debug > "LV probe":
  *  - "LV flag follows Canon": lv = !PROP_LV_ACTION (propvalues.c,
- *    CONFIG_LV_FOLLOW_TOGGLE). Default off and not saved, so every boot
- *    starts with lv = 0 as in M6.
+ *    CONFIG_LV_FOLLOW_TOGGLE). Not saved; every boot starts with lv = 0 as
+ *    in M6. M7.6: r6_autostart (CONFIG_R6_AUTOSTART) switches it ON at boot
+ *    after a clean shutdown.
  *  - "Status line": a task prints 7 short lines (M7.2a: plus 6 small ones)
  *    with bmp_printf into ML's own pixels of Canon's layer 0 (as approved in
  *    M6), also while DISPLAY_IS_ON == 0, with a running counter. M7.2a: the
@@ -121,6 +122,15 @@ extern int lv_follow_canon_get(void);
 extern void lv_follow_canon_set(int on);
 extern int lv_action_raw_get(uint32_t * value, int * len);
 
+#ifdef CONFIG_R6_AUTOSTART
+#ifndef CONFIG_R6_GLOBAL_DRAW
+#error "CONFIG_R6_AUTOSTART needs CONFIG_R6_GLOBAL_DRAW (r6_global_draw_boot, zebra.c)"
+#endif
+extern void r6_global_draw_boot(int keep);   /* zebra.c */
+/* r6_autostart: -2 = not called yet, else its argument (1 clean, 0 / -1 not) */
+static int lp_autostart = -2;
+#endif
+
 /* ---- Canon RAM addresses, R6 1.9.0 ------------------------------------- */
 #define LP_GUI_MODE      0x8D70    /* CURRENT_GUI_MODE, GetGUIMode 0xE079A692 (consts.h) */
 #define LP_DISPLAY_IS_ON 0xEF48    /* DispOperator_PropertyMasterSetDisplayTurnOffOn 0xE0751460 (consts.h) */
@@ -149,6 +159,10 @@ extern int lv_action_raw_get(uint32_t * value, int * len);
 #define LP_XOC_TABLE     0x14B2E4  /* XOC handles [xcm*4+out] (VMIX_SetLayerEnable 0xE0260F66),
                                     * [xoc+4] = layer enable bits (XOC_GetLayerEnable 0xE019E724) */
 #define LP_RENDERER      0x14B130  /* 2 x {MARV*, w, h} (RENDERER_InitializeScreen 0xE0233CC6) */
+#define LP_WINSYS_ORIGIN 0x18358   /* M7.6: 4 x {x, y, w, h}: WINSYS_SetRGBAVramActualSizeAndOffset 0xE078C82C
+                                    * stores origin i at 0x1832C+0x2C+16*i (strd at 0xE078C87A / 0xE078C850);
+                                    * boot (0xE09D2AD2..0xE09D2B00): 720x480@(152,30), 720x540@(152,0),
+                                    * 960x540@(32,0), 1024x540@(0,0) */
 #define LP_TTBR1         0xDFFC0000 /* TTBR1 L1 table (QEMU snapshot: 0x80000000 -> 0x80054402, 0xBF000000 -> 0xBF050416) */
 
 /* M7.2a census extension (decision doc docs/m7_2_wegb.md), RAM reads only */
@@ -1095,6 +1109,12 @@ static void lp_census_m72a(struct lp_buf * b)
         LGD("hist_valid", g->hist_valid);  LGD("hist_none", g->hist_none);       LGD("hist_hold", g->hist_hold);
         LGD("wfm_n", g->wfm_n);            LGD("wfm_us", g->wfm_us);               LGD("wfm_us_max", g->wfm_us_max);
         LGD("wfm_samples", g->wfm_samples);
+        /* M7.6 */
+        LGD("evf", r6_gd_evf);             LGD("evf_ok", g->evf_ok);               LGD("evf_switch", g->evf_switch);
+        LGD("peak_n", g->peak_n);          LGD("peak_us", g->peak_us);             LGD("peak_us_max", g->peak_us_max);
+        LGD("peak_nolv", g->peak_nolv);    LGD("peak_dots", g->peak_dots);         LGD("peak_over", g->peak_over);
+        LGD("peak_thr", g->peak_thr);      LGD("peak_changed", g->peak_changed);   LGD("peak_full", g->peak_full);
+        LGD("peak_off", g->peak_off);      LGD("redraw_n", g->redraw_n);
 #undef LGD
     }
 #endif
@@ -1166,6 +1186,9 @@ static void lp_census(struct lp_buf * b, const char * tag)
     lp_printf(b, "lv=%d\n", lv);
     lp_printf(b, "lv_paused=%d\n", lv_paused);
     lp_printf(b, "lv_follow_canon=%d\n", lv_follow_canon_get());
+#ifdef CONFIG_R6_AUTOSTART
+    lp_printf(b, "autostart=%d\n", lp_autostart);
+#endif
     if (lv_action_raw_get(&v, &len))
     {
         lp_printf(b, "lv_action_raw=0x%08x\n", (int) v);
@@ -1341,6 +1364,46 @@ static void lp_census(struct lp_buf * b, const char * tag)
     lp_fld(b, "rgb_vram_info.flags", m, 0x18);
     lp_fld(b, "rgb_vram_info.width", m, 0x1C);
     lp_fld(b, "rgb_vram_info.height", m, 0x20);
+
+    /* M7.6: EVF geometry. The WINSYS origin table, and what layer 0 shows in
+     * origin 1 (720x540 at (152,0), assumed to be the EVF) per 30-row band:
+     * every 4th pixel of every 2nd row (2700 samples per band), split into
+     * Canon's and ML's pixels (ML = owned in the ownership table; a stale
+     * entry while a conversion runs only shifts the split). RAM reads only. */
+    for (int i = 0; i < 4; i++)
+    {
+        uint32_t a = LP_WINSYS_ORIGIN + 16 * i, v[4];
+        snprintf(k, sizeof(k), "winsys.origin[%d]", i);
+        if (rd32(a, &v[0]) && rd32(a + 4, &v[1]) && rd32(a + 8, &v[2]) && rd32(a + 12, &v[3]))
+            lp_printf(b, "%s=%dx%d@(%d,%d)\n", k, (int) v[2], (int) v[3], (int) v[0], (int) v[1]);
+        else
+            lp_printf(b, "%s=invalid\n", k);
+    }
+    {
+        uint32_t base = 0, lw = 0, lh = 0;
+        if (fld(m, 4, &base) && fld(m, 0x1C, &lw) && fld(m, 0x20, &lh) && lw == BMP_LAYER_WIDTH && lh >= 540
+            && ram_ok(base, BMP_LAYER_WIDTH * 4 * 540))
+        {
+            const uint32_t * L = (const uint32_t *) base;
+            for (int band = 0; band < 18; band++)
+            {
+                int canon = 0, ml = 0;
+                for (int y = band * 30; y < band * 30 + 30; y += 2)
+                {
+                    for (int x = 152; x < 872; x += 4)
+                    {
+                        uint32_t c = L[y * BMP_LAYER_WIDTH + x];
+                        if (!(c & 0xFF000000) || c == 0xFF000000) continue;   /* empty, as r6_layer.c R6L_EMPTY */
+                        if (r6_layer_owns(x, y)) ml++; else canon++;
+                    }
+                }
+                snprintf(k, sizeof(k), "evfprof[%d]", band);
+                lp_printf(b, "%s=%d/%d\n", k, canon, ml);
+            }
+        }
+        else
+            lp_printf(b, "evfprof=invalid\n");
+    }
 
     /* memory, as ML's own allocator sees it (MALLOC_STRUCT_ADDR, RAM only) */
     struct malloc_status * ms = (struct malloc_status *) MALLOC_STRUCT_ADDR;
@@ -1771,6 +1834,33 @@ static MENU_SELECT_FUNC(lp_follow_toggle)
     lv_follow_canon_set(lp_follow_menu);
 }
 
+#ifdef CONFIG_R6_AUTOSTART
+/* M7.6 (internals.h CONFIG_R6_AUTOSTART): called once by module_load_task
+ * (src/module.c) right after its LOADING.LCK check. Until then lv stays 0
+ * (the LV flag starts OFF), so no overlay can draw before this decision.
+ *   1  clean shutdown before this boot and this session's lockfile is
+ *      written: LV flag ON; Global Draw keeps its saved value
+ *   0  the last session did not end cleanly (module.c shows the NotifyBox)
+ *  -1  not clean or unknown (no lockfile written, autoload disabled)
+ * In both other cases the LV flag stays OFF and Global Draw is set OFF
+ * (in RAM; saved as OFF at the next clean shutdown), as before M7.6. */
+void r6_autostart(int clean)
+{
+    if (lp_autostart != -2) return;
+    lp_autostart = clean;
+    if (clean == 1)
+    {
+        r6_global_draw_boot(1);
+        lp_follow_menu = 1;
+        lv_follow_canon_set(1);
+        return;
+    }
+    r6_global_draw_boot(0);
+    if (clean < 0)
+        NotifyBox(10000, "Last shutdown not seen as clean:\nLV flag and Global Draw OFF.");
+}
+#endif
+
 static MENU_SELECT_FUNC(lp_status_toggle)
 {
     lvprobe_status_enable(MOD(lp_status_on + delta, 3));
@@ -1817,7 +1907,11 @@ static struct menu_entry lp_menu[] = {
                 .priv   = &lp_follow_menu,
                 .max    = 1,
                 .select = lp_follow_toggle,
+                #ifdef CONFIG_R6_AUTOSTART
+                .help   = "ON: lv = !PROP_LV_ACTION. ON at boot after a clean shutdown, else OFF.",
+                #else
                 .help   = "ON: lv = !PROP_LV_ACTION. OFF (default, not saved): lv = 0 as in M6.",
+                #endif
                 .help2  = "The ML menu always opens over Canon MENU (0x2003).",
             },
             {

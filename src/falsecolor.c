@@ -79,7 +79,8 @@ void draw_false_downsampled( void )
     uint64_t r6_t0 = get_us_clock();
     r6_gd_st.drawn |= R6GD_DRAWN_MIRROR;
     uint32_t r6_changed = 0;
-    for(int y = os.y0 + R6_GD_Y0; y < os.y0 + R6_GD_Y1; y += 2 )
+    const int r6_y0 = os.y0 + R6_GD_Y0, r6_y1 = os.y0 + R6_GD_Y1;    /* M7.6: once per pass (LCD / EVF band) */
+    for(int y = r6_y0; y < r6_y1; y += 2 )
     #else
     int off = get_y_skip_offset_for_overlays();
     for(int y = os.y0 + off; y < os.y_max - off; y += 2 )

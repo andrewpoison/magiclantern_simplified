@@ -49,6 +49,10 @@ int r6_layer_clear(uint32_t * layer);
 int r6_layer_has_table(void);
 /* blocks whose given-up pixels the last conversion kept (allow_erase 0) */
 uint32_t r6_layer_deferred(void);
+/* M7.6 (lvprobe.c, diagnostics only, no lock): 1 = the ownership table says
+ * ML owns pixel (x, y) of ML's indexed buffer = layer 0 (x < 960, y < 540);
+ * 0 = not owned, outside, or no table */
+int r6_layer_owns(int x, int y);
 
 struct r6_layer_stats
 {

@@ -12,8 +12,12 @@
  * the dialog event names it produces. Same values as R5 1.5.2 where R5 defines them.
  */
 
-#define BGMT_WHEEL_DOWN              0x00 // QCD2 (rear, around SET), SwSub_Dial delta<0
-#define BGMT_WHEEL_UP                0x01 // SwSub_Dial delta>0; arg = number of clicks
+/* M7.6: QCD2 clockwise is 0x01 (camera: it moved the ML menu up while 0x01
+ * was WHEEL_UP). ML moves down / increments on WHEEL_DOWN, so clockwise is
+ * WHEEL_DOWN, as in Canon's menus (and on the 5D3). The R5 values are the
+ * other way round; not checked on an R5. */
+#define BGMT_WHEEL_UP                0x00 // QCD2 (rear, around SET), SwSub_Dial delta<0 = counter-clockwise
+#define BGMT_WHEEL_DOWN              0x01 // SwSub_Dial delta>0 = clockwise; arg = number of clicks
 
 // 0x02/0x03: SUB2 dial, no switch callback exists on R6
 // 0x04/0x05: QCD1 (top, "3rd dial"), Sw3rd_Dial; not used by ML

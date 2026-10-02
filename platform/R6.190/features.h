@@ -34,10 +34,14 @@
 #define FEATURE_R6_CANON_HISTOGRAM
 
 /* M7.4: ML's own overlays from Canon's FaceYuv image (CONFIG_R6_GLOBAL_DRAW,
- * internals.h), Overlay menu. All default OFF, Global Draw not saved.
+ * internals.h), Overlay menu. All default OFF. M7.6: Global Draw is saved
+ * (default ON) and the LV flag follows Canon at boot, both only after a clean
+ * shutdown (CONFIG_R6_AUTOSTART).
+ * M7.6: FEATURE_FOCUS_PEAK (zebra.c draw_zebra_and_focus), dots only, on
+ * FaceYuv (get_yuv422_vram, not YUV422_LV_BUFFER_DISPLAY_ADDR = 0); no
+ * display-filter modes (FEATURE_FOCUS_PEAK_DISP_FILTER), no grayscale image.
  * Deliberately left out (MMIO, writes into Canon image buffers, Canon GUI
  * calls, files, or not reviewed): FEATURE_ZEBRA_FAST (EngDrvOut),
- * FEATURE_FOCUS_PEAK (reads YUV422_LV_BUFFER_DISPLAY_ADDR = 0),
  * FEATURE_MAGIC_ZOOM (writes the LV buffer), CONFIG_DISPLAY_FILTERS,
  * FEATURE_VECTORSCOPE, FEATURE_CROPMARKS / FEATURE_GHOST_IMAGE (card files,
  * Canon redraws), FEATURE_OVERLAYS_IN_PLAYBACK_MODE, FEATURE_LV_DISPLAY_PRESETS;
@@ -49,6 +53,7 @@
 #define FEATURE_WAVEFORM
 #define FEATURE_SPOTMETER
 #define FEATURE_HISTOGRAM
+#define FEATURE_FOCUS_PEAK
 
 #undef CONFIG_CRASH_LOG
 #undef CONFIG_PROP_REQUEST_CHANGE

@@ -2163,6 +2163,13 @@ static void module_unload_offline_strings(int mod_number)
     }
 }
 
+#ifdef CONFIG_R6_AUTOSTART
+/* platform/R6.190/lvprobe.c: 1 = clean shutdown before this boot, 0 = not
+ * (this task shows the NotifyBox), -1 = not clean or unknown (r6_autostart
+ * shows one) */
+extern void r6_autostart(int clean);
+#endif
+
 static void module_load_task(void* unused) 
 {
     char *lockstr = "If you can read this, ML crashed last time. To save from faulty modules, autoload gets disabled.";
@@ -2170,11 +2177,21 @@ static void module_load_task(void* unused)
     if(!module_autoload_disabled)
     {
         uint32_t size;
+        #ifdef CONFIG_R6_AUTOSTART
+        /* R6 M7.6: an old lockfile means unclean, even with module_ignore_crashes */
+        int r6_lock_old = FIO_GetFileSize( module_lockfile, &size ) == 0;
+        #endif
         if(!module_ignore_crashes && FIO_GetFileSize( module_lockfile, &size ) == 0 )
         {
             /* uh, it seems the camera didnt shut down cleanly, skip module loading this time */
+            #ifdef CONFIG_R6_AUTOSTART
+            r6_autostart(0);
+            msleep(1000);
+            NotifyBox(10000, "Camera was not shut down cleanly.\r\nSkipping module loading.\r\nLV flag and Global Draw OFF." );
+            #else
             msleep(1000);
             NotifyBox(10000, "Camera was not shut down cleanly.\r\nSkipping module loading." );
+            #endif
         }
         else
         {
@@ -2184,6 +2201,11 @@ static void module_load_task(void* unused)
                 FIO_WriteFile(handle, lockstr, strlen(lockstr));
                 FIO_CloseFile(handle);
             }
+            #ifdef CONFIG_R6_AUTOSTART
+            /* only with a lockfile for this session can the next boot see a hang;
+             * an old lockfile here (module_ignore_crashes) is still unclean */
+            r6_autostart(!r6_lock_old && handle ? 1 : -1);
+            #endif
             
             /* now load modules */
             _module_load_all(0);
@@ -2192,6 +2214,9 @@ static void module_load_task(void* unused)
     }
     else
     {
+        #ifdef CONFIG_R6_AUTOSTART
+        r6_autostart(-1);   /* no lockfile, so a hang could not be seen next time */
+        #endif
         /* only list modules */
         _module_load_all(1);
         module_menu_update();
@@ -2247,6 +2272,31 @@ void module_save_configs()
     }
 }
 
+#ifdef CONFIG_R6_AUTOSTART
+/* R6 M7.6 (tasks.c: battery / card door opened, PROP_ABORT): this session
+ * did not end through the power switch or auto power off. Keep LOADING.LCK,
+ * or write it again if an earlier shutdown request already removed it, so
+ * the next boot starts with the LV flag and Global Draw OFF (r6_autostart).
+ * Upstream removes it ("if no hard crash, load the modules after taking the
+ * battery out"); R6 loads no modules, and a hang is followed by exactly this. */
+static volatile int r6_keep_lockfile = 0;
+
+void module_mark_unclean(void)
+{
+    r6_keep_lockfile = 1;
+    if (module_autoload_disabled) return;
+    uint32_t size;
+    if (FIO_GetFileSize( module_lockfile, &size ) == 0) return;    /* still there */
+    FILE *handle = FIO_CreateFile(module_lockfile);
+    if (handle)
+    {
+        static const char s[] = "R6: battery or card door opened while ML was running.";
+        FIO_WriteFile(handle, (void *) s, sizeof(s) - 1);
+        FIO_CloseFile(handle);
+    }
+}
+#endif
+
 /* clean shutdown, unlink lockfile */
 int module_shutdown()
 {
@@ -2255,6 +2305,9 @@ int module_shutdown()
     if(!module_autoload_disabled)
     {
         /* remove lockfile */
+        #ifdef CONFIG_R6_AUTOSTART
+        if (!r6_keep_lockfile)
+        #endif
         FIO_RemoveFile(module_lockfile);
     }
     return 0;

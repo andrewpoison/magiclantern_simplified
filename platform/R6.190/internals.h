@@ -85,11 +85,41 @@
  *     last conversion time (max 2 s) while the ML menu is closed
  *   - refresh guard: no piggyback conversion within 1 s of a display mask /
  *     vrammgr_mode change (LCD <-> EVF, display off/on)
- *   - movie mode blocked by shooting_mode OR PROP_LV_MOVIE_SELECT == 2 */
+ *   - movie mode blocked by shooting_mode OR PROP_LV_MOVIE_SELECT == 2
+ * M7.6 (r6_gdraw.c, src/zebra.c, src/falsecolor.c):
+ *   - also on the EVF shooting screen (display mask exactly 0x10). Canon uses
+ *     the same layer 0 there with WINSYS origin 1 = 720x540 at (152,0)
+ *     (WINSYS_SetRGBAVramActualSizeAndOffset 0xE078C82C, calls at
+ *     0xE09D2AD2..0xE09D2B00): ML's 720x480 area at (152,30) is its middle,
+ *     where the 1280x854 EVF image lies if Canon centres it in the 1280x960
+ *     panel (assumed, checked on the camera). Same ML coordinates on both
+ *     screens; zebras / false color cover the whole 720x480 in the EVF
+ *     (Canon's EVF info is assumed in the bands above and below)
+ *   - focus peaking (dots) on FaceYuv
+ *   - _redraw_do (MLEV_REDRAW, from redraw()) no longer calls
+ *     dialog_redraw(LiveViewApp_dialog): on R6 that runs Canon's TRV in
+ *     GuiMainTask next to CtrlSrv (TRV is not reentrant; suspected M7.1
+ *     hang at LCD <-> EVF via _prop_handler_PROP_LV_OUTPUT_TYPE). ML erases
+ *     its own pixels instead (clrscr: ML's buffer and ML-owned layer-0
+ *     pixels only). No new Canon call. */
 #define CONFIG_R6_FACEYUV_LV
 #define CONFIG_BMP_REAL_IS_INDEXED
 #define CONFIG_NO_LVINFO_BARS
 #define CONFIG_R6_GLOBAL_DRAW
+
+/* M7.6 (approved 2026-10-02): "LV flag follows Canon" ON and Global Draw
+ * saved (default ON), but only after a clean shutdown. src/module.c
+ * module_load_task already marks a running session with ML/modules/
+ * LOADING.LCK (removed by module_shutdown at a clean power-off); it calls
+ * r6_autostart(clean) (lvprobe.c) once at boot: clean = no lockfile from the
+ * last session AND the new one was written. Otherwise (battery pulled after
+ * a hang, lockfile not writable, module autoload disabled) the LV flag stays
+ * OFF and Global Draw is set OFF, with a NotifyBox. Until then lv = 0, so no
+ * overlay can draw before the decision. Battery / card door opened while ML
+ * runs (src/tasks.c: PROP_ABORT, PROP_SHUTDOWN_REASON 4 / 8) counts as
+ * unclean: module_mark_unclean keeps (or writes back) the lockfile, which
+ * upstream removes there. Global Draw from the config is clamped to 0..1. */
+#define CONFIG_R6_AUTOSTART
 
 #define CONFIG_TASK_STRUCT_V2_SMP
 #define CONFIG_TASK_ATTR_STRUCT_V5

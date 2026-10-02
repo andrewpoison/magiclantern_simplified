@@ -220,6 +220,12 @@ int r6_layer_has_table(void)
     return r6l_own != NULL;
 }
 
+int r6_layer_owns(int x, int y)
+{
+    if (!r6l_own || x < 0 || y < 0 || x >= R6L_W || y >= R6L_H) return 0;
+    return (r6l_own[y * R6L_BPR + x / 32].mask >> (x & 31)) & 1;   /* bit i = pixel bx * 32 + i (r6_layer_convert) */
+}
+
 uint32_t r6_layer_deferred(void)
 {
     return st.defer_blk;

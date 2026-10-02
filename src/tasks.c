@@ -395,6 +395,15 @@ PROP_HANDLER(PROP_ABORT)
         terminateAbort_save_settings = 0;
 #endif
 
+        #ifdef CONFIG_R6_AUTOSTART
+        /* R6 M7.6: the battery door opened while ML runs is what the user does
+         * after a hang: the next boot counts as unclean (module.c keeps or
+         * writes back LOADING.LCK; r6_autostart then leaves the LV flag and
+         * Global Draw OFF) */
+        extern void module_mark_unclean(void);
+        module_mark_unclean();
+        #endif
+
         #if defined(CONFIG_MODULES)
         /* if no hard crash, load the modules after taking the battery out */
         module_shutdown();
@@ -420,6 +429,12 @@ PROP_HANDLER(PROP_SHUTDOWN_REASON)
     // unverified; a non-zero value there must not stop ML silently.
     // Shutdown detection with this guard confirmed on camera (M6).
     extern int ml_started;
+    #ifdef CONFIG_R6_AUTOSTART
+    /* M7.6: 4 = card door, 8 = battery door open (src/property.h, seen on the
+     * EOS R; 2 = power switch): unclean for the autostart, see PROP_ABORT */
+    extern void module_mark_unclean(void);
+    if ((buf[0] == 4 || buf[0] == 8) && ml_started) module_mark_unclean();
+    #endif
     if (buf[0] != 0 && ml_started)  ml_shutdown();
 #else
     if (buf[0] != 0)  ml_shutdown();

@@ -201,7 +201,14 @@ static int transparent_overlay_hidden = 0;
 #endif
 
 #ifdef CONFIG_R6_GLOBAL_DRAW
-static int global_draw = 0;     /* R6 M7.4: plain variable, OFF at every boot until the first camera test passed */
+/* R6 M7.6: saved, default ON (LiveView only, max 1); after an unclean
+ * shutdown r6_autostart (lvprobe.c) sets it OFF (CONFIG_R6_AUTOSTART) */
+static CONFIG_INT( "global.draw",   global_draw, 1 );
+#ifdef CONFIG_R6_AUTOSTART
+/* once at boot (r6_autostart): 0 = OFF; 1 = keep the saved value, clamped to
+ * the R6 menu range 0..1 (an older config may hold 2 or 3) */
+void r6_global_draw_boot(int keep) { global_draw = keep ? MIN(global_draw, 1) : 0; }
+#endif
 #else
 static CONFIG_INT( "global.draw",   global_draw, 3 );
 #endif
@@ -1290,6 +1297,14 @@ static inline int zebra_color_word_row(int c, int y)
 static int* dirty_pixels = 0;
 static uint32_t* dirty_pixel_values = 0;
 static int dirty_pixels_num = 0;
+#ifdef CONFIG_R6_GLOBAL_DRAW
+/* R6 M7.6: the dots of the last pass as they were drawn (count, hash of offsets
+ * and colours); -1 = unknown because someone else erased them (r6_gd_erase,
+ * r6_peak_off, clrscr: the next pass must ask for a refresh even if it draws
+ * the same dots again) */
+static int r6_peak_n = -1;
+static uint32_t r6_peak_hash = 0;
+#endif
 //~ static unsigned int* bm_hd_r_cache = 0;
 static uint16_t bm_lv_x_cache[BMP_W_PLUS - BMP_W_MINUS];
 
@@ -1430,8 +1445,10 @@ static void draw_zebras( int Z )
         // draw zebra in 16:9 frame
         // y is in BM coords
         #ifdef CONFIG_R6_GLOBAL_DRAW
-        /* R6: only the band between Canon's top row and bottom bar (r6_gdraw.h) */
-        for(int y = os.y0 + R6_GD_Y0; y < os.y0 + R6_GD_Y1; y += 2 )
+        /* R6: only the band between Canon's top row and bottom bar (r6_gdraw.h);
+         * M7.6: taken once per pass, the screen (LCD / EVF) may change meanwhile */
+        const int r6_y0 = os.y0 + R6_GD_Y0, r6_y1 = os.y0 + R6_GD_Y1;
+        for(int y = r6_y0; y < r6_y1; y += 2 )
         #else
         int off = get_y_skip_offset_for_overlays();
         for(int y = os.y0 + off; y < os.y_max - off; y += 2 )
@@ -1937,6 +1954,9 @@ draw_zebra_and_focus( int Z, int F )
             #define M1 *(uint16_t*)(bvram_mirror + dirty_pixels[i])
             #define M2 *(uint16_t*)(bvram_mirror + dirty_pixels[i] + BMPPITCH)
 
+            #ifdef CONFIG_R6_GLOBAL_DRAW
+            if (B1 != M1 || B2 != M2) r6_peak_n = -1;   /* the dot is gone from ML's buffer (clrscr) */
+            #endif
             if (likely((B1 == 0 || B1 == M1)) && likely((B2 == 0 || B2 == M2)))
             {
                 B1 = M1 = dirty_pixel_values[i] & 0xFFFF;
@@ -1947,14 +1967,37 @@ draw_zebra_and_focus( int Z, int F )
             #undef M1
             #undef M2
         }
+        #ifdef CONFIG_R6_GLOBAL_DRAW
+        int r6_had_dots = dirty_pixels_num;
+        #endif
         dirty_pixels_num = 0;
         
+        #ifdef CONFIG_R6_GLOBAL_DRAW
+        /* R6 M7.6: FaceYuv through get_yuv422_vram (uncached alias, verified
+         * frame; YUV422_LV_BUFFER_DISPLAY_ADDR is 0 on R6), in the band of
+         * the current screen (r6_gdraw.h), at least 8 px from every edge:
+         * the Laplacian reads one FaceYuv row / pixel around each sample,
+         * BM2LV keeps all of them inside the 640x426 buffer */
+        uint32_t vram = (uint32_t) get_yuv422_vram()->vram;
+        if (!vram)
+        {
+            /* the restore above removed the old dots: show that */
+            r6_gd_st.peak_nolv++;
+            if (r6_had_dots) { r6_peak_n = -1; r6_gd_st.refresh_req++; ml_refresh_display_needed = 1; }
+            return 0;
+        }
+        R6GD_T0();
+        r6_gd_st.drawn |= R6GD_DRAWN_MIRROR;
+        int yStart = MAX(os.y0 + R6_GD_Y0, os.y0 + 8);
+        int yEnd = MIN(os.y0 + R6_GD_Y1, os.y_max - 8);
+        #else
         uint32_t vram = (uint32_t)CACHEABLE(YUV422_LV_BUFFER_DISPLAY_ADDR);
         if (!vram) return 0;
         
         int off = get_y_skip_offset_for_overlays();
         int yStart = os.y0 + off + 8;
         int yEnd = os.y_max - off - 8;
+        #endif
         int xStart = os.x0 + 8;
         int xEnd = os.x_max - 8;
         int n_over = 0;
@@ -2050,6 +2093,30 @@ draw_zebra_and_focus( int Z, int F )
         thr_delta = thr - prev_thr;
         prev_thr = thr;
 
+        #ifdef CONFIG_R6_GLOBAL_DRAW
+        /* ML's indexed buffer only; refresh only if the dots changed (same
+         * offsets and colours as the last pass = same buffer content) */
+        {
+            uint32_t hs = 0x811C9DC5u;
+            for (int k = 0; k < dirty_pixels_num; k++)
+            {
+                hs = (hs ^ (uint32_t) dirty_pixels[k]) * 0x01000193u;
+                hs = (hs ^ *(uint16_t*)(bvram + dirty_pixels[k])) * 0x01000193u;
+            }
+            if ((dirty_pixels_num || r6_had_dots) && (hs != r6_peak_hash || dirty_pixels_num != r6_peak_n))
+            {
+                r6_gd_st.peak_changed++; r6_gd_st.refresh_req++; ml_refresh_display_needed = 1;
+            }
+            r6_peak_hash = hs;
+            r6_peak_n = dirty_pixels_num;
+            r6_gd_st.peak_dots = dirty_pixels_num;
+            r6_gd_st.peak_over = n_over;
+            r6_gd_st.peak_thr = thr;
+            if (n_over > MAX_DIRTY_PIXELS) r6_gd_st.peak_full++;
+            R6GD_T1(peak_n, peak_us, peak_us_max);
+        }
+        #endif
+
         if (n_over > MAX_DIRTY_PIXELS)
             return thr_delta;
     }
@@ -2059,6 +2126,37 @@ draw_zebra_and_focus( int Z, int F )
     
     return 0;
 }
+
+#ifdef CONFIG_R6_GLOBAL_DRAW
+/* R6 M7.6: peaking was switched off while dots are shown (overlay task, ML
+ * menu closed, BMP_LOCK held): erase the dots that are still there (indexed
+ * pixel = mirror pixel) instead of restoring old, possibly stale values;
+ * other overlays draw again by themselves. ML's buffer only. */
+static void r6_peak_off(void)
+{
+    #ifdef FEATURE_FOCUS_PEAK
+    if (!dirty_pixels_num) return;
+    uint8_t * const bvram = bmp_vram_real();
+    if (bvram && bvram_mirror && dirty_pixels)
+    {
+        for (int i = 0; i < dirty_pixels_num; i++)
+        {
+            uint16_t * b1 = (uint16_t*)(bvram + dirty_pixels[i]);
+            uint16_t * b2 = (uint16_t*)(bvram + dirty_pixels[i] + BMPPITCH);
+            uint16_t * m1 = (uint16_t*)(bvram_mirror + dirty_pixels[i]);
+            uint16_t * m2 = (uint16_t*)(bvram_mirror + dirty_pixels[i] + BMPPITCH);
+            if (*b1 == *m1) *b1 = 0;
+            if (*b2 == *m2) *b2 = 0;
+            *m1 = *m2 = 0;
+        }
+    }
+    dirty_pixels_num = 0;
+    r6_peak_n = -1;
+    r6_gd_st.peak_off++; r6_gd_st.refresh_req++;
+    ml_refresh_display_needed = 1;
+    #endif
+}
+#endif
 
 static void guess_focus_peaking_threshold()
 {
@@ -2994,7 +3092,7 @@ struct menu_entry zebra_menus[] = {
         .choices = (const char *[]) {"OFF", "LiveView", "QuickReview", "ON, all modes"},
         #ifdef CONFIG_R6_GLOBAL_DRAW
         .help = "ML overlays (zebras, false color, histogram...) from Canon's FaceYuv.",
-        .help2 = "LCD shooting screen only, needs LV flag follows Canon. Not saved.",
+        .help2 = "LCD/EVF shooting screen, needs LV flag. OFF after an unclean shutdown.",
         #else
         .help = "Enable/disable ML overlay graphics (zebra, cropmarks...)",
         #endif
@@ -3086,6 +3184,9 @@ struct menu_entry zebra_menus[] = {
         .update         = focus_peaking_display,
         .max = 1,
         .help = "Show which parts of the image are in focus.",
+        #ifdef CONFIG_R6_GLOBAL_DRAW
+        .help2 = "R6: from Canon's 640x426 FaceYuv image, coarser than the screen.",
+        #endif
         .submenu_width = 650,
         .depends_on = DEP_GLOBAL_DRAW,
         .children =  (struct menu_entry[]) {
@@ -3137,12 +3238,14 @@ struct menu_entry zebra_menus[] = {
                 .help = "Focus peaking color (fixed or color coding).",
                 .icon_type = IT_DICE,
             },
+            #ifndef CONFIG_R6_GLOBAL_DRAW   /* R6: needs a display filter (writes Canon's LV image) */
             {
                 .name = "Grayscale image", 
                 .priv = &focus_peaking_grayscale,
                 .max = 1,
                 .help = "Display LiveView image in grayscale.",
             },
+            #endif
             MENU_EOL
         },
     },
@@ -4312,6 +4415,20 @@ BMP_LOCK (
  * TODO: Code should probably be expanded by other apps that we want to mess
  *       with (PlayMain, ShootOlcApp, PlayMovieGuideApp?)
  */
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    /* R6 M7.6: no dialog_redraw here. MLEV_REDRAW is handled in GuiMainTask,
+     * but Canon's TRV (VMIX_TransferRectangleToVram 0xE0260A16, reached by
+     * dialog_redraw while the dialog is not shown) normally runs in CtrlSrv
+     * and is not reentrant: two TRVs at once = suspected M7.1 hang (redraw()
+     * from _prop_handler_PROP_LV_OUTPUT_TYPE at LCD <-> EVF). ML erases its
+     * own pixels instead: its indexed buffer and, under the guard's clear
+     * lock, the layer-0 pixels that still hold ML's values (rgba_buffer_clear);
+     * Canon repaints its own UI by itself. The overlays notice the empty
+     * buffer (box hashes, zebra words) and draw again. */
+    r6_gd_st.redraw_n++;
+    clrscr();
+    ml_refresh_display_needed = 1;
+    #else
     extern struct dialog* LiveViewApp_dialog;
     if(LiveViewApp_dialog)
     {
@@ -4321,6 +4438,7 @@ BMP_LOCK (
     {
         clrscr(); // out of luck, fallback
     }
+    #endif
 #else
 
     //~ if (disable_redraw) 
@@ -4390,7 +4508,8 @@ void schedule_transparent_overlay()
 
 #ifdef CONFIG_R6_GLOBAL_DRAW
 /* R6 M7.4: the overlay screen state ended (Canon MENU / Q / INFO settings,
- * display off, EVF, LV off, Global Draw OFF): erase what ML's overlays put
+ * display off, HDMI, LV off, Global Draw OFF; M7.6: no longer the EVF, but
+ * any mask other than exactly LCD or EVF, e.g. during a switch): erase what ML's overlays put
  * into ML's indexed buffer - zebra / false color pixels via the mirror (only
  * pixels that still hold exactly what the overlay wrote), the spotmeter, the
  * histogram and waveform boxes - and request a refresh. The ownership
@@ -4408,6 +4527,10 @@ static void r6_gd_erase(void)
         {
             uint32_t d = r6_gd_st.drawn;
             if (d & R6GD_DRAWN_MIRROR) clrscr_mirror_do();
+            #ifdef FEATURE_FOCUS_PEAK
+            /* M7.6: the peaking dots are mirror pixels too; nothing left to restore */
+            if (d & R6GD_DRAWN_MIRROR) { dirty_pixels_num = 0; r6_peak_n = -1; }
+            #endif
             #ifdef FEATURE_SPOTMETER
             if (d & R6GD_DRAWN_SPOT) spotmeter_erase();
             #endif
@@ -4535,6 +4658,20 @@ livev_hipriority_task( void* unused )
                 continue;
             }
         }
+        #ifdef CONFIG_R6_GLOBAL_DRAW
+        /* M7.6: the screen of the last passed check changed (LCD <-> EVF):
+         * the band changed (r6_gdraw.h), so erase once (a no-op if a failed
+         * check in between erased already); on the LCD nothing may stay in
+         * Canon's top row / bottom bar from the EVF band */
+        {
+            static int r6_evf_seen = -1;
+            if (r6_evf_seen != r6_gd_evf)
+            {
+                if (r6_evf_seen >= 0) { r6_gd_st.evf_switch++; r6_gd_erase(); }
+                r6_evf_seen = r6_gd_evf;
+            }
+        }
+        #endif
         #if 0
         draw_cropmark_area(); // just for debugging
         struct vram_info * lv = get_yuv422_vram();
@@ -4624,10 +4761,13 @@ livev_hipriority_task( void* unused )
             #endif
             {
                 #ifdef CONFIG_R6_GLOBAL_DRAW
-                static int r6_zb_aux = 0;
+                static int r6_zb_aux = 0, r6_pk_aux = 0;
                 int r6_z = zebra_draw && should_run_polling_action(R6_GD_ZEBRA_MS, &r6_zb_aux);   /* R6: 4 x per second */
-                if (r6_z)
-                    BMP_LOCK( if (lv) draw_zebra_and_focus(1, 0); )
+                int r6_f = focus_peaking && should_run_polling_action(R6_GD_PEAK_MS, &r6_pk_aux); /* M7.6: peaking 4 x per second */
+                if (!focus_peaking && dirty_pixels_num)     /* before the pass (no holes in fresh zebras); no lock per loop otherwise */
+                    BMP_LOCK( r6_peak_off(); )
+                if (r6_z || r6_f)
+                    BMP_LOCK( if (lv) draw_zebra_and_focus(r6_z, r6_f); )
                 #else
                 BMP_LOCK(
                     if (lv)

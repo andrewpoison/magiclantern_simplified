@@ -20,8 +20,19 @@
  * place of Canon's histogram box (r6_overlays.c; the two are mutually
  * exclusive), the small waveform sits above the bottom bar, right of the
  * left icons. */
-#define R6_GD_Y0          50
-#define R6_GD_Y1          386
+#define R6_GD_LCD_Y0      50
+#define R6_GD_LCD_Y1      386
+/* M7.6, EVF: Canon's EVF shows WINSYS origin 1 (720x540 at (152,0) in layer
+ * 0); ML's 720x480 area at (152,30) is assumed to be exactly the 1280x854
+ * EVF image (centred in the 1280x960 panel), with Canon's EVF info in the
+ * 30-row bands above and below it. Zebras / false color / peaking therefore
+ * cover the whole 720x480 there (write-under keeps Canon's elements on top).
+ * Same coordinates and boxes as on the LCD otherwise. */
+#define R6_GD_EVF_Y0      0
+#define R6_GD_EVF_Y1      480
+extern int r6_gd_evf;               /* r6_gdraw.c: 1 = the last screen check saw the EVF (mask exactly 0x10) */
+#define R6_GD_Y0          (r6_gd_evf ? R6_GD_EVF_Y0 : R6_GD_LCD_Y0)
+#define R6_GD_Y1          (r6_gd_evf ? R6_GD_EVF_Y1 : R6_GD_LCD_Y1)
 #define R6_GD_HIST_X      576       /* multiple of 4 (hist_draw_image aligns), box 576..703 x 54..107 */
 #define R6_GD_HIST_Y      54
 #define R6_GD_WFM_X       100       /* small waveform 180 x 54: 100..279 x 330..383 */
@@ -40,6 +51,8 @@
 #define R6_GD_ZEBRA_MS    250       /* zebras recomputed at most 4 x per second (ML default: ~15 x) */
 #define R6_GD_FALSE_MS    333       /* M7.5: false color at most 3 x per second (M7.4: 1 x; the lazy conversion,
                                      * r6_layer.c, converts only the blocks that changed; the cap below stays) */
+#define R6_GD_PEAK_MS     250       /* M7.6: focus peaking at most 4 x per second (ML default: every 2nd frame);
+                                     * ~57600 FaceYuv samples (y step 3, x step 2), 5 uncached reads each */
 #define R6_GD_RESHOW_MS   500       /* after Canon repainted layer 0 (VMIX index changed): re-show ML's pixels, at most 2 x per second */
 #define R6_GD_CAP_DUTY    10        /* conversion cap: wait 10 x the last conversion time (~10 % of a core) */
 #define R6_GD_CAP_MAX_MS  2000      /* ... but at most 2 s */
@@ -52,7 +65,7 @@ enum {
     R6GD_GUISTATE,   /* gui_state != GUISTATE_IDLE */
     R6GD_OVL,        /* LV_OVERLAYS_MODE not one of the LV shooting screen INFO variants (6 = settings screen) */
     R6GD_DISP_OFF,   /* DISPLAY_IS_ON == 0 */
-    R6GD_NOT_PANEL,  /* display mask not exactly 0x01 (EVF 0x10, HDMI 0x1100, pointer invalid) */
+    R6GD_NOT_PANEL,  /* display mask neither exactly 0x01 (LCD) nor, M7.6, exactly 0x10 (EVF): HDMI 0x1100, both, pointer invalid */
     R6GD_NO_DIALOG,  /* LiveViewApp dialog 0 */
     R6GD_NO_IMAGE,   /* no verified FaceYuv frame (get_yuv422_vram()->vram == NULL, r6_faceyuv.c) */
     R6GD_MOVIE,      /* movie mode: not reviewed (recording is invisible to ML, PROP_MVR_REC_START denied);
@@ -112,7 +125,16 @@ struct r6_gd_stats
     uint32_t movie_sm, movie_lvms;   /* movie mode blocks by is_movie_mode() / by PROP_LV_MOVIE_SELECT */
     int32_t  shooting_mode, lv_movie_select;   /* last values seen by the gate */
     uint32_t reshow;                 /* of these: after Canon repainted layer 0 (VMIX index change, refresh_guard.c) */
-    uint32_t drawn;                  /* bit 0 zebra/false color (mirror), 1 histogram, 2 waveform, 3 spotmeter */
+    uint32_t drawn;                  /* bit 0 zebra/false color/peaking (mirror), 1 histogram, 2 waveform, 3 spotmeter */
+    /* M7.6 */
+    uint32_t evf_ok;                 /* screen checks passed on the EVF */
+    uint32_t evf_switch;             /* LCD <-> EVF band changes seen by the overlay task (overlays erased once) */
+    uint32_t peak_n, peak_us, peak_us_max, peak_nolv;   /* focus peaking passes (zebra.c draw_zebra_and_focus) */
+    uint32_t peak_dots, peak_over, peak_thr;            /* last pass: dots drawn, samples over the threshold, threshold */
+    uint32_t peak_changed;           /* passes whose dots differed from the previous pass (refresh requested) */
+    uint32_t peak_full;              /* passes that hit MAX_DIRTY_PIXELS (threshold too low, rows cut short) */
+    uint32_t peak_off;               /* dots erased because peaking was switched off */
+    uint32_t redraw_n;               /* _redraw_do (MLEV_REDRAW) handled as ML-only clrscr instead of dialog_redraw */
 };
 extern struct r6_gd_stats r6_gd_st;
 
