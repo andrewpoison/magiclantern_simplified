@@ -184,6 +184,9 @@ const struct r6_refresh_guard_stats * r6_refresh_guard_stats(void);
  * consumer must therefore only use it to skip work that changes nothing in
  * layer 0 (never to erase or overwrite) */
 uint32_t r6g_canon_activity(void);
+/* M7.7: 1 = the settle window after a display / XOC change runs (Canon
+ * repaints then); r6_layer.c forces no deferred erase meanwhile */
+int r6g_settling_now(void);
 /* current episode length in ms (0 if none) */
 uint32_t r6_refresh_guard_starve_ms(void);
 

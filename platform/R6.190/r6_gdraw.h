@@ -23,11 +23,17 @@
 #define R6_GD_LCD_Y0      50
 #define R6_GD_LCD_Y1      386
 /* M7.6, EVF: Canon's EVF shows WINSYS origin 1 (720x540 at (152,0) in layer
- * 0); ML's 720x480 area at (152,30) is assumed to be exactly the 1280x854
- * EVF image (centred in the 1280x960 panel), with Canon's EVF info in the
- * 30-row bands above and below it. Zebras / false color / peaking therefore
- * cover the whole 720x480 there (write-under keeps Canon's elements on top).
- * Same coordinates and boxes as on the LCD otherwise. */
+ * 0). M7.7 (ROM, checked twice; camera: M7.6 false color 30 rows too low):
+ * Canon top-aligns the 1280x854 EVF image in the 1280x960 panel (BlackBelt
+ * entry 0x4000, lookup 0xE080BEC4: output (0,0)), i.e. GUI rows 0..480 of
+ * origin 1 = ML rows R6_GD_EVF_IMG_Y .. R6_GD_EVF_IMG_Y + 479; Canon's EVF
+ * info bar is below it (ML rows 450..509). In the EVF src/vram.c sets
+ * os.y0 = R6_GD_EVF_IMG_Y (and bm2lv.ty to match), so the bands below are
+ * relative to the image there too: zebras / false color / peaking cover the
+ * whole image (write-under keeps Canon's elements on top). The histogram /
+ * waveform boxes keep their ML coordinates. Only this EVF layout is drawn
+ * on (r6_gdraw.c checks Canon's live EVF image info). */
+#define R6_GD_EVF_IMG_Y   (-30)
 #define R6_GD_EVF_Y0      0
 #define R6_GD_EVF_Y1      480
 extern int r6_gd_evf;               /* r6_gdraw.c: 1 = the last screen check saw the EVF (mask exactly 0x10) */
@@ -70,6 +76,7 @@ enum {
     R6GD_NO_IMAGE,   /* no verified FaceYuv frame (get_yuv422_vram()->vram == NULL, r6_faceyuv.c) */
     R6GD_MOVIE,      /* movie mode: not reviewed (recording is invisible to ML, PROP_MVR_REC_START denied);
                       * is_movie_mode() (shooting_mode) OR PROP_LV_MOVIE_SELECT == 2 (second, independent indicator) */
+    R6GD_EVF_LAYOUT, /* M7.7: EVF, but Canon's live EVF image info is not the top-aligned 1280x854 stills layout */
     R6GD_NREASONS
 };
 
@@ -135,6 +142,9 @@ struct r6_gd_stats
     uint32_t peak_full;              /* passes that hit MAX_DIRTY_PIXELS (threshold too low, rows cut short) */
     uint32_t peak_off;               /* dots erased because peaking was switched off */
     uint32_t redraw_n;               /* _redraw_do (MLEV_REDRAW) handled as ML-only clrscr instead of dialog_redraw */
+    /* M7.7: Canon's live EVF image info (DVC slot) at the last EVF check */
+    uint32_t evf_slot;               /* DVC offset of the live slot (0x390 / 0x428), 0 = none */
+    uint32_t evf_bw, evf_bh, evf_x, evf_y, evf_vw, evf_vh;   /* buffer W/H, output X/Y, visible W/H (EVF panel px) */
 };
 extern struct r6_gd_stats r6_gd_st;
 

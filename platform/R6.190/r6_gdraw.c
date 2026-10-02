@@ -18,8 +18,10 @@
  *  - LV_OVERLAYS_MODE is one of the INFO variants of the LV shooting screen
  *    (consts.h LV_OVERLAYS_MODE_ML_OK: 0..3; 6 = Canon's settings screen)
  *  - DISPLAY_IS_ON, display mask MEM(MEM(0xEA40)+0x18) exactly 0x01 = LCD
- *    or, M7.6, exactly 0x10 = EVF (same ML coordinates, see r6_gdraw.h);
- *    not HDMI/LINE 0x1100 (other geometry) and not both bits at once
+ *    or, M7.6, exactly 0x10 = EVF; not HDMI/LINE 0x1100 (other geometry) and
+ *    not both bits at once. M7.7: in the EVF only with Canon's top-aligned
+ *    1280x854 stills layout (gd_evf_layout_ok; the image is ML rows
+ *    -30..449 there, r6_gdraw.h / src/vram.c)
  *  - LiveViewApp dialog (0x1624C) != 0
  *  - a verified FaceYuv frame (r6_fy_lv_frame via get_yuv422_vram)
  * Same rules as the M7.3 histogram overlay (r6_overlays.c). RAM reads only,
@@ -57,13 +59,44 @@ extern struct dialog * LiveViewApp_dialog;                    /* stubs.S DATA_PT
 #define GD_DISPDEV_PTR 0xEA40     /* [[0xEA40]+0x18] = display mask (0xE01694C8): bit0 PNL, bit4 EVF, 0x1100 LINE */
 #define GD_MASK_PNL    0x01
 #define GD_MASK_EVF    0x10
+#define GD_DVC_PTR     0xEA60     /* display VRAM control (lvprobe LP_DVC_PTR; DISP_GetImageAddress 0xE07B1054) */
+
+/* M7.7: Canon's live EVF image info. DISPIMAGEINFO (0x98 bytes, builder
+ * 0xE02995A8, validator 0xE07B0438) is copied for OutKind 1 to DVC+0x390
+ * (dispVramCtrl_SetOnlyParamIMGRepVram 0xE061DF20), +0x428 when double
+ * buffered; live = +0x00 == 1 && +0x04 == 1 (Canon marks a dead slot 2 / 5).
+ * +0x14/+0x18 buffer W/H, +0x24/+0x28 output X/Y in EVF panel pixels
+ * (DispVramCtrlEvf 0xE01C130C -> 0xE01BBC60 adds them as the image position),
+ * +0x2C/+0x30 visible W/H. 1 = the layout ML maps (EVF stills, Device 4,
+ * BlackBelt entry 0x4000: 1280x854 buffer at panel (0,0) = ML rows -30..449,
+ * r6_gdraw.h); 0 = anything else (Device 5 "small" layout 1124x748 at
+ * (78,106), movie 1280x720 at Y 67, slot not live / not readable). RAM reads,
+ * every pointer checked. */
+static int gd_evf_layout_ok(void)
+{
+    static const uint16_t slots[2] = { 0x390, 0x428 };
+    uint32_t dvc = MEM(GD_DVC_PTR);
+    r6_gd_st.evf_slot = 0;
+    for (int s = 0; s < 2; s++)
+    {
+        uint32_t b = dvc + slots[s];
+        if (!dvc || !r6_fy_ram_ok(b, 0x34)) return 0;
+        if (MEM(b) != 1 || MEM(b + 4) != 1) continue;
+        r6_gd_st.evf_slot = slots[s];
+        r6_gd_st.evf_bw = MEM(b + 0x14); r6_gd_st.evf_bh = MEM(b + 0x18);
+        r6_gd_st.evf_x = MEM(b + 0x24);  r6_gd_st.evf_y = MEM(b + 0x28);
+        r6_gd_st.evf_vw = MEM(b + 0x2C); r6_gd_st.evf_vh = MEM(b + 0x30);
+        return r6_gd_st.evf_bw == 1280 && r6_gd_st.evf_bh == 854 && r6_gd_st.evf_x == 0 && r6_gd_st.evf_y == 0;
+    }
+    return 0;
+}
 
 struct r6_gd_stats r6_gd_st = { .mask = 0xFFFFFFFF };
 int r6_gd_evf = 0;
 
 static const char * const gd_names[R6GD_NREASONS] = {
     "drawn", "Canon LV off", "Canon GUI mode", "GUI state", "INFO/settings screen",
-    "display off", "not LCD/EVF", "no LV dialog", "no FaceYuv frame", "movie mode",
+    "display off", "not LCD/EVF", "no LV dialog", "no FaceYuv frame", "movie mode", "EVF layout",
 };
 
 const char * r6_gd_reason(int r)
@@ -91,6 +124,7 @@ static int gd_check(void)
     uint32_t mask = MEM(dd + 0x18);
     r6_gd_st.mask = mask;
     if (mask != GD_MASK_PNL && mask != GD_MASK_EVF) return R6GD_NOT_PANEL;     /* LCD or EVF alone: no HDMI/LINE bits */
+    if (mask == GD_MASK_EVF && !gd_evf_layout_ok()) return R6GD_EVF_LAYOUT;   /* M7.7: only the layout ML maps */
     if (!LiveViewApp_dialog) return R6GD_NO_DIALOG;
     /* the image source itself: without a verified frame nothing may draw, and
      * what was drawn is erased (instead of zebras frozen on a stale frame) */

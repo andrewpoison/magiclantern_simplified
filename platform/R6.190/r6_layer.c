@@ -25,11 +25,19 @@
  *     new mask and hash are stored.
  *   - piggyback conversions (the guard saw Canon repainting layer 0 right
  *     now, allow_erase 0): given-up pixels are verified but not erased; if
- *     the hash still matches they stay owned (mask = new | kept, hash over
- *     the layer values of both), and bmp.c requests another refresh, whose
- *     conversion (Canon quiet, own XimrExe path) erases them. So the
- *     check-then-erase race with Canon's GUI is only open while Canon looked
- *     quiet.
+ *     the hash still matches they stay owned (mask = new | kept; M7.7: the
+ *     hash is computed from ML's own values - LUT value written, verified
+ *     copy kept - not read back), and bmp.c requests another refresh, whose
+ *     conversion (Canon quiet, own XimrExe path) erases them. M7.7: once
+ *     kept for R6L_DEFER_MAX_MS over an unbroken run of conversions, a
+ *     piggyback conversion erases them too (in the EVF Canon flushes ~15 x
+ *     per second: no own XimrExe ever), except while the guard settles. So
+ *     erases can now run while Canon flushes; each store re-checks its pixel
+ *     right before it (erase / re-assert: still the value read for the hash;
+ *     claim: still empty), which leaves a single load / compare / store
+ *     window (it can still be preempted). Erases are re-checked in both
+ *     modes, re-asserts and claims in the write-under mode only (the ML
+ *     menu paints over Canon by design).
  * rgba_buffer_clear (clrscr): every owned block is verified the same way and
  * erased, then the table is empty, and bmp.c zeroes the whole indexed buffer
  * while it still holds the guard lock (no refresh can re-own old content in
@@ -53,9 +61,9 @@
  *   mask + 16-bit hash (97.2 KB): possible fallback if memory gets tight.
  *
  * Remaining limits (not closable from ML without a tag in the pixel values):
- *  - race: Canon's GUI may write a pixel of a block between ML's hash check
- *    and ML's erase (a few microseconds; only in conversions that started
- *    with Canon quiet, and in clrscr).
+ *  - race: Canon's GUI may write a pixel between ML's per-pixel re-check and
+ *    ML's store (M7.7: one load / compare / store; in any conversion and in
+ *    clrscr; a preemption inside it is the worst case: one Canon pixel).
  *  - the hash detects a change, not who wrote: if Canon paints exactly the
  *    RGBA values ML wrote over all owned pixels of a block, ML erases them
  *    (cosmetic hole until Canon repaints; ML's black is 0xFF010101).
@@ -151,6 +159,17 @@ static uint32_t r6l_act = 0;                 /* M7.5: r6g_canon_activity() at th
 static int r6l_act_valid = 0;
 #define R6L_LAZY_MAX_MS 2000                 /* M7.5 fix: a full conversion at least every 2 s (while converting) */
 static uint32_t r6l_t_full = 0;              /* ms (us clock / 1000) of the last full conversion */
+/* M7.7: deferred erases. Kept (given-up, verified) pixels are erased by the
+ * first conversion after they have been kept for R6L_DEFER_MAX_MS, also a
+ * piggyback one (not while the guard settles). The age runs over an
+ * unbroken run of conversions: a pause longer than R6L_DEFER_GAP_MS (display
+ * off, LV paused; the conversion cap is at most 2 s) restarts it. */
+#define R6L_DEFER_MAX_MS 250
+#define R6L_DEFER_GAP_MS 2500
+static int r6l_defer_on = 0;                 /* the previous conversion kept given-up pixels */
+static uint32_t r6l_defer_t0 = 0;            /* ms when the current run of keeping started */
+static uint32_t r6l_conv_t = 0;              /* ms when the previous conversion ended */
+static int r6l_conv_seen = 0;
 
 static inline uint32_t r6l_mix(uint32_t h, uint32_t v)
 {
@@ -163,6 +182,21 @@ static inline uint32_t r6l_hash_layer(const uint32_t * d, uint32_t m)
     uint32_t h = R6L_H0;
     for (; m; m &= m - 1)
         h = r6l_mix(h, d[__builtin_ctz(m)]);
+    return h;
+}
+
+/* M7.7: the same, keeping a copy of the values read (c[i] for the bits of m):
+ * a later store checks that the pixel still holds c[i] (store race) */
+static inline uint32_t r6l_hash_copy(const uint32_t * d, uint32_t m, uint32_t * c)
+{
+    uint32_t h = R6L_H0;
+    for (; m; m &= m - 1)
+    {
+        int i = __builtin_ctz(m);
+        uint32_t v = d[i];
+        c[i] = v;
+        h = r6l_mix(h, v);
+    }
     return h;
 }
 
@@ -184,6 +218,7 @@ static int r6l_table(uint32_t * layer)
         memset(r6l_own, 0, R6L_BLOCKS * sizeof(struct r6l_blk));
         r6l_layer = layer;
         st.resets++;
+        r6l_defer_on = 0;
     }
     return 1;
 }
@@ -240,11 +275,23 @@ int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int
     uint64_t t0 = get_us_clock();
     int fast = r6l_build_lut();
     if (!fast) st.slow_lut++;
-    if (!allow_erase) st.defer_convs++;
     if (under) st.under_convs++;
     /* M7.5: lazy only while Canon was quiet since the previous conversion */
     uint32_t act = r6g_canon_activity();
     uint32_t now_ms = (uint32_t) (t0 / 1000);
+    /* M7.7: aged deferred erases (see R6L_DEFER_MAX_MS) */
+    /* gap = idle time since the end of the previous conversion (r6l_conv_t is
+     * set at the end), so long conversions never look like a pause */
+    if (r6l_conv_seen && now_ms - r6l_conv_t > R6L_DEFER_GAP_MS) r6l_defer_t0 = now_ms;
+    r6l_conv_seen = 1;
+    int er = allow_erase;
+    if (!er && r6l_defer_on && now_ms - r6l_defer_t0 >= R6L_DEFER_MAX_MS && !r6g_settling_now())
+    {
+        er = 1;
+        st.defer_forced++;
+        if (now_ms - r6l_defer_t0 > st.defer_age_max) st.defer_age_max = now_ms - r6l_defer_t0;
+    }
+    if (!er) st.defer_convs++;
     int lz = lazy && r6l_act_valid && act == r6l_act;
     if (lz && now_ms - r6l_t_full >= R6L_LAZY_MAX_MS)
     {
@@ -319,9 +366,11 @@ int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int
             uint32_t * d = drow + bx * 32;
             uint32_t cm = om & ~nm;                      /* ML gave these up */
             uint32_t keep = 0;                           /* given up, verified, kept (piggyback) */
+            uint32_t cv[32];                             /* M7.7: owned values as read for the hash (valid if vc) */
             /* M7.4: the hash check is needed for the given-up pixels and, in
              * the write-under mode, for the re-asserted ones */
-            int verified = om && (cm || under) ? r6l_hash_layer(d, om) == o->hash : 1;
+            int vc = om && (cm || under);
+            int verified = vc ? r6l_hash_copy(d, om, cv) == o->hash : 1;
             if (unchanged && under && verified)
             {
                 /* M7.5: layer 0 holds exactly ML's unchanged values (M7.4
@@ -338,11 +387,15 @@ int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int
                     st.veto_blk++;
                     st.veto_px += __builtin_popcount(cm);
                 }
-                else if (allow_erase)
+                else if (er)
                 {
+                    /* M7.7: only where the pixel still holds what ML verified */
                     for (uint32_t m = cm; m; m &= m - 1)
-                        d[__builtin_ctz(m)] = 0x00000000;
-                    st.px_cleared += __builtin_popcount(cm);
+                    {
+                        int i = __builtin_ctz(m);
+                        if (d[i] == cv[i]) { d[i] = 0x00000000; st.px_cleared++; }
+                        else st.race_px++;
+                    }
                 }
                 else
                 {
@@ -380,16 +433,33 @@ int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int
                 blocked_px += blocked;
             }
 
-            uint32_t h = R6L_H0;
+            /* M7.7: in the write-under mode every store re-checks its pixel
+             * right before it: an owned (verified) pixel must still hold the
+             * value read for the hash, a claimed one must still be empty;
+             * otherwise Canon painted it meanwhile: not written, not owned */
+            uint32_t wd = 0;
             for (uint32_t m = wm; m; m &= m - 1)
             {
                 int i = __builtin_ctz(m);
                 uint32_t v = r6l_lut[s.b[i]];
+                if (under)
+                {
+                    uint32_t cur = d[i];
+                    int ok = (vc && verified && ((om >> i) & 1)) ? cur == cv[i] : R6L_EMPTY(cur);
+                    if (!ok) { st.race_px++; continue; }
+                }
                 d[i] = v;
-                h = r6l_mix(h, v);
+                wd |= 1u << i;
             }
-            uint32_t mk = wm | keep;
-            if (keep) h = r6l_hash_layer(d, mk);         /* kept pixels hold ML's verified values */
+            uint32_t mk = wd | keep;
+            /* hash of what ML now owns, from ML's own values (written: LUT
+             * value; kept: the verified copy) - no read-back of layer 0 */
+            uint32_t h = R6L_H0;
+            for (uint32_t m = mk; m; m &= m - 1)
+            {
+                int i = __builtin_ctz(m);
+                h = r6l_mix(h, ((wd >> i) & 1) ? r6l_lut[s.b[i]] : cv[i]);
+            }
             o->mask = mk;
             o->hash = h;
             if (mk) { owned_b++; owned_px += __builtin_popcount(mk); }
@@ -397,6 +467,8 @@ int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int
     }
 
     st.defer_blk = defer_b;
+    if (defer_b) { if (!r6l_defer_on) { r6l_defer_on = 1; r6l_defer_t0 = now_ms; } }
+    else r6l_defer_on = 0;
     st.under_blocked_last = blocked_px;
     st.under_blocked_px += blocked_px;
     st.blk_skip = skip;
@@ -409,6 +481,7 @@ int r6_layer_convert(const uint8_t * idx, uint32_t * layer, int allow_erase, int
     st.px_owned = owned_px;
     st.conversions++;
     uint32_t us = (uint32_t) (get_us_clock() - t0);
+    r6l_conv_t = now_ms + us / 1000;
     st.us_last = us;
     if (us > st.us_max) st.us_max = us;
     if (us < st.us_min) st.us_min = us;
@@ -433,11 +506,16 @@ int r6_layer_clear(uint32_t * layer)
             uint32_t om = o->mask;
             if (!om) continue;
             uint32_t * d = drow + bx * 32;
-            if (r6l_hash_layer(d, om) == o->hash)
+            uint32_t c[32];
+            if (r6l_hash_copy(d, om, c) == o->hash)
             {
+                /* M7.7: only where the pixel still holds the value checked */
                 for (uint32_t m = om; m; m &= m - 1)
-                    d[__builtin_ctz(m)] = 0x00000000;
-                st.clear_px += __builtin_popcount(om);
+                {
+                    int i = __builtin_ctz(m);
+                    if (d[i] == c[i]) { d[i] = 0x00000000; st.clear_px++; }
+                    else st.race_px++;
+                }
             }
             else
             {
@@ -451,6 +529,7 @@ int r6_layer_clear(uint32_t * layer)
     st.blk_owned = 0;
     st.px_owned = 0;
     st.clears++;
+    r6l_defer_on = 0;
     uint32_t us = (uint32_t) (get_us_clock() - t0);
     st.clear_us_last = us;
     if (us > st.clear_us_max) st.clear_us_max = us;

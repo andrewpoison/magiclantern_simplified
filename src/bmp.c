@@ -302,8 +302,9 @@ void refresh_yuv_from_rgb(void)
         /* R6 (platform/R6.190/r6_layer.c): ownership-aware conversion. Skips
          * empty 32-px blocks, writes ML's opaque pixels, and erases pixels ML
          * gave up only where layer 0 still holds exactly what ML wrote there,
-         * and only when the guard saw Canon quiet (EXE path; a piggyback
-         * conversion keeps them owned and asks for another refresh below).
+         * when the guard saw Canon quiet (EXE path; a piggyback conversion
+         * keeps them owned and asks for another refresh below) or, M7.7,
+         * once they were kept for R6L_DEFER_MAX_MS (r6_layer.c).
          * Runs under the guard lock (r6g_begin .. r6g_end), so never at the
          * same time as rgba_buffer_clear. 0 = no ownership table (malloc
          * failed): the old loop below. */
@@ -382,10 +383,15 @@ void refresh_yuv_from_rgb(void)
     if (r6g_g != R6G_GATE_OK)
     {
         /* PIG: Canon's next flushes compose layer 0; SKIP: flag back to 1 */
+#ifdef CONFIG_R6_LAYER_OWNERSHIP
+        /* piggyback kept given-up pixels: a later refresh erases them (Canon
+         * quiet, or M7.7: once kept for R6L_DEFER_MAX_MS). Read before
+         * r6g_end releases the guard lock (another refresh resets it) */
+        int r6l_deferred = r6_layer_deferred() != 0;
+#endif
         r6g_end(r6g_g == R6G_GATE_PIG ? R6G_END_PIGGYBACK : R6G_END_GATE);
 #ifdef CONFIG_R6_LAYER_OWNERSHIP
-        /* piggyback kept given-up pixels: a later refresh (Canon quiet) erases them */
-        if (r6_layer_deferred())
+        if (r6l_deferred)
             ml_refresh_display_needed = 1;
 #endif
         return;

@@ -14,6 +14,9 @@
 #ifdef CONFIG_R6_FACEYUV_LV
 #include "r6_faceyuv.h"         /* platform/R6.190 */
 #endif
+#ifdef CONFIG_R6_GLOBAL_DRAW
+#include "r6_gdraw.h"           /* platform/R6.190: r6_gd_evf, R6_GD_EVF_IMG_Y */
+#endif
 
 //~ #define CONFIG_DEBUGMSG 1
 
@@ -244,8 +247,10 @@ void _update_vram_params()
 #endif
     
 #ifndef CONFIG_R6_FACEYUV_LV
-    /* R6 M7.4: skipped - os.* is set once to the fixed LCD values below, so
-     * an unlocked reader (hist_build) never sees the HDMI / RCA values */
+    /* R6 M7.4: skipped - os.* is set below from the FaceYuv geometry, never
+     * to the HDMI / RCA values. M7.7: os.y0 / bm2lv.ty follow LCD / EVF;
+     * the unlocked reader (r6_hist_build) takes a snapshot under BMP_LOCK
+     * and bounds every row to the buffer */
     // LV crop area (black bars)
     os.x0   = hdmi_code >= 5 ?  75 - 120 : (hdmi_code == 2 ? 40 : EXT_MONITOR_RCA ? (video_system_pal ? 40 : 40) :    0);
     os.y0   = hdmi_code >= 5 ?   0 - 30  : (hdmi_code == 2 ? 24 : EXT_MONITOR_RCA ? (video_system_pal ? 29 : 25) :    0);
@@ -364,14 +369,21 @@ void _update_vram_params()
     /* R6 M7.4: ML's LV image is Canon's FaceYuv buffer (r6_faceyuv.c):
      * 640x426 UYVY, pitch 1280, the full 3:2 frame that the LCD shows on the
      * whole screen, i.e. on ML's whole 720x480 LCD area (offset (152,30) in
-     * the 2048x1080 layer, M5). Fixed for the LCD; the overlays are gated to
-     * the LCD shooting screen (get_global_draw, r6_gdraw.c), so the EVF/HDMI
-     * geometry is not needed. No 16:9 bars (photo LV). */
+     * the 2048x1080 layer, M5). No 16:9 bars (photo LV).
+     * M7.7: in the EVF (r6_gd_evf, the last screen check that passed) the
+     * image is top-aligned in WINSYS origin 1, i.e. ML rows -30..449
+     * (R6_GD_EVF_IMG_Y, r6_gdraw.h); os.y0 follows, bm2lv.ty below matches
+     * it. HDMI is gated off. The overlay task marks the params dirty when
+     * r6_gd_evf changes. */
     vram_lv.width = R6_FY_W;
     vram_lv.height = R6_FY_H;
     vram_lv.pitch = R6_FY_PITCH;
     os.x0 = 0;
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    os.y0 = r6_gd_evf ? R6_GD_EVF_IMG_Y : 0;
+    #else
     os.y0 = 0;
+    #endif
     os.x_ex = 720;
     os.y_ex = 480;
     os.x_max = os.x0 + os.x_ex;
@@ -475,11 +487,13 @@ void _update_vram_params()
     //~ bm2lv.ty = (PLAY_MODE || QR_MODE)? -48 : 0;     
 #elif defined(CONFIG_R6_FACEYUV_LV)
     /* R6 M7.4: ML (0..719, 0..479) -> FaceYuv (0..638, 0..424); sx = 910,
-     * sy = 908 (/1024), so BM2LV never leaves the 640x426 buffer */
+     * sy = 908 (/1024), so BM2LV never leaves the 640x426 buffer.
+     * M7.7: ty maps os.y0 to LV row 0 (EVF: os.y0 = -30, ty = 27:
+     * BM2LV_Y(-30) = -27 + 27 = 0, BM2LV_Y(449) = 398 + 27 = 425) */
     bm2lv.sx = 1024 * vram_lv.width / os.x_ex;
     bm2lv.sy = 1024 * vram_lv.height / os.y_ex;
     bm2lv.tx = 0;
-    bm2lv.ty = 0;
+    bm2lv.ty = -((os.y0 * bm2lv.sy) >> 10);
 #else
     // bmp to lv transformation
     // LCD: (0,0) -> (0,0)

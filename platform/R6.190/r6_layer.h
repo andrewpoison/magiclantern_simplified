@@ -22,7 +22,13 @@ int r6_layer_target_ok(const struct MARV * m);
  * allow_erase: 1 = pixels ML gave up are erased (verified); 0 (piggyback:
  * Canon is repainting layer 0 right now) = they are only verified and kept
  * owned, the next conversion with allow_erase erases them (r6_layer_deferred
- * tells the caller to request one).
+ * tells the caller to request one). M7.7: once kept for R6L_DEFER_MAX_MS
+ * (an unbroken run of conversions), also a piggyback conversion erases them,
+ * except while the refresh guard settles (in the EVF Canon flushes ~15 x per
+ * second, so there is never an allow_erase conversion). Erases (both modes)
+ * and, in the write-under mode, re-asserts and claims re-read the layer
+ * pixel right before the store and skip it if it changed since ML checked
+ * it (race_px); in the ML menu (under 0) re-asserts / claims overpaint.
  * under (M7.4, ML menu closed): write-under rule. A pixel ML does not own
  * yet is written (and owned) only where layer 0 shows nothing of Canon
  * (alpha 0 or the colour key 0xFF000000); pixels ML owns are re-asserted
@@ -94,6 +100,10 @@ struct r6_layer_stats
     uint32_t us_lazy_last, us_lazy_max, us_full_last, us_full_max;
     uint32_t full_forced;    /* fix round: full only because the last full one was >= 2 s old */
     uint32_t lazy_streak, lazy_streak_max;   /* consecutive lazy conversions (current / longest) */
+    /* M7.7 */
+    uint32_t defer_forced;   /* piggyback conversions that erased because given-up pixels were kept >= R6L_DEFER_MAX_MS */
+    uint32_t defer_age_max;  /* longest keep time (ms) at such a forced erase */
+    uint32_t race_px;        /* stores skipped: layer 0 changed between ML's check and its store (Canon painted meanwhile) */
     /* target check (r6_layer_target_ok) */
     uint32_t bad_target;     /* refresh / clear calls refused: layer 0 not as expected */
     uint32_t bad_w, bad_h;   /* MARV width / height of the last refusal */

@@ -1005,6 +1005,9 @@ static void lp_census_m72a(struct lp_buf * b)
         LL("us_full_max", s->us_full_max);
         LL("full_forced", s->full_forced);
         LL("lazy_streak_max", s->lazy_streak_max);
+        LL("defer_forced", s->defer_forced);
+        LL("defer_age_max", s->defer_age_max);
+        LL("race_px", s->race_px);
         for (int i = 0; i < 4; i++)
         {
             snprintf(k, sizeof(k), "layer.under_val[%d]", i);       lp_printf(b, "%s=0x%08x\n", k, (int) s->under_val[i]);
@@ -1115,6 +1118,11 @@ static void lp_census_m72a(struct lp_buf * b)
         LGD("peak_nolv", g->peak_nolv);    LGD("peak_dots", g->peak_dots);         LGD("peak_over", g->peak_over);
         LGD("peak_thr", g->peak_thr);      LGD("peak_changed", g->peak_changed);   LGD("peak_full", g->peak_full);
         LGD("peak_off", g->peak_off);      LGD("redraw_n", g->redraw_n);
+        /* M7.7 */
+        lp_printf(b, "gd.evf_slot=0x%x\n", (int) g->evf_slot);
+        LGD("evf_bw", g->evf_bw);          LGD("evf_bh", g->evf_bh);
+        LGD("evf_x", g->evf_x);            LGD("evf_y", g->evf_y);
+        LGD("evf_vw", g->evf_vw);          LGD("evf_vh", g->evf_vh);
 #undef LGD
     }
 #endif
@@ -1252,7 +1260,8 @@ static void lp_census(struct lp_buf * b, const char * tag)
      * (0 = UYVY 8 bit, 3 = packed 10 bit), [0x19], [0x1a], [0x1d] = 1 when initialised.
      * Slot -> output mapping is unverified: w[1] (DisplayOut) settles it. */
     lp_printf(b, "# dvc.imginfo slots, assumed panel 0x1c8/0x260, evf 0x390/0x428, line 0x558/0x5f0 (unverified; w[0x1] = DisplayOut)\n");
-    static const uint8_t dii[] = { 0, 1, 2, 3, 5, 6, 0xd, 0xe, 0x19, 0x1a, 0x1d };
+    /* M7.7: + [7],[8] crop x/y, [9],[0xa] output X/Y, [0xb],[0xc] visible W/H (builder 0xE02995A8) */
+    static const uint8_t dii[] = { 0, 1, 2, 3, 5, 6, 7, 8, 9, 0xa, 0xb, 0xc, 0xd, 0xe, 0x19, 0x1a, 0x1d };
     for (int s = 0; s < 6; s++)
         for (int i = 0; i < (int) COUNT(dii); i++)
         {

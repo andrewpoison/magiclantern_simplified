@@ -55,6 +55,7 @@
 #include "r6_gdraw.h"
 #include "refresh_guard.h"      /* idx_changes: Canon repainted layer 0 */
 #include "r6_layer.h"           /* resets: layer 0 address changed */
+#include "r6_faceyuv.h"         /* M7.7: R6_FY_H / R6_FY_PITCH (waveform row bound) */
 #ifdef FEATURE_HISTOGRAM
 #ifndef FEATURE_R6_CANON_HISTOGRAM
 #error "R6 M7.5: ML's histogram needs Canon's bins (r6_overlays.c)"
@@ -661,12 +662,20 @@ static void r6_hist_build(const uint32_t * buf)
         }
         uint32_t n = 0;
         int off = get_y_skip_offset_for_histogram();
-        int y1 = os.y_max - off;
-        for (int y = os.y0 + off; y < y1; y += R6_WFM_YSTEP)
+        /* M7.7: this runs in livev_loprio_task without BMP_LOCK, and os.y0 /
+         * bm2lv.ty now change at LCD <-> EVF (src/vram.c): take one
+         * consistent snapshot, and bound every row to the FaceYuv buffer */
+        int r6_y0, r6_ym, r6_sy, r6_ty;
+        BMP_LOCK( r6_y0 = os.y0; r6_ym = os.y_max; r6_sy = bm2lv.sy; r6_ty = bm2lv.ty; )
+        int y1 = r6_ym - off;
+        for (int y = r6_y0 + off; y < y1; y += R6_WFM_YSTEP)
         {
             const uint32_t * rows[R6_WFM_YSTEP];
             for (int k = 0; k < R6_WFM_YSTEP; k++)
-                rows[k] = (y + k < y1) ? buf + (BM2LV_R(y + k) >> 2) : NULL;
+            {
+                int ly = (((y + k) * r6_sy) >> 10) + r6_ty;     /* = BM2LV_Y(y + k) */
+                rows[k] = (y + k < y1 && ly >= 0 && ly < R6_FY_H) ? buf + ly * (R6_FY_PITCH / 4) : NULL;
+            }
             for (int c = 0; c < WAVEFORM_WIDTH; c++)
             {
                 const uint32_t * row = rows[R6_WFM_PHASE(c)];
@@ -1270,7 +1279,11 @@ static inline int zebra_color_word_row(int c, int y)
     if (!c) return 0;
     
     uint32_t cw = 0;
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    switch(y & 3)       /* M7.7: the EVF image starts at ML row -30 (y % 4 < 0 there) */
+    #else
     switch(y % 4)
+    #endif
     {
         case 0:
             cw  = c  | c  << 8;
@@ -2204,7 +2217,14 @@ clrscr_mirror( void )
     if (!bvram_mirror) return;
 
     int x, y;
+    #ifdef CONFIG_R6_GLOBAL_DRAW
+    /* M7.7: the rows of both screens (EVF image ML rows -30..449, LCD
+     * 0..479): at an LCD <-> EVF switch os.* may already describe the new
+     * one; only pixels that still equal the mirror are cleared */
+    for( y = MIN(os.y0, R6_GD_EVF_IMG_Y); y < MAX(os.y_max, 480); y++ )
+    #else
     for( y = os.y0; y < os.y_max; y++ )
+    #endif
     {
         for( x = os.x0; x < os.x_max; x += 4 )
         {
@@ -4669,6 +4689,7 @@ livev_hipriority_task( void* unused )
             {
                 if (r6_evf_seen >= 0) { r6_gd_st.evf_switch++; r6_gd_erase(); }
                 r6_evf_seen = r6_gd_evf;
+                vram_params_set_dirty();    /* M7.7: os.y0 / bm2lv follow the screen (src/vram.c) */
             }
         }
         #endif

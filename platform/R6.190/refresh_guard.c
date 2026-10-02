@@ -331,6 +331,12 @@ uint32_t r6g_canon_activity(void)
     return rg.act_seq;
 }
 
+/* M7.7 (r6_layer.c): the settle window runs (RAM reads, no lock) */
+int r6g_settling_now(void)
+{
+    return rg_settling(get_ms_clock());
+}
+
 static int rg_canon_active(int now)
 {
     rg.act_win_ms = rg_evf() ? RG_ACT_EVF_MS : RG_ACT_MS;
