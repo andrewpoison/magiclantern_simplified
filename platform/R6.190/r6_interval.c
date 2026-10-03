@@ -29,7 +29,8 @@
  *    frame of the calling task and gives a deleted semaphore = Canon assert =
  *    hang: only MF (the SW1 reply waits for AF), only M with Tv <= 1 s (Tv
  *    mode: safety shift may lengthen it; Tv = PROP_SHUTTER as delivered, own
- *    handler, lens.c drops it in Av / P), single shot; one
+ *    handler, lens.c drops it in Av / P and reads the R6 format as 0), single
+ *    shot; one
  *    long-lived task (r6_iv_task, never ends) makes every call, never two at
  *    once, never from the GUI, a property handler or with an ML lock held
  *  - exposures near the 10 s job wait cause retries (extra pictures): Tv <=
@@ -88,8 +89,18 @@ extern int lv_action_raw_get(uint32_t * value, int * len);   /* propvalues.c */
 #define R6IV_JOB_MS        30000   /* Canon's job count must be 0 again within this time */
 #define R6IV_SETTLE_MS       300   /* after the job: late counter updates (extra pictures) */
 #define R6IV_MAX_PICS         50   /* per series, until a long test showed no leak */
-#define R6IV_RAW_TV_MIN       56   /* 1 s (raw2shutter_ms: 2^((56 - raw) / 8) s) */
-#define R6IV_RAW_TV_MAX      168   /* 1/16000 s */
+/* R6 PROP_SHUTTER = Canon's PROP_SET_TV (camera test 2026-10-03, LVP00037,
+ * and the ROM): exactly 2 bytes (CC master size table 0xE0FE3E0C; writer
+ * ManualSafetyShift 0xE0946A5A, readers ldrh+sxth 0xE066FDCE / 0xE0750948),
+ * a signed 16-bit Tv in EV * 768 (Canon "Code768"), 256 per 1/3 stop, 384
+ * per 1/2 stop: 1 s = 0x0000, 1/80 = 0x1300, 1/100 = 0x1400, 1/125 = 0x1500
+ * (7 EV), 4 s = 0xFA00 (-2 EV), 30 s = 0xF100, Bulb 0xDF00, 0xDC00 (flag).
+ * The bytes after the 2 delivered ones are undefined. Not ML's raw 56 + 8 *
+ * EV (upstream lens.c keeps the low byte, 0 on the R6). Accepted: a multiple
+ * of 128 in 0 (1 s) .. 10752 (14 EV = 1/16000 s); anything else (also a
+ * delivery that is not 2 bytes long) counts as unknown. */
+#define R6IV_TV_EV768_MIN      0   /* 1 s */
+#define R6IV_TV_EV768_MAX  10752   /* 1/16000 s */
 #define R6IV_GUI_REVIEW   0x4033   /* Canon's quick review (SetGUIMode 0xE0BD35E4) */
 #define R6IV_GUI_SR       0x4034   /* LvReview's SR mode (GUI_RequestSR from action_None_NotifySR 0xE0B9BD1A) */
 #define R6IV_GUI_SAVER    0xE08E   /* START_SCREEN_SAVER (GuiUtilTftPowerSaveController 0xE0BA6F74 / 0xE0BA6ECA) */
@@ -115,14 +126,33 @@ static int iv_gui_seen = 0;              /* foreign Canon GUI mode seen during t
 static int iv_due = 0;                   /* ms of the next picture slot */
 static uint32_t iv_wait_ms = 0;          /* camera not ready (ML menu excluded) since the last picture */
 static uint32_t iv_wait_mask = 0;
-static volatile uint32_t iv_tv_prop = 0; /* PROP_SHUTTER as delivered (lens.c drops it while ML still sees Av / P) */
+static volatile int iv_tv_prop = 0;      /* PROP_SHUTTER as delivered, int16 (lens.c drops it while ML still sees Av / P) */
 static volatile int iv_tv_seen = 0;
+static volatile int iv_tv_len = 0;
+static volatile uint32_t iv_aeb = 0;     /* PROP_AEB as delivered (shoot.c keeps its copy static) */
+static volatile int iv_aeb_seen = 0;
 
-/* read-only copy of an already registered property (lens.c has the other handler) */
+/* read-only copies of already registered properties (lens.c / shoot.c have the other handlers) */
 PROP_HANDLER(PROP_SHUTTER)
 {
-    iv_tv_prop = buf[0];
+    iv_tv_len = len;
+    if (len != 2) { iv_tv_seen = 0; return; }   /* unknown layout: Start stays refused */
+    int16_t t;
+    memcpy(&t, buf, 2);                          /* only the delivered bytes */
+    iv_tv_prop = t;
     iv_tv_seen = 1;
+}
+
+/* exposure bracketing: in M it lengthens the exposure (1 s at +3 EV = 8 s).
+ * 4 bytes (CC master size table); signed low halfword = bracketing step,
+ * 0x100 per 1/3 EV (GUI tables 0xE1F022D8 / 0xE1F02534), 0 = off; byte 2 =
+ * two-shot type (CameraConductor keeps it only with a step, 0xE03B2D84..
+ * 0xE03B2DB2), byte 3 unused. Canon's own "AEB on" tests use the low
+ * halfword only (0xE05B38D4, 0xE0AB088A, 0xE0B12EB8), and so does ML. */
+PROP_HANDLER(PROP_AEB)
+{
+    iv_aeb = buf[0];
+    iv_aeb_seen = 1;
 }
 
 static const char * const iv_stop_names[R6IV_NSTOPS] = {
@@ -131,7 +161,7 @@ static const char * const iv_stop_names[R6IV_NSTOPS] = {
     "Canon job open",
 };
 static const char * const iv_cam_names[R6IV_NCAMS] = {
-    "ok", "movie mode", "not M", "Tv > 1s or unknown", "not single shot", "not MF", "no card / full",
+    "ok", "movie mode", "not M", "Tv > 1s or unknown", "not single shot", "not MF", "no card / full", "AEB on",
 };
 static const char * const iv_canon_names[R6IV_NCANON] = {
     "ready", "remote switch not ready", "factory part not ready", "Release in flight", "factory log to file",
@@ -144,7 +174,31 @@ int r6_iv_running(void) { return st.running || iv_cmd == 1; }
 const char * r6_iv_stop_name(int s) { return (s >= 0 && s < R6IV_NSTOPS) ? iv_stop_names[s] : "?"; }
 const char * r6_iv_cam_name(int c) { return (c >= 0 && c < R6IV_NCAMS) ? iv_cam_names[c] : "?"; }
 const char * r6_iv_canon_name(int c) { return (c >= 0 && c < R6IV_NCANON) ? iv_canon_names[c] : "?"; }
-int r6_iv_tv_prop(int * seen) { if (seen) *seen = iv_tv_seen; return iv_tv_prop; }
+int r6_iv_tv_prop(int * seen, int * len)
+{
+    if (seen) *seen = iv_tv_seen;
+    if (len) *len = iv_tv_len;
+    return iv_tv_prop;
+}
+
+int r6_iv_tv_ev768(int * ev)
+{
+    if (!iv_tv_seen) return 0;
+    int e = iv_tv_prop;
+    if (e % 128) return 0;                  /* neither 1/3 nor 1/2 stops (and not Canon's flag values) */
+    *ev = e;
+    return 1;
+}
+
+int r6_iv_aeb(int * seen) { if (seen) *seen = iv_aeb_seen; return iv_aeb; }
+
+/* EV * 768 -> ML's raw Tv (56 + 8 * EV) like Canon's own conversion
+ * (0xE09B643E, + 56; exact for its 82 table entries); for lens_format_shutter */
+static int iv_ev768_to_raw(int t)
+{
+    int x = t / 32;
+    return 56 + (x + (x >= 0 ? 1 : -1)) / 3;
+}
 
 static int iv_interval_s(void) { return iv_intervals[COERCE(r6_iv_interval_idx, 0, COUNT(iv_intervals) - 1)]; }
 static int iv_delay_s(void) { return iv_delays[COERCE(r6_iv_delay_idx, 0, COUNT(iv_delays) - 1)]; }
@@ -166,11 +220,12 @@ int r6_iv_cam_check(void)
 {
     if (is_movie_mode() || lv_movie_select == LVMS_ENABLE_MOVIE) return R6IV_CAM_MOVIE;
     if (shooting_mode != SHOOTMODE_M) return R6IV_CAM_MODE;
-    int tv = iv_tv_prop;
-    if (!iv_tv_seen || tv < R6IV_RAW_TV_MIN || tv > R6IV_RAW_TV_MAX) return R6IV_CAM_TV;
+    int ev = 0;
+    if (!r6_iv_tv_ev768(&ev) || ev < R6IV_TV_EV768_MIN || ev > R6IV_TV_EV768_MAX) return R6IV_CAM_TV;
     if (drive_mode != DRIVE_SINGLE) return R6IV_CAM_DRIVE;
     if ((af_mode & 0xF) != AF_MODE_MANUAL_FOCUS) return R6IV_CAM_FOCUS;
     if (avail_shot <= 0) return R6IV_CAM_CARD;
+    if (iv_aeb_seen && (int16_t) (iv_aeb & 0xFFFF)) return R6IV_CAM_AEB;
     return R6IV_CAM_OK;
 }
 
@@ -480,13 +535,13 @@ static const char * iv_mode_name(int m)
 
 static MENU_UPDATE_FUNC(iv_cam_update)
 {
-    int seen = 0;
-    int tv = r6_iv_tv_prop(&seen);
-    if (!seen) tv = 0;
+    int seen = 0, len = 0, ev = 0, tv = 0;
+    int tvp = r6_iv_tv_prop(&seen, &len);
+    if (r6_iv_tv_ev768(&ev) && ev >= -0xF00 && ev <= R6IV_TV_EV768_MAX) tv = iv_ev768_to_raw(ev);   /* 30 s .. 1/16000 */
     MENU_SET_VALUE("%s, %s, %s, %s", iv_mode_name(shooting_mode),
         drive_mode == DRIVE_SINGLE ? "single" : "drive?",
         (af_mode & 0xF) == AF_MODE_MANUAL_FOCUS ? "MF" : "AF",
-        (tv >= 15 && tv <= R6IV_RAW_TV_MAX) ? lens_format_shutter(tv) : "Tv?");
+        (tv >= 15 && tv <= 168) ? lens_format_shutter(tv) : "Tv?");
     int c = r6_iv_cam_check();
     if (c == R6IV_CAM_OK) return;
     switch (c)
@@ -494,7 +549,10 @@ static MENU_UPDATE_FUNC(iv_cam_update)
         case R6IV_CAM_MODE:
             MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Mode %d: set M.", shooting_mode); break;
         case R6IV_CAM_TV:
-            MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Tv raw %d (%s): set 1 s or shorter, turn the main dial.", tv, seen ? "seen" : "not seen"); break;
+            MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Tv %d (0x%x, %s, len %d): set 1 s or shorter, turn the main dial.",
+                tvp, tvp & 0xFFFF, seen ? "seen" : "not seen", len); break;
+        case R6IV_CAM_AEB:
+            MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "AEB 0x%x: switch exposure bracketing off.", (int) iv_aeb); break;
         case R6IV_CAM_DRIVE:
             MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Drive 0x%x: set single shot (0 expected).", drive_mode); break;
         case R6IV_CAM_FOCUS:

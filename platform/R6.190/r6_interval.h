@@ -33,6 +33,7 @@ enum r6_iv_cam {
     R6IV_CAM_DRIVE,          /* drive mode not single shot */
     R6IV_CAM_FOCUS,          /* not MF ((af_mode & 0xF) != 3) */
     R6IV_CAM_CARD,           /* no card / card full (avail_shot == 0) */
+    R6IV_CAM_AEB,            /* exposure bracketing on (PROP_AEB step != 0): lengthens Tv in M */
     R6IV_NCAMS
 };
 
@@ -98,7 +99,9 @@ const char * r6_iv_canon_name(int c);
 int r6_iv_cam_check(void);             /* enum r6_iv_cam */
 int r6_iv_canon_check(int * hard);     /* enum r6_iv_canon; *hard = 1: stops a series; menu display:
                                         * ignores the ML menu and what it causes (LV stopped, gui_state) */
-int r6_iv_tv_prop(int * seen);         /* PROP_SHUTTER as Canon delivered it (r6_interval.c's own handler) */
+int r6_iv_tv_prop(int * seen, int * len); /* PROP_SHUTTER as delivered (int16, own handler); len = delivered length */
+int r6_iv_tv_ev768(int * ev);          /* 1 = the delivered Tv decoded: *ev = Tv in EV * 768 (1 s = 0, 1/125 s = 5376) */
+int r6_iv_aeb(int * seen);             /* PROP_AEB as delivered (own handler), 0 = off */
 
 /* Canon RAM read by r6_interval.c (for the log; read-only) */
 #define R6IV_RAM_JOBCNT    0x9DC0      /* live job count [0x9D9C+0x24]: CreateJob checks it (cbz 0xE07C9E5E),
