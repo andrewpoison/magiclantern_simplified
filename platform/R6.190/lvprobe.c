@@ -96,6 +96,10 @@
 #ifdef CONFIG_R6_GLOBAL_DRAW
 #include "r6_gdraw.h"
 #endif
+#ifdef CONFIG_R6_INTERVAL
+#include "lens.h"
+#include "r6_interval.h"
+#endif
 
 /* CONFIG_LIVEVIEW compiles in force_liveview (fake_simple_button(BGMT_LV) in
  * a loop while lv == 0) and the LV AF frame code. With lv pinned to 0 by
@@ -1484,6 +1488,85 @@ static void lp_vmix_poll(struct lp_buf * b)
     lp_printf(b, "dtc_seq_samples=%d\n", n_seq);                 /* 0x21A58 != 0 */
 }
 
+#ifdef CONFIG_R6_INTERVAL
+/* M8.0: interval release state (r6_interval.c), ML's values it checks, the
+ * Canon RAM words it reads, and the last pictures (oldest first) */
+static const char * lp_nosp(const char * s, char * buf, int n)
+{
+    int i = 0;
+    for (; s[i] && i < n - 1; i++) buf[i] = s[i] == ' ' ? '_' : s[i];
+    buf[i] = 0;
+    return buf;
+}
+
+static void lp_iv_log(struct lp_buf * b)
+{
+    const struct r6_iv_stats * s = r6_iv_stats();
+    char w[40];
+    int hard = 0;
+    int k = r6_iv_canon_check(&hard);
+    int c = r6_iv_cam_check();
+    lp_printf(b, "iv.running=%d\n", s->running);
+    lp_printf(b, "iv.n_done=%d\n", s->n_done);
+    lp_printf(b, "iv.n_target=%d\n", s->n_target);
+    lp_printf(b, "iv.interval_s=%d\n", s->interval_s);
+    lp_printf(b, "iv.t_start=%d\n", (int) s->t_start);
+    lp_printf(b, "iv.stop=%d,%s\n", s->stop, lp_nosp(r6_iv_stop_name(s->stop), w, sizeof(w)));
+    lp_printf(b, "iv.stop_cam=%d,%s\n", s->stop_cam, lp_nosp(r6_iv_cam_name(s->stop_cam), w, sizeof(w)));
+    lp_printf(b, "iv.stop_canon=%d,%s\n", s->stop_canon, lp_nosp(r6_iv_canon_name(s->stop_canon), w, sizeof(w)));
+    lp_printf(b, "iv.stop_val=%d\n", (int) s->stop_val);
+    lp_printf(b, "iv.t_stop=%d\n", (int) s->t_stop);
+    lp_printf(b, "iv.skipped=%d\n", s->skipped);
+    lp_printf(b, "iv.calls=%d\n", (int) s->calls);
+    lp_printf(b, "iv.shots=%d\n", (int) s->shots);
+    lp_printf(b, "iv.refused=%d\n", (int) s->refused);
+    lp_printf(b, "iv.cam=%d,%s\n", c, lp_nosp(r6_iv_cam_name(c), w, sizeof(w)));
+    lp_printf(b, "iv.canon=%d,%s\n", k, lp_nosp(r6_iv_canon_name(k), w, sizeof(w)));
+    lp_printf(b, "iv.canon_hard=%d\n", hard);
+    lp_printf(b, "iv.shooting_mode=%d\n", shooting_mode);
+    lp_printf(b, "iv.drive_mode=0x%08x\n", drive_mode);
+    lp_printf(b, "iv.af_mode=0x%08x\n", af_mode);
+    lp_printf(b, "iv.raw_shutter=%d\n", lens_info.raw_shutter);
+    int tv_seen = 0;
+    int tv_prop = r6_iv_tv_prop(&tv_seen);
+    lp_printf(b, "iv.tv_prop=0x%08x\n", tv_prop);
+    lp_printf(b, "iv.tv_seen=%d\n", tv_seen);
+    lp_printf(b, "iv.avail_shot=%d\n", avail_shot);
+    lp_printf(b, "iv.burst_count=%d\n", burst_count);
+    lp_printf(b, "iv.icu_uilock=0x%08x\n", icu_uilock);
+    lp_printf(b, "iv.sensor_cleaning=%d\n", sensor_cleaning);
+    lp_printf(b, "iv.auto_power_off_time=%d\n", auto_power_off_time);
+    lp_printf(b, "iv.total_shots_count=%d\n", total_shots_count);
+    lp_printf(b, "iv.shutter_count=%d\n", shutter_count);
+    struct card_info * card = get_shooting_card();
+    lp_printf(b, "iv.file_number=%d\n", card ? card->file_number : -1);
+    lp_printf(b, "iv.job_state=0x%08x\n", lens_info.job_state);
+    lp_printf(b, "iv.gui_mode=0x%08x\n", CURRENT_GUI_MODE);
+    lp_printf(b, "iv.gui_state=%d\n", gui_state);
+    lp_glob(b, "iv.ram.jobcnt", R6IV_RAM_JOBCNT);
+    lp_glob(b, "iv.ram.fasy_sem", R6IV_RAM_FASY_SEM);
+    lp_glob(b, "iv.ram.fa_log", R6IV_RAM_FA_LOG);
+    lp_glob(b, "iv.ram.fa_logmode", R6IV_RAM_FA_LOGMODE);
+    lp_glob(b, "iv.ram.fa_logfile", R6IV_RAM_FA_LOGFILE);
+    lp_glob(b, "iv.ram.fa_store", R6IV_RAM_FA_STORE);
+    lp_globs(b, "iv.ram.faneo", R6IV_RAM_FANEO, 4);
+    lp_glob(b, "iv.ram.faneo_sem", R6IV_RAM_FANEO_SEM);
+    lp_glob(b, "iv.ram.cc_sw1", R6IV_RAM_CC_SW1);
+    lp_glob(b, "iv.ram.cc_sw2", R6IV_RAM_CC_SW2);
+    lp_glob(b, "iv.ram.cc_obj", R6IV_RAM_CC_OBJ);
+    int n = MIN((int) s->shots, R6IV_RING);
+    lp_printf(b, "# iv.shot[i]=t,ret,dur_ms,d_cnt,d_fn,pic_ms,job_ms,jobs_after,js_before,js_after,wait_ms,wait_mask\n");
+    for (int i = 0; i < n; i++)
+    {
+        const struct r6_iv_shot * e = &s->ring[(s->shots - n + i) % R6IV_RING];
+        lp_printf(b, "iv.shot[%d]=%d,%d,%d,%d,%d,%d,%d,%d,0x%x,0x%x,%d,0x%x\n", (int) (s->shots - n + i),
+            (int) e->t, (int) e->ret, (int) e->dur, (int) e->d_cnt, (int) e->d_fn, (int) e->pic_ms,
+            (int) e->job_ms, (int) e->jobs_after, (int) e->js_before, (int) e->js_after,
+            (int) e->wait_ms, (int) e->wait_mask);
+    }
+}
+#endif
+
 /* ---- log snapshot -------------------------------------------------------- */
 #define LP_LOG_SIZE (96 * 1024)   /* M7.2a camera: up to 51.5 KB; M7.3 adds ~7 KB (QEMU), ~60 KB expected;
                                    * transient malloc, freed after the write */
@@ -1541,6 +1624,9 @@ static void lp_snapshot_do(int delay_ms)
     msleep(500);
     lp_census(&b, "B");
     lp_vmix_poll(&b);
+#ifdef CONFIG_R6_INTERVAL
+    lp_iv_log(&b);
+#endif
     int trunc = b.trunc;
     b.cap = LP_LOG_SIZE;                  /* the trailer always fits */
     lp_printf(&b, "log_truncated=%d\n", trunc);
@@ -1564,7 +1650,15 @@ int lvprobe_snapshot_run(int delay_ms)
 
 static void lp_snapshot_task(int unused)
 {
+#ifdef CONFIG_R6_INTERVAL
+    msleep(4000);            /* menu closed; user shows the LV screen */
+    if (r6_iv_running())     /* M8.0: no card write while a series runs */
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "skipped (interval)");
+    else
+        lp_snapshot_do(0);
+#else
     lp_snapshot_do(4000);    /* menu closed; user shows the LV screen */
+#endif
     lp_snap_busy = 0;
 }
 
@@ -1884,6 +1978,13 @@ static MENU_SELECT_FUNC(lp_snapshot_select)
         snprintf(lp_snap_msg, sizeof(lp_snap_msg), "busy");
         return;
     }
+#ifdef CONFIG_R6_INTERVAL
+    if (r6_iv_running())     /* M8.0: no card write while a series runs */
+    {
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "interval running");
+        return;
+    }
+#endif
     lp_snap_busy = 1;
     snprintf(lp_snap_msg, sizeof(lp_snap_msg), "starting");
     run_in_separate_task(lp_snapshot_task, 0);
