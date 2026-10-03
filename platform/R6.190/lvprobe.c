@@ -1489,14 +1489,116 @@ static void lp_vmix_poll(struct lp_buf * b)
 }
 
 #ifdef CONFIG_R6_INTERVAL
-/* M8.0: interval release state (r6_interval.c), ML's values it checks, the
- * Canon RAM words it reads, and the last pictures (oldest first) */
+/* M8.0 / M8.1: interval release state (r6_interval.c), ML's values it checks, the
+ * Canon RAM words it reads, and the last pictures (oldest first). M8.1 adds the
+ * CameraConductor, the switch manager, the release counter, the job manager, the
+ * FA-Neo node walk (only with a live job), the last-picture detail and the
+ * passive trace. Every pointer taken from a Canon structure passes ram_ok() for
+ * the whole structure first; otherwise the key prints invalid(0x...) and nothing
+ * is dereferenced (also for 0: no NULL keys in this block). */
 static const char * lp_nosp(const char * s, char * buf, int n)
 {
     int i = 0;
     for (; s[i] && i < n - 1; i++) buf[i] = s[i] == ' ' ? '_' : s[i];
     buf[i] = 0;
     return buf;
+}
+
+/* 32-bit field [base+off] of a Canon structure of n bytes (whole structure range-checked) */
+static void lp_ivw(struct lp_buf * b, const char * key, uint32_t base, uint32_t n, uint32_t off)
+{
+    if (!ram_ok(base, n)) { lp_bad(b, key, base); return; }
+    lp_printf(b, "%s=0x%08x\n", key, (int) RD(base + off));
+}
+
+/* byte [base+off] of a Canon structure of n bytes, through its aligned word */
+static void lp_ivb(struct lp_buf * b, const char * key, uint32_t base, uint32_t n, uint32_t off)
+{
+    if (!ram_ok(base, n)) { lp_bad(b, key, base); return; }
+    lp_printf(b, "%s=%d\n", key, (int) ((RD(base + (off & ~3u)) >> (8 * (off & 3))) & 0xFF));
+}
+
+/* [[base+poff]+off]: the outer structure (n1 bytes) and the inner one (n2 bytes) both checked */
+static void lp_ivw2(struct lp_buf * b, const char * key, uint32_t base, uint32_t n1, uint32_t poff, uint32_t n2, uint32_t off)
+{
+    if (!ram_ok(base, n1)) { lp_bad(b, key, base); return; }
+    lp_ivw(b, key, RD(base + poff), n2, off);
+}
+
+/* one r6_iv_cc snapshot on one line */
+static void lp_iv_cc(struct lp_buf * b, const char * key, const struct r6_iv_cc * s)
+{
+    lp_printf(b, "%s=%d,%d,%d,%d,%d,%d,0x%x,0x%x,%d,0x%x,0x%x,%d,%d,%d,%d,%d,%d,%d,%d,%d,0x%x\n", key,
+        (int) s->state, (int) s->state_prev, (int) s->relseq, (int) s->b54, s->df, s->e0, (int) s->pend, (int) s->work,
+        (int) s->shmode, (int) s->a68, (int) s->a6c, (int) s->r888, (int) s->relcnt, (int) s->jobs, (int) s->jid,
+        (int) s->jdone, (int) s->access,
+        s->faneo[0] == R6IV_RAM_FANEO && s->faneo[1] == R6IV_RAM_FANEO, s->tsc, s->fn, s->gui);
+}
+
+/* FA-Neo node walk (approved Option 4, only with a live job: a jobref of a finished job points to
+ * freed memory). 0 = complete, else the failed step (raw = the value that failed) */
+struct lp_fa { uint32_t stop, raw, node, jobref, jobdata, mask, id, sm, save, tbl, cnt, pos, stage; };
+static int lp_fa_walk(struct lp_fa * f)
+{
+    memset(f, 0, sizeof(*f));
+    uint32_t link = RD(R6IV_RAM_FANEO_TAIL);
+    uint32_t node = link - 0x14;
+    f->raw = link;
+    if (!ram_ok(node, 0x20) || RD(link) != R6IV_RAM_FANEO) return f->stop = 1;      /* oldest.next == head */
+    f->node = node;
+    uint32_t jobref = RD(node + 0x1C);
+    f->raw = jobref;
+    if (!ram_ok(jobref, 0x18) || RD(jobref) != R6IV_JOBCLASS_SIG) return f->stop = 2;
+    f->jobref = jobref;
+    uint32_t jobdata = RD(jobref + 4);
+    f->raw = jobdata;
+    uint32_t d = jobref - jobdata;                                                    /* unit slot 0 / 1 / 2 */
+    if (d != 0 && d != 0x138 && d != 0x270) return f->stop = 3;
+    if (!ram_ok(jobdata, 0x3070) || RD(jobdata) != R6IV_JOBCLASS_SIG || RD(jobdata + 4) != jobdata) return f->stop = 4;
+    f->jobdata = jobdata;
+    f->mask = RD(jobdata + 0x3DC);              /* unit / flag mask: bit0 card, bit1 PC, bit3 factory */
+    f->id = RD(jobdata + 0x3C0);                /* job ID */
+    f->sm = RD(jobdata + 0x41C);                /* ShutterMode copy of this job */
+    f->save = RD(jobdata + 0xD5C);              /* save mode at creation */
+    f->tbl = RD(jobdata + 0x3B4);               /* stage table (ROM, default 0xE0CC331C) */
+    f->cnt = RD(jobdata + 0x3BC);               /* stage count (default 0x11) */
+    f->pos = RD(jobref + 0xC);                  /* stage position */
+    f->raw = f->tbl;
+    if (f->tbl < 0xE0000000 || f->tbl >= 0xE2040000 || (f->tbl & 3)) return f->stop = 5;
+    f->raw = f->cnt;
+    if (f->cnt < 1 || f->cnt > 32) return f->stop = 6;
+    f->raw = f->pos;
+    if (f->pos >= f->cnt || f->tbl + 4 * f->pos + 4 > 0xE2040000) return f->stop = 7;
+    f->stage = RD(f->tbl + 4 * f->pos);         /* ROM word */
+    return 0;
+}
+
+static void lp_iv_faneo(struct lp_buf * b)
+{
+    uint32_t tail = RD(R6IV_RAM_FANEO_TAIL), live = RD(R6IV_RAM_JOBCNT);
+    if (tail == R6IV_RAM_FANEO) { lp_printf(b, "iv.job.faneo=empty\n"); return; }
+    if (!live) { lp_printf(b, "iv.job.faneo=not_walked(live_0)\n"); return; }
+    struct lp_fa f, f2;
+    lp_fa_walk(&f);
+    lp_fa_walk(&f2);
+    lp_printf(b, "iv.job.faneo=walked\n");
+    if (f.node) lp_printf(b, "iv.job.fa.node=0x%08x\n", (int) f.node);
+    if (f.jobref) lp_printf(b, "iv.job.fa.jobref=0x%08x\n", (int) f.jobref);
+    if (f.jobdata)
+    {
+        lp_printf(b, "iv.job.fa.jobdata=0x%08x\n", (int) f.jobdata);
+        lp_printf(b, "iv.job.fa.unit_off=0x%x\n", (int) (f.jobref - f.jobdata));
+        lp_printf(b, "iv.job.fa.mask=0x%08x\n", (int) f.mask);
+        lp_printf(b, "iv.job.fa.id=%d\n", (int) f.id);
+        lp_printf(b, "iv.job.fa.sm=%d\n", (int) f.sm);
+        lp_printf(b, "iv.job.fa.save=0x%08x\n", (int) f.save);
+        lp_printf(b, "iv.job.fa.tbl=0x%08x\n", (int) f.tbl);
+        lp_printf(b, "iv.job.fa.cnt=%d\n", (int) f.cnt);
+        lp_printf(b, "iv.job.fa.pos=%d\n", (int) f.pos);
+    }
+    if (f.stop) lp_printf(b, "iv.job.fa.stop=%d,0x%08x\n", (int) f.stop, (int) f.raw);
+    else lp_printf(b, "iv.job.fa.stage=0x%08x\n", (int) f.stage);
+    lp_printf(b, "iv.job.fa.stable=%d\n", memcmp(&f, &f2, sizeof(f)) == 0);
 }
 
 static void lp_iv_log(struct lp_buf * b)
@@ -1520,6 +1622,15 @@ static void lp_iv_log(struct lp_buf * b)
     lp_printf(b, "iv.calls=%d\n", (int) s->calls);
     lp_printf(b, "iv.shots=%d\n", (int) s->shots);
     lp_printf(b, "iv.refused=%d\n", (int) s->refused);
+    lp_printf(b, "iv.test=%d\n", s->test);
+    lp_printf(b, "iv.cnt_last=%d\n", s->cnt_last);
+    lp_printf(b, "iv.fn_last=%d\n", s->fn_last);
+    uint32_t pn[4], refused = 0;
+    int held = r6_iv_press_info(pn, &refused);
+    lp_printf(b, "iv.press.n=%d,%d,%d,%d\n", (int) pn[0], (int) pn[1], (int) pn[2], (int) pn[3]);
+    lp_printf(b, "iv.press.refused=%d\n", (int) refused);
+    lp_printf(b, "iv.press.held=%d\n", held);
+    lp_printf(b, "iv.gate.cc_settings=%d\n", r6_iv_gate_cc_settings());
     lp_printf(b, "iv.cam=%d,%s\n", c, lp_nosp(r6_iv_cam_name(c), w, sizeof(w)));
     lp_printf(b, "iv.canon=%d,%s\n", k, lp_nosp(r6_iv_canon_name(k), w, sizeof(w)));
     lp_printf(b, "iv.canon_hard=%d\n", hard);
@@ -1562,15 +1673,137 @@ static void lp_iv_log(struct lp_buf * b)
     lp_glob(b, "iv.ram.cc_sw1", R6IV_RAM_CC_SW1);
     lp_glob(b, "iv.ram.cc_sw2", R6IV_RAM_CC_SW2);
     lp_glob(b, "iv.ram.cc_obj", R6IV_RAM_CC_OBJ);
+
+    /* CameraConductor */
+    static const uint32_t cps[9] = { R6IV_RAM_CC_MASTER, R6IV_RAM_CC_RELSEQ, R6IV_RAM_CC_STATEGET, R6IV_RAM_CC_SWWRAP,
+        R6IV_RAM_CC_SHMODE, R6IV_RAM_CC_LVH1, R6IV_RAM_CC_LVH2, R6IV_RAM_CC_JSW2OFF, R6IV_RAM_CC_JSW1OFF };
+    uint32_t cc = RD(R6IV_RAM_CC);
+    lp_printf(b, "iv.cc=0x%08x\n", (int) cc);
+    int ok_v = cc != 0, ok_i = cc != 0;
+    for (int i = 0; i < 9; i++)
+    {
+        uint32_t v = RD(cps[i]);
+        lp_printf(b, "iv.cc.copy[0x%x]=0x%08x\n", (int) cps[i], (int) v);
+        if (v != cc) { if (i < 4) ok_v = 0; else ok_i = 0; }
+    }
+    lp_printf(b, "iv.cc.copy_ok=%d\n", ok_v);
+    lp_printf(b, "iv.cc.copy_ok_i=%d\n", ok_i);
+    lp_ivw(b, "iv.cc.evflag", cc, R6IV_CC_SIZE, R6IV_CC_EVFLAG);
+    lp_ivw(b, "iv.cc.table", cc, R6IV_CC_SIZE, R6IV_CC_TABLE);
+    lp_ivb(b, "iv.cc.lvkind", cc, R6IV_CC_SIZE, 0x2CE);
+    lp_ivw(b, "iv.cc.shoottype", cc, R6IV_CC_SIZE, R6IV_CC_SHOOTTYPE);
+    lp_ivw(b, "iv.cc.dispatch", cc, R6IV_CC_SIZE, R6IV_CC_DISPATCH);
+    lp_ivw(b, "iv.cc.swgate", cc, R6IV_CC_SIZE, R6IV_CC_SWGATE);
+    lp_ivw(b, "iv.cc.remote", cc, R6IV_CC_SIZE, R6IV_CC_REMOTE);
+    lp_ivw(b, "iv.cc.state", cc, R6IV_CC_SIZE, R6IV_CC_STATE);
+    lp_ivw(b, "iv.cc.state_prev", cc, R6IV_CC_SIZE, R6IV_CC_STATE_PREV);
+    lp_ivb(b, "iv.cc.sw1", cc, R6IV_CC_SIZE, 0xDF);
+    lp_ivb(b, "iv.cc.sw2", cc, R6IV_CC_SIZE, 0xE0);
+    lp_ivb(b, "iv.cc.snap_sw1", cc, R6IV_CC_SIZE, 0x16B);
+    lp_ivb(b, "iv.cc.snap_sw2", cc, R6IV_CC_SIZE, 0x16C);
+    lp_ivw(b, "iv.cc.pend2", cc, R6IV_CC_SIZE, R6IV_CC_PEND2);
+    lp_ivw(b, "iv.cc.work2", cc, R6IV_CC_SIZE, R6IV_CC_WORK2);
+    lp_glob(b, "iv.ram.aux2", R6IV_RAM_AUX2);
+    lp_ivw(b, "iv.cc.b54", cc, R6IV_CC_SIZE, R6IV_CC_B54);
+    lp_glob(b, "iv.ram.relseq", R6IV_RAM_RELSEQ);
+    lp_glob(b, "iv.ram.relcb", R6IV_RAM_RELCB);
+    lp_ivw(b, "iv.cc.shmode", cc, R6IV_CC_SIZE, R6IV_CC_SHMODE);
+    lp_ivw(b, "iv.cc.a68", cc, R6IV_CC_SIZE, R6IV_CC_A68);
+    lp_ivw(b, "iv.cc.a6c", cc, R6IV_CC_SIZE, R6IV_CC_A6C);
+    lp_ivw(b, "iv.cc.r888", cc, R6IV_CC_SIZE, R6IV_CC_R888);
+    lp_ivw(b, "iv.cc.bfc", cc, R6IV_CC_SIZE, R6IV_CC_BFC);
+    lp_ivw(b, "iv.cc.r5e8", cc, R6IV_CC_SIZE, R6IV_CC_R5E8);
+    lp_ivw(b, "iv.cc.af", cc, R6IV_CC_SIZE, R6IV_CC_AF);
+    lp_ivw(b, "iv.cc.r730", cc, R6IV_CC_SIZE, R6IV_CC_R730);
+    lp_ivw(b, "iv.cc.r3b4", cc, R6IV_CC_SIZE, R6IV_CC_R3B4);
+    lp_ivw(b, "iv.cc.p", cc, R6IV_CC_SIZE, R6IV_CC_P);
+    lp_ivw2(b, "iv.cc.p.ae", cc, R6IV_CC_SIZE, R6IV_CC_P, R6IV_P_SIZE, R6IV_P_AE);
+    lp_ivw2(b, "iv.cc.p.drive", cc, R6IV_CC_SIZE, R6IV_CC_P, R6IV_P_SIZE, R6IV_P_DRIVE);
+    lp_ivw2(b, "iv.cc.p.r92c", cc, R6IV_CC_SIZE, R6IV_CC_P, R6IV_P_SIZE, R6IV_P_92C);
+    {
+        uint32_t p = ram_ok(cc, R6IV_CC_SIZE) ? RD(cc + R6IV_CC_P) : 0;
+        if (ram_ok(p, R6IV_P_SIZE)) lp_printf(b, "iv.cc.p.tv=0x%04x\n", (int) (RD(p + R6IV_P_TV_W) >> 16));
+        else lp_bad(b, "iv.cc.p.tv", ram_ok(cc, R6IV_CC_SIZE) ? p : cc);
+    }
+    lp_glob(b, "iv.ram.swhack_q", R6IV_RAM_SWHACK_Q);
+    lp_glob(b, "iv.ram.swhack_hook", R6IV_RAM_SWHACK_HOOK);
+
+    /* switch manager */
+    uint32_t mgr = RD(R6IV_RAM_SWMGR);
+    lp_printf(b, "iv.sw.mgr=0x%08x\n", (int) mgr);
+    lp_ivw2(b, "iv.sw.cbr[0]", mgr, R6IV_SWMGR_SIZE, 0, 8, 0);
+    lp_ivw2(b, "iv.sw.cbr[1]", mgr, R6IV_SWMGR_SIZE, 0, 8, 4);
+    lp_ivw2(b, "iv.sw.status[0]", mgr, R6IV_SWMGR_SIZE, 4, 8, 0);
+    lp_ivw2(b, "iv.sw.status[1]", mgr, R6IV_SWMGR_SIZE, 4, 8, 4);
+    lp_ivw(b, "iv.sw.hook", mgr, R6IV_SWMGR_SIZE, 0xC);
+
+    /* release counter */
+    uint32_t po = RD(R6IV_RAM_PO);
+    lp_printf(b, "iv.po=0x%08x\n", (int) po);
+    lp_ivw(b, "iv.po.relcnt", po, R6IV_PO_SIZE, R6IV_PO_RELCNT);
+    uint32_t po2 = RD(R6IV_RAM_PO2);
+    lp_ivw(b, "iv.po.relcnt_copy", po2, 0x1C0, 0x1BC);
+    if (ram_ok(po, R6IV_PO_SIZE)) lp_printf(b, "iv.po.rel_minus_prop=%d\n", (int) (RD(po + R6IV_PO_RELCNT) - total_shots_count));
+    else lp_bad(b, "iv.po.rel_minus_prop", po);
+
+    /* job manager (fixed globals) and the FA-Neo list */
+    lp_glob(b, "iv.job.last_id", R6IV_RAM_JOB_LASTID);
+    lp_glob(b, "iv.job.done_id", R6IV_RAM_JOB_DONEID);
+    lp_glob(b, "iv.job.skel_id", 0x9E0C);
+    lp_glob(b, "iv.job.live", R6IV_RAM_JOBCNT);
+    lp_glob(b, "iv.job.capture", 0x9DC4);
+    lp_glob(b, "iv.job.develop", 0x9DC8);
+    lp_glob(b, "iv.job.card", 0x9DCC);
+    lp_glob(b, "iv.job.pc", 0x9DD0);
+    lp_glob(b, "iv.job.access_remain", R6IV_RAM_JOB_ACCESS);
+    lp_glob(b, "iv.job.size", 0x9DD8);
+    lp_glob(b, "iv.job.state_m", 0x9DEC);
+    lp_glob(b, "iv.job.state_s", 0x9DF0);
+    lp_glob(b, "iv.job.class_m", 0x9DA0);
+    lp_glob(b, "iv.job.class_s", 0x9DA4);
+    lp_iv_faneo(b);
+
     int n = MIN((int) s->shots, R6IV_RING);
-    lp_printf(b, "# iv.shot[i]=t,ret,dur_ms,d_cnt,d_fn,pic_ms,job_ms,jobs_after,js_before,js_after,wait_ms,wait_mask\n");
+    lp_printf(b, "# iv.shot[i]=t,ret,dur,d_cnt,d_fn,pic_ms,job_ms,jobs_after,js_before,js_after,wait_ms,wait_mask,"
+                 "sw1_ms,acc_ms,off_ms,seq_ms,off_why,off_state,states,d_rel,d_jid,sm_before,sm_after,late,second,final\n");
     for (int i = 0; i < n; i++)
     {
         const struct r6_iv_shot * e = &s->ring[(s->shots - n + i) % R6IV_RING];
-        lp_printf(b, "iv.shot[%d]=%d,%d,%d,%d,%d,%d,%d,%d,0x%x,0x%x,%d,0x%x\n", (int) (s->shots - n + i),
+        lp_printf(b, "iv.shot[%d]=%d,%d,%d,%d,%d,%d,%d,%d,0x%x,0x%x,%d,0x%x,%d,%d,%d,%d,%d,%d,0x%x,%d,%d,%d,%d,0x%x,%d,0x%x\n",
+            (int) (s->shots - n + i),
             (int) e->t, (int) e->ret, (int) e->dur, (int) e->d_cnt, (int) e->d_fn, (int) e->pic_ms,
             (int) e->job_ms, (int) e->jobs_after, (int) e->js_before, (int) e->js_after,
-            (int) e->wait_ms, (int) e->wait_mask);
+            (int) e->wait_ms, (int) e->wait_mask,
+            e->sw1_ms, e->acc_ms, e->off_ms, e->seq_ms, e->off_why, e->off_state, e->states, e->d_rel, e->d_jid,
+            e->sm_before, e->sm_after, e->late, e->second, e->final);
+    }
+
+    /* last picture: snapshots and trace (codes: r6_interval.c iv_tr_codes, 1..4 the switch calls, X the reason) */
+    const struct r6_iv_last * l = r6_iv_last();
+    lp_printf(b, "# iv.last.*=state,state_prev,relseq,b54,df,e0,pend,work,shmode,a68,a6c,r888,relcnt,jobs,jid,jdone,"
+                 "access,faneo_empty,tsc,fn,gui\n");
+    lp_iv_cc(b, "iv.last.pre", &l->pre);
+    lp_iv_cc(b, "iv.last.off", &l->off);
+    lp_iv_cc(b, "iv.last.post", &l->post);
+    lp_printf(b, "iv.last.valid=0x%x,0x%x,0x%x\n", (int) l->pre.valid, (int) l->off.valid, (int) l->post.valid);
+    lp_printf(b, "iv.last.n=%d\n", l->n);
+    lp_printf(b, "iv.last.lost=%d\n", l->lost);
+    char cs[2] = { 0, 0 };                     /* the code as a string: Canon's vsnprintf garbles %c */
+    for (int i = 0; i < l->n && i < R6IV_TRACE; i++)
+    {
+        cs[0] = l->tr[i].code ? l->tr[i].code : '?';
+        lp_printf(b, "iv.tr[%d]=%d,%s,%d\n", i, l->tr[i].dt, cs, (int) l->tr[i].v);
+    }
+
+    /* passive trace (Canon's own shots, no ML picture running): absolute values */
+    struct r6_iv_ptr pe;
+    int pn_cnt = r6_iv_ptrace(0, &pe);
+    lp_printf(b, "iv.pt.n=%d\n", pn_cnt);
+    for (int i = 0; i < pn_cnt; i++)
+    {
+        r6_iv_ptrace(i, &pe);
+        cs[0] = pe.code ? pe.code : '?';
+        lp_printf(b, "iv.pt[%d]=%d,%s,%d\n", i, (int) pe.t, cs, (int) pe.v);
     }
 }
 #endif

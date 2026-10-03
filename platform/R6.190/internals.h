@@ -121,14 +121,15 @@
  * upstream removes there. Global Draw from the config is clamped to 0..1. */
 #define CONFIG_R6_AUTOSTART
 
-/* M8.0 (approved 2026-10-02): ML menu Shoot > "R6 Interval" (r6_interval.c)
- * takes pictures with call("Release") from its own task, nothing else new
- * (no property write, no other Canon call, no MMIO, no file). Only M or Tv,
- * Tv <= 1 s, single shot, MF, at most 50 pictures; every call checks Canon's
- * state first (RAM reads) and every picture is verified (counter / file
- * number, Canon's job count back to 0), else the series stops. Never saved
- * as running, never started at boot. Upstream's FEATURE_INTERVALOMETER stays
- * off (r6_interval.c #errors on it). */
+/* M8.0 (approved 2026-10-02) / M8.1 (approved 2026-10-03): ML menu Shoot >
+ * "R6 Interval" (r6_interval.c) takes pictures from its own task through the
+ * two CameraConductor shutter callbacks (SW1 / SW2, as the MPU interrupt
+ * calls them), nothing else new (no property write, no other Canon call, no
+ * MMIO, no file). Only M, Tv <= 1 s, single shot, MF, at most 50 pictures;
+ * every press checks Canon's state first (RAM reads) and every picture is
+ * verified (counter / file number, Canon's job count back to 0, CC idle),
+ * else the series stops. Never saved as running, never started at boot.
+ * Upstream's FEATURE_INTERVALOMETER stays off (r6_interval.c #errors on it). */
 #define CONFIG_R6_INTERVAL
 
 #define CONFIG_TASK_STRUCT_V2_SMP

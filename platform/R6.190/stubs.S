@@ -73,6 +73,10 @@ THUMB_FN(0xe07da350,  DryosDebugMsg)                      // r0=class r1=level r
 /** Eventprocs (call by name) **/
 THUMB_FN(0xe07c715e,  call)                               // ExecuteEventProcedure, registered at 0xE0112722
 
+/** M8.1: CameraConductor callbacks of the physical shutter switch (approved 2026-10-03) **/
+THUMB_FN(0xe0296518,  CC_SW1_CBR)                         // MPU switch table 0xE0FE5C84 row {7, 0xE0296519} @0xE0FE5CA4, registered by CC init 0xE028854E -> 0xE029803C -> loop 0xE0298014 -> 0xE06D315E -> 0xE033A9B8 (ccid 7 -> slot 0, MPU key 5 = SW1); strb r0,[[0x10AB8]+0xDF], post 0x20000400 (r0 == 1) else 0x20000800 via 0xE0287C2E
+THUMB_FN(0xe029652e,  CC_SW2_CBR)                         // same table, row {8, 0xE029652F} @0xE0FE5CAC (ccid 8 -> slot 1, MPU key 6 = SW2); strb r0,[[0x10AB8]+0xE0], post 0x20001000 (r0 == 1) else 0x20002000 via 0xE0287C2E
+
 /** GUI timers **/
 THUMB_FN(0xe08587d8,  SetHPTimerAfterNow)                 // System::HPTimer.c; see "comAdapterDelayMicroSecond : SetHPTimerAfterNow" (0xE067A574)
 THUMB_FN(0xe085885e,  SetHPTimerNextTick)                 // System::HPTimer.c; next function, same worker (e085870c) as SetHPTimerAfterNow
