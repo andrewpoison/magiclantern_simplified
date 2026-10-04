@@ -8,6 +8,11 @@
  * channel 1 (camera: 0x1:11540260 + k * 0x96000), static memif window 5,
  * read only through the uncached alias 0x5xxxxxxx. Approved by the user
  * 2026-10-01 (read only, every pointer checked).
+ *
+ * M9.3 (r6_motion.c): r6_fy_locate_done() picks the second-newest ring frame
+ * F2, whose buffer is not the one being written, and r6_fy_recheck() tells
+ * after the pixel read whether that buffer may have been handed out again
+ * (rules in r6_faceyuv.c).
  */
 #ifndef _r6_faceyuv_h_
 #define _r6_faceyuv_h_
@@ -33,6 +38,11 @@ struct r6_fy_loc
     uint32_t lo, hi;         /* 64-bit IBus address of the picked buffer */
     uint32_t cpu;            /* CPU address (uncached alias), 0 if refused */
     int win;                 /* static memif window, -1 none */
+    /* M9.3 (r6_fy_locate_done only; src 4) */
+    uint32_t ctx;            /* MEM(0x1ED68+0xC) used */
+    uint32_t b048;           /* byte [ctx+0xB048] (0xFF = not readable) */
+    uint32_t f1, f2;         /* newest / second-newest ring FrameNum */
+    int pick1;               /* buffer of F1's record (0..3), -1 none */
 };
 
 /* Locate the current FaceYuv buffer (RAM reads of Canon's controller
@@ -43,6 +53,19 @@ struct r6_fy_loc
  * 4..7, the whole buffer inside that window, inside channel 1's RAM end and
  * inside the verified uncached alias. Returns r->ok. */
 int r6_fy_locate(struct r6_fy_loc * r);
+
+/* M9.3: the buffer of the second-newest ring frame F2 (src 4), for the motion
+ * detector: [ctx+0xB048] & 6 == 0, F1 - F2 in 1..16, a record for F1 and one
+ * for F2, each naming one of the 4 buffers, different buffers, and exactly
+ * one hand-out since F2 ([ctx+0xB029] = g: F1 in buffer (g+3)&3, F2 in
+ * (g+2)&3). Never the getter fallback. Then the pointer checks of
+ * r6_fy_locate on that buffer. Returns r->ok. */
+int r6_fy_locate_done(struct r6_fy_loc * r);
+
+/* M9.3, after the pixel read of a r6_fy_locate_done result: hand-outs since
+ * the locate (0..3), or -1 if r is not an ok src-4 result, the ctx pointer
+ * changed, a byte is not readable or [ctx+0xB048] & 6 != 0 */
+int r6_fy_recheck(const struct r6_fy_loc * r);
 
 /* [a, a+n) 4-byte aligned and inside cached RAM 0x1000..0x3FFFFFFF, or inside
  * the uncached alias 0x40001000..0x7FFFFFFF if Canon's memif copy verifies

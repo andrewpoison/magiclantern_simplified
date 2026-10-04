@@ -39,8 +39,11 @@ int r6_grid_step(const struct r6_grid_rect * ex, int n);
  * the grid is switched off. Returns 1 if ML's indexed buffer changed. */
 int r6_grid_erase(void);
 
-/* 1 = the grid menu is ON and selects something to draw */
+/* 1 = the grid menu is ON and selects something to draw, or (M9.3) the motion display of R6 Motion is wanted
+ * (r6_motion.c, drawn by r6_grid_step with the same pixel rules); src/zebra.c steps while this or drawn is set */
 int r6_grid_wanted(void);
+/* M9.3: the grid alone (log key grid.wanted, skeptic B8) */
+int r6_grid_wanted_grid(void);
 
 struct r6_grid_stats
 {
@@ -60,6 +63,8 @@ struct r6_grid_stats
     uint32_t us_last, us_max, us_draw_max;  /* step duration; draws only */
     uint32_t y0_mismatch;    /* steps where os.y0 (src/vram.c) did not match the gate's screen yet */
     uint32_t changed;        /* steps that changed ML's buffer (refresh requested by the caller) */
+    /* M9.3: the motion display (drawn covers it as well) */
+    uint32_t md_drawn, md_n, md_sig, md_draws;
 };
 const struct r6_grid_stats * r6_grid_stats(void);
 

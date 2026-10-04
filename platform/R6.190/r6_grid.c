@@ -57,6 +57,13 @@
  * requests a refresh only if ML's buffer changed. r6_gd_erase erases the shape
  * with the other overlays (Canon MENU / Q / playback, display off, LCD <-> EVF,
  * magnify via zebra_should_run, Global Draw OFF).
+ *
+ * M9.3: R6 Motion's display (area frame, value bar, threshold tick, state
+ * square; r6_motion.c r6_md_shape) goes through the same walk with its own
+ * snapshot and signature, after the grid: its colours (orange, green 1,
+ * magenta, light blue) are no grid colour, so the two never erase each
+ * other's pixels and the grid wins where they overlap. drawn and
+ * R6GD_DRAWN_GRID cover both; r6_grid_erase erases both.
  */
 
 #include "dryos.h"
@@ -67,6 +74,9 @@
 #include "propvalues.h"         /* os: the image rows src/vram.c uses */
 #include "r6_gdraw.h"
 #include "r6_grid.h"
+#ifdef CONFIG_R6_MOTION
+#include "r6_motion.h"
+#endif
 
 #ifdef CONFIG_R6_GRID
 
@@ -120,16 +130,25 @@ static struct r6_grid_stats st;
 
 const struct r6_grid_stats * r6_grid_stats(void) { return &st; }
 
-int r6_grid_wanted(void)
+static int gr_wanted(void)
 {
     return gr_on && (gr_type || gr_center || gr_aspect || gr_safe);
+}
+int r6_grid_wanted_grid(void) { return gr_wanted(); }
+
+int r6_grid_wanted(void)
+{
+#ifdef CONFIG_R6_MOTION
+    if (r6_md_disp_wanted()) return 1;
+#endif
+    return gr_wanted();
 }
 
 /* the wanted shape from the settings and the gate's screen; 0 = nothing to draw */
 static int gr_build(struct gr_cfg * c, const struct r6_grid_rect * ex, int n)
 {
     memset(c, 0, sizeof(*c));
-    if (!r6_grid_wanted()) return 0;
+    if (!gr_wanted()) return 0;
     c->type = COERCE(gr_type, 0, 4);
     c->center = COERCE(gr_center, 0, 3);
     c->aspect = COERCE(gr_aspect, 0, GR_NAR - 1);
@@ -377,6 +396,33 @@ static void gr_walk(struct gr_walk * w, int op, const struct gr_cfg * c, uint8_t
     if (c->line == 2) gr_shape(w, 1);
 }
 
+#ifdef CONFIG_R6_MOTION
+/* M9.3: the motion display's snapshot (everything its pixels depend on; hashed, no padding) */
+struct gr_md
+{
+    uint8_t n, evf;
+    int16_t y0;
+    uint16_t nex, pad;
+    struct r6_grid_rect ex[R6_GRID_NEXCL];
+    struct r6_md_rect r[R6MD_NRECT];
+};
+static struct gr_md gr_md_snap;
+static uint32_t gr_md_sig = 0;
+static int gr_md_valid = 0;
+#endif
+
+/* drawn (stats, R6GD_DRAWN_GRID) from what is in ML's buffer: the grid and (M9.3) the motion display */
+static void gr_drawn(void)
+{
+    int d = gr_snap_valid;
+#ifdef CONFIG_R6_MOTION
+    d |= gr_md_valid;
+#endif
+    st.drawn = d;
+    if (d) r6_gd_st.drawn |= R6GD_DRAWN_GRID;
+    else r6_gd_st.drawn &= ~R6GD_DRAWN_GRID;
+}
+
 /* erase the drawn shape; 1 = ML's buffer changed */
 static int gr_erase_snap(uint8_t * b, uint8_t * m)
 {
@@ -384,17 +430,76 @@ static int gr_erase_snap(uint8_t * b, uint8_t * m)
     struct gr_walk w;
     gr_walk(&w, GR_ERASE, &gr_snap, b, m);
     gr_snap_valid = 0;
-    st.drawn = 0;
     st.erases++;
-    r6_gd_st.drawn &= ~R6GD_DRAWN_GRID;
+    gr_drawn();
     return w.changed != 0;
 }
+
+#ifdef CONFIG_R6_MOTION
+/* the motion rectangles as line primitives (clipped to the image, minus the exclusions of the snapshot) */
+static void gr_md_walk(struct gr_walk * w, int op, const struct gr_md * s, uint8_t * b, uint8_t * m)
+{
+    struct gr_cfg c;
+    memset(&c, 0, sizeof(c));
+    c.evf = s->evf; c.y0 = s->y0; c.nex = s->nex;
+    for (int i = 0; i < s->nex; i++) c.ex[i] = s->ex[i];
+    memset(w, 0, sizeof(*w));
+    w->op = op; w->c = &c; w->b = b; w->m = m;
+    for (int i = 0; i < s->n; i++) gr_rect(w, s->r[i].x0, s->r[i].y0, s->r[i].x1, s->r[i].y1, s->r[i].col, GR_K_LINE);
+    w->c = 0;
+}
+
+static int gr_md_erase(uint8_t * b, uint8_t * m)
+{
+    if (!gr_md_valid) return 0;
+    struct gr_walk w;
+    gr_md_walk(&w, GR_ERASE, &gr_md_snap, b, m);
+    gr_md_valid = 0;
+    st.md_drawn = 0;
+    gr_drawn();
+    return w.changed != 0;
+}
+
+/* one step of the motion display: unchanged = repair, changed = erase the old, claim the new, nothing = erase */
+static int gr_md_step(uint8_t * b, uint8_t * m, const struct r6_grid_rect * ex, int nex)
+{
+    struct gr_md want;
+    memset(&want, 0, sizeof(want));
+    int evf = r6_gd_evf ? 1 : 0;
+    int n = r6_md_disp_wanted() ? r6_md_shape(want.r, R6MD_NRECT, evf) : 0;
+    if (n <= 0) return gr_md_erase(b, m);
+    want.n = n; want.evf = evf; want.y0 = evf ? R6_GD_EVF_IMG_Y : 0;
+    nex = COERCE(nex, 0, R6_GRID_NEXCL);
+    for (int i = 0; i < nex; i++) want.ex[i] = ex[i];
+    want.nex = nex;
+    uint32_t sig = r6_gd_bv_hash_mem(&want, sizeof(want));
+    struct gr_walk w;
+    int changed = 0;
+    if (gr_md_valid && sig == gr_md_sig && !memcmp(&want, &gr_md_snap, sizeof(want)))
+        gr_md_walk(&w, GR_CLAIM, &gr_md_snap, b, m);
+    else
+    {
+        changed = gr_md_erase(b, m);
+        gr_md_walk(&w, GR_CLAIM, &want, b, m);
+        gr_md_snap = want;
+        gr_md_sig = sig;
+        gr_md_valid = 1;
+        st.md_draws++;
+    }
+    st.md_drawn = 1; st.md_n = n; st.md_sig = sig;
+    return changed | (w.changed != 0);
+}
+#endif
 
 int r6_grid_erase(void)
 {
     uint8_t * b = bmp_vram(), * m = get_bvram_mirror();
     if (!b || !m) return 0;
-    return gr_erase_snap(b, m);
+    int c = gr_erase_snap(b, m);
+#ifdef CONFIG_R6_MOTION
+    c |= gr_md_erase(b, m);
+#endif
+    return c;
 }
 
 static uint32_t gr_pack(const struct gr_cfg * c)
@@ -452,6 +557,10 @@ int r6_grid_step(const struct r6_grid_rect * ex, int n)
         st.drawn = 1;
         r6_gd_st.drawn |= R6GD_DRAWN_GRID;
     }
+#ifdef CONFIG_R6_MOTION
+    changed |= gr_md_step(b, m, ex, n);                 /* M9.3: after the grid (the grid wins where they overlap) */
+    gr_drawn();
+#endif
     if (changed) st.changed++;
     uint32_t us = (uint32_t) (get_us_clock() - t0);
     st.us_last = us;
@@ -479,7 +588,7 @@ static MENU_UPDATE_FUNC(gr_main_update)
         MENU_SET_VALUE("%s%s%s", g, (gr_type && gr_aspect) ? ", " : "", a);
     else if (gr_center || gr_safe)
         MENU_SET_VALUE("%s", gr_center ? "Center mark" : "Safe areas");
-    if (!r6_grid_wanted())
+    if (!gr_wanted())
         MENU_SET_WARNING(MENU_WARN_ADVICE, "Nothing selected: choose a grid, center mark, aspect frame or safe area.");
     else if (r6_gd_st.last_outside_menu != R6GD_OK)
         MENU_SET_WARNING(MENU_WARN_INFO, "Last LV screen: not drawn (%s).", r6_gd_reason(r6_gd_st.last_outside_menu));

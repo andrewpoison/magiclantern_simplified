@@ -146,6 +146,13 @@ static int gd_check(void)
     return R6GD_OK;
 }
 
+uint32_t r6_gd_disp_mask(void)
+{
+    uint32_t dd = MEM(GD_DISPDEV_PTR);
+    if (!dd || !r6_fy_ram_ok(dd, 0x1C)) return 0xFFFFFFFF;
+    return MEM(dd + 0x18);
+}
+
 int r6_gd_screen_ok(void)
 {
     int r = gd_check();

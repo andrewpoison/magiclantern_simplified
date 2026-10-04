@@ -1,7 +1,8 @@
 #ifndef _r6_interval_h_
 #define _r6_interval_h_
 
-/* R6.190 M8.0 / M8.1 / M8.2 / M9.2: interval release ("R6 Interval", r6_interval.c); M9.2: B with Canon's bulb timer */
+/* R6.190 M8.0 / M8.1 / M8.2 / M9.2: interval release ("R6 Interval", r6_interval.c); M9.2: B with Canon's bulb timer;
+ * M9.3: up to 30 min, and R6 Motion's runs (r6_motion.c) through the same task and presser */
 
 #include <stdint.h>
 
@@ -37,6 +38,7 @@ enum r6_iv_stop {
                               * end it (timer A / B 0 and BA0 0 or seconds 0, review F1); stopped at once, no call
                               * (stop_val = d30_ms) */
     R6IV_STOP_BULB_NOT12,    /* M9.2: B mode, but Canon did not start a bulb (state 5 / 6 / sequence end; stop_val = off_state) */
+    R6IV_STOP_TIME,          /* M9.3: R6 Motion: maximum duration reached (stop_val = the limit in ms) */
     R6IV_NSTOPS
 };
 
@@ -67,11 +69,15 @@ enum r6_iv_cam {
     R6IV_CAM_CC_NOTB,        /* B: p not readable or [p+8] (AE) != 4 */
     R6IV_CAM_CC_TVB,         /* B: (s16) [p+0x61E] != 0xDF00 */
     R6IV_CAM_BULB_OFF,       /* B: byte [p+0x648] (Canon bulb timer enable) != 1 */
-    R6IV_CAM_BULB_TIME,      /* B: T = h*3600 + m*60 + s outside R6IV_BULB_MIN_S .. R6IV_BULB_MAX_S, or m / s > 59 */
+    R6IV_CAM_BULB_TIME,      /* B: T = h*3600 + m*60 + s outside R6IV_BULB_MIN_S .. R6IV_BULB_MAX_S (31 s .. 30 min), or m / s > 59 */
     R6IV_CAM_BULB_BUSY,      /* M and B: [cc+0xD30] / [cc+0xBA0] / [0x1E5BC] / [0x1E5C4] / [cc+0x99C] != 0 (a bulb runs or
                               * did not end cleanly; spec R2, skeptic C1 / C5) */
     R6IV_CAM_CC_R5E8,        /* B: [cc+0x5E8] != 0 (skeptic D2: the re-post builder 0xE0640BCE branches on it and
                               * 0xE0718122 keeps Canon's bulb timer on for 1 / 2; camera value 0) */
+    /* M9.3 (Start of R6 Interval or R6 Motion only) */
+    R6IV_CAM_BUSY,           /* the other series (interval / motion) is running or starting */
+    R6IV_CAM_MD_B,           /* R6 Motion "Release" in B (no bulb for motion: M, Tv up to 30 s) */
+    R6IV_CAM_MD_MEM,         /* no memory for the motion detector (4.7 KB heap) */
     R6IV_NCAMS
 };
 
@@ -181,7 +187,12 @@ struct r6_iv_stats {
     uint32_t menu_blocked;   /* ML menu opens refused while a picture runs (r6_iv_menu_block, src/menu.c) */
     /* M9.2 */
     uint32_t bulb_warn;      /* OR of IV_BW_* over the bulb pictures of the current / last run (reset at the start) */
+    /* M9.3 */
+    int mode;                /* R6IV_MODE_* of the current / last run */
 };
+#define R6IV_MODE_INTERVAL 0     /* R6 Interval (series or "Test: 1 picture") */
+#define R6IV_MODE_MD_SHOOT 1     /* R6 Motion, Release */
+#define R6IV_MODE_MD_VIEW  2     /* R6 Motion, Display only (never presses) */
 
 /* M8.1: one read-only snapshot of the CameraConductor and the switch path (r6_interval.c iv_cc_read) */
 #define R6IV_V_CC    0x01    /* cc passed the pointer check: the CC fields are valid */
@@ -294,8 +305,18 @@ void r6_iv_budget(int * tv_ub, int * busy, int * need, int * need_nr, int * fit)
 /* M9.2 */
 int r6_iv_bulb_t(const struct r6_iv_cc * s);   /* T (s) from [p+0x648] if p valid, enable 1, m / s <= 59; else -1 */
 int r6_iv_bulb_min_s(void);                    /* R6IV_BULB_MIN_S (31) */
-int r6_iv_bulb_max_s(void);                    /* R6IV_BULB_MAX_S (60) */
+int r6_iv_bulb_max_s(void);                    /* R6IV_BULB_MAX_S (1800, M9.3) */
 int r6_iv_bulb_running(void);                  /* 1 = ML's bulb picture runs, or Canon's bulb after an overrun stop (overlays pause) */
+/* M9.3: R6 Motion's runs (r6_motion.c menu); one series at a time */
+int r6_iv_md_start(void);                      /* menu task: 0 = queued, else enum r6_iv_cam (refused) */
+void r6_iv_md_stop(void);                      /* menu task: stops a motion run (only a motion run) */
+int r6_iv_md_running(void);                    /* a motion run is active or starting */
+int r6_iv_md_refused(void);                    /* enum r6_iv_cam of the last motion Start (0 = ok) */
+int r6_iv_in_pic(void);                        /* a picture is running (motion display pauses) */
+int r6_iv_tick_ms(void);                       /* r6_iv_task period: 20 ms during a motion run, else 50 ms */
+struct menu_entry;
+struct menu_display_info;
+void r6_iv_stop_warn(struct menu_entry * entry, struct menu_display_info * info);   /* the "Last series" warning */
 
 /* Canon RAM read by r6_interval.c (read-only) */
 #define R6IV_RAM_JOBCNT    0x9DC0      /* live job count [0x9D9C+0x24]: CreateJob checks it (cbz 0xE07C9E5E),

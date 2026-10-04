@@ -34,6 +34,27 @@
  * ("rec"). Else the newest record not newer than that frame ("rec_old").
  * Else the getter rule: (ctx[0xB029] - 2) mod 4, i.e. the buffer handed out
  * before the most recent one (the most recent may still be written) ("get").
+ *
+ * M9.3 (r6_fy_locate_done, the motion detector; spec m9/m93 spec_m93.md 1.1 -
+ * 1.3 with the corrections of spec_m93_skeptic.md A1 / A2 / A5). R2Y job of
+ * one LV frame N (raw2yuvProcessPath 0xE0365006): ring step 0xE0365100 ->
+ * 0xE0809212 ({flag, N} into the ring), then the getter 0xE0364FE4 ->
+ * 0xE0809390 (hands out ctx+0x20+8*[ctx+0xB029], then +1 mod 4), then the
+ * record 0xE0365428 -> 0xE0809550 ("YuvStar": +4 N, +0x10 the buffer), then
+ * the kick 0xE036542C (the hardware writes the buffer only after ring entry
+ * and record exist). So the newest frame F1 may still be written. Its record
+ * proves only that F1 was STARTED: the stage accepts the next job before the
+ * last one's outputs are done (state object "Raw2YuvStage", PathComplete in
+ * state 1, overlap bookkeeping [0x12A44+0x28], skeptic A1 / A2), so "F2 is
+ * complete" is inferred from timing, not proven; the detector discards torn
+ * frames (r6_motion.c) and needs Confirm frames in a row. [ctx+0xB048] bit 1
+ * hands out a debug dump area (0xE08093C2..0xE08093F8), bit 2 always buffer 0
+ * while the record stores buffer 3 (0xE0809404 / 0xE08096AE): read only with
+ * both bits 0. Rules (a) [ctx+0xB048] & 6 == 0, (b) F1 newest, F2 = the ring
+ * entry before it, F1 - F2 in 1..16, (c) a record of F1 naming one of the 4
+ * buffers, (d) a record of F2 naming another one, (e) exactly one hand-out
+ * since F2: F1 in (g+3)&3, F2 in (g+2)&3. F2's buffer is handed out again
+ * only by the 3rd hand-out after g: r6_fy_recheck() after the read.
  */
 
 #include "dryos.h"
@@ -44,6 +65,7 @@
 #define FY_RING       0x164614  /* 3 x {flag, FrameNum} */
 #define FY_LVIC_SIZE  0x11FC8   /* u16 w, u16 h (640 x 426) */
 #define FY_GET_IDX    0xB029
+#define FY_B048       0xB048    /* M9.3: getter mode bits (bit 1 debug dump area, bit 2 buffer 0 / record buffer 3) */
 #define FY_REC_IDX    0xB02A
 #define FY_REC        0x40
 #define FY_REC_STRIDE 0xA0
@@ -133,10 +155,23 @@ static int fy_fail(struct r6_fy_loc * r, const char * why)
     return 0;
 }
 
-int r6_fy_locate(struct r6_fy_loc * r)
+/* M9.3: the record with exactly this FrameNum that names one of the 4 buffers; index, *pick = buffer (else -1) */
+static int fy_rec_find(uint32_t ctx, uint32_t frame, const uint32_t * blo, const uint32_t * bhi, int * pick, int uc)
+{
+    for (int k = 0; k < 4; k++)
+    {
+        uint32_t rb = ctx + FY_REC + FY_REC_STRIDE * k, lo, hi;
+        if (RD(rb + 4) != frame || fy_rd64(rb + 0x10, &lo, &hi, uc) != 1) continue;
+        for (int j = 0; j < 4; j++) if (lo == blo[j] && hi == bhi[j]) { *pick = j; return k; }
+    }
+    return -1;
+}
+
+/* done = 0: r6_fy_locate (unchanged); done = 1: r6_fy_locate_done (M9.3) */
+static int fy_locate(struct r6_fy_loc * r, int done)
 {
     memset(r, 0, sizeof(*r));
-    r->pick = r->rec = r->win = r->ring_i = -1;
+    r->pick = r->rec = r->win = r->ring_i = r->pick1 = -1;
     r->why = "";
     int uc = fy_uc_ok();
 
@@ -159,26 +194,50 @@ int r6_fy_locate(struct r6_fy_loc * r)
     for (int k = 0; k < 4; k++)
         if (fy_rd64(ctx + 0x20 + 8 * k, &blo[k], &bhi[k], uc) != 1) return fy_fail(r, "buf_unstable");
 
-    /* ring frame -> record -> buffer */
-    int best = -1, best_d = 1 << 30;
-    for (int k = 0; k < 4; k++)
+    if (done)
     {
-        uint32_t rb = ctx + FY_REC + FY_REC_STRIDE * k, lo, hi;
-        uint32_t f = RD(rb + 4);
-        if (fy_rd64(rb + 0x10, &lo, &hi, uc) != 1) continue;
-        int m = -1;
-        for (int j = 0; j < 4; j++) if (lo == blo[j] && hi == bhi[j]) m = j;
-        if (m < 0) continue;
-        int d = (int) (r->ring_frame - f);
-        if (d < 0 || d >= 16) continue;
-        if (d < best_d) { best_d = d; best = k; r->pick = m; r->rec_frame = f; }
+        /* M9.3: rules (a) .. (e), see the header; never the getter fallback */
+        uint32_t b = 0xFF;
+        r->ctx = ctx;
+        if (!fy_rd8(ctx + FY_B048, &b, uc)) b = 0xFF;
+        r->b048 = b;
+        if (b & 6) return fy_fail(r, "b048");                           /* 0xE08093C2 / 0xE0809404 */
+        r->f1 = r->ring_frame;
+        r->f2 = RD(FY_RING + 8 * (r->ring_i == 2 ? 0 : r->ring_i + 1) + 4);   /* the entry before the newest */
+        uint32_t d = r->f1 - r->f2;
+        if (d < 1 || d > 16) return fy_fail(r, "ring_f");
+        if (fy_rec_find(ctx, r->f1, blo, bhi, &r->pick1, uc) < 0) return fy_fail(r, "no_rec_new");
+        int k2 = fy_rec_find(ctx, r->f2, blo, bhi, &r->pick, uc);
+        if (k2 < 0) return fy_fail(r, "no_rec_done");
+        if (r->pick == r->pick1) return fy_fail(r, "same_buf");
+        if (g > 3 || r->pick1 != (int) ((g + 3) & 3) || r->pick != (int) ((g + 2) & 3)) return fy_fail(r, "handout");
+        r->rec = k2;
+        r->rec_frame = r->f2;
+        r->src = 4;
     }
-    if (best >= 0) { r->rec = best; r->src = best_d == 0 ? 1 : 2; }
     else
     {
-        if (g > 3) return fy_fail(r, "get_idx");
-        r->pick = (g + 2) & 3;
-        r->src = 3;
+        /* ring frame -> record -> buffer */
+        int best = -1, best_d = 1 << 30;
+        for (int k = 0; k < 4; k++)
+        {
+            uint32_t rb = ctx + FY_REC + FY_REC_STRIDE * k, lo, hi;
+            uint32_t f = RD(rb + 4);
+            if (fy_rd64(rb + 0x10, &lo, &hi, uc) != 1) continue;
+            int m = -1;
+            for (int j = 0; j < 4; j++) if (lo == blo[j] && hi == bhi[j]) m = j;
+            if (m < 0) continue;
+            int d = (int) (r->ring_frame - f);
+            if (d < 0 || d >= 16) continue;
+            if (d < best_d) { best_d = d; best = k; r->pick = m; r->rec_frame = f; }
+        }
+        if (best >= 0) { r->rec = best; r->src = best_d == 0 ? 1 : 2; }
+        else
+        {
+            if (g > 3) return fy_fail(r, "get_idx");
+            r->pick = (g + 2) & 3;
+            r->src = 3;
+        }
     }
     r->lo = blo[r->pick]; r->hi = bhi[r->pick];
 
@@ -201,6 +260,20 @@ int r6_fy_locate(struct r6_fy_loc * r)
     r->cpu = cpu;
     r->ok = 1;
     return 1;
+}
+
+int r6_fy_locate(struct r6_fy_loc * r) { return fy_locate(r, 0); }
+int r6_fy_locate_done(struct r6_fy_loc * r) { return fy_locate(r, 1); }
+
+int r6_fy_recheck(const struct r6_fy_loc * r)
+{
+    if (!r->ok || r->src != 4) return -1;                               /* skeptic A5: only an ok src-4 locate */
+    int uc = fy_uc_ok();
+    uint32_t g = 0xFF, b = 0xFF;
+    if (RD(FY_STATE + 0xC) != r->ctx || !fy_rd8(r->ctx + FY_GET_IDX, &g, uc) || !fy_rd8(r->ctx + FY_B048, &b, uc)
+        || (b & 6) || g > 3)
+        return -1;
+    return (int) ((g - (uint32_t) r->gidx) & 3);
 }
 
 /* ---- ML's LV image ---- */

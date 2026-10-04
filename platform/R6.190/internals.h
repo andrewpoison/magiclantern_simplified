@@ -127,7 +127,7 @@
  * calls them), nothing else new (no property write, no other Canon call, no
  * MMIO, no file). M8.2: src/menu.c menu_open() keeps the ML menu closed while
  * a picture runs (r6_iv_menu_block). Only M with Tv <= 30 s, or B with Canon's
- * bulb timer 31..60 s (M9.2), single shot, MF, no Canon interval timer / timer
+ * bulb timer 31 s .. 30 min (M9.2 / M9.3), single shot, MF, no Canon interval timer / timer
  * setting 0x80040064, at most 50 pictures;
  * every press checks Canon's state first (RAM reads) and every picture is
  * verified (counter / file number, Canon's job count back to 0, CC idle),
@@ -145,6 +145,13 @@
  * in ML's config, default OFF (user decisions 2026-10-04). No Canon call, no
  * write, no MMIO, no file. Needs CONFIG_R6_GLOBAL_DRAW. */
 #define CONFIG_R6_GRID
+
+/* R6.190 M9.3: "R6 Motion" (r6_motion.c, Shoot menu): motion trigger on Canon's FaceYuv image (second-newest
+ * frame, r6_fy_locate_done; torn frames discarded). Releases only through R6 Interval's iv_shoot (shutter
+ * callbacks, approved 2026-10-04); "Display only" never presses. No property write, no MMIO, no new Canon call.
+ * Display through the grid's pixel rules. Needs CONFIG_R6_INTERVAL, CONFIG_R6_FACEYUV_LV, CONFIG_R6_GLOBAL_DRAW,
+ * CONFIG_R6_GRID. */
+#define CONFIG_R6_MOTION
 
 #define CONFIG_TASK_STRUCT_V2_SMP
 #define CONFIG_TASK_ATTR_STRUCT_V5

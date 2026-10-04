@@ -87,6 +87,10 @@ enum {
 int r6_gd_screen_ok(void);
 const char * r6_gd_reason(int r);
 
+/* M9.3 (r6_motion.c gate): the display mask [[0xEA40]+0x18] (0xE01694C8), read fresh; 0xFFFFFFFF = pointer not
+ * readable (RAM reads only, the pointer checked as in the screen check) */
+uint32_t r6_gd_disp_mask(void);
+
 /* conversion cap (bmp.c refresh_yuv_from_rgb): 1 = skip this refresh (the
  * flag stays set), while the ML menu is closed and the last conversion was
  * less than R6_GD_CAP_DUTY x its own duration ago (at most R6_GD_CAP_MAX_MS);

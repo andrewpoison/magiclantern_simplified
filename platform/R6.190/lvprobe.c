@@ -107,6 +107,10 @@
 #ifdef CONFIG_R6_GRID
 #include "r6_grid.h"
 #endif
+#ifdef CONFIG_R6_MOTION
+#include "r6_faceyuv.h"
+#include "r6_motion.h"
+#endif
 
 /* CONFIG_LIVEVIEW compiles in force_liveview (fake_simple_button(BGMT_LV) in
  * a loop while lv == 0) and the LV AF frame code. With lv pinned to 0 by
@@ -1157,7 +1161,7 @@ static void lp_census_m72a(struct lp_buf * b)
 #define LGR(name, val) lp_printf(b, "grid." name "=%d\n", (int) (val))
         lp_printf(b, "grid.cfg=0x%08x\n", (int) r->cfg);
         lp_printf(b, "grid.sig=0x%08x\n", (int) r->sig);
-        LGR("wanted", r6_grid_wanted());   LGR("drawn", r->drawn);           LGR("evf", r->evf);
+        LGR("wanted", r6_grid_wanted_grid()); LGR("drawn", r->drawn);        LGR("evf", r->evf);   /* M9.3: the grid alone */
         LGR("y0", r->y0);                  LGR("px_line", r->px_line);       LGR("px_fill", r->px_fill);
         LGR("px_shadow", r->px_shadow);    LGR("steps", r->steps);           LGR("off", r->off);
         LGR("draws", r->draws);            LGR("erases", r->erases);         LGR("repairs", r->repairs);
@@ -1701,6 +1705,8 @@ static void lp_iv_log(struct lp_buf * b)
     lp_printf(b, "iv.bulb.max_s=%d\n", r6_iv_bulb_max_s());
     lp_printf(b, "iv.bulb.warn=0x%x\n", (int) s->bulb_warn);
     lp_printf(b, "iv.bulb.running=%d\n", r6_iv_bulb_running());
+    lp_printf(b, "iv.mode=%d\n", s->mode);                            /* M9.3: 0 interval, 1 motion release, 2 motion view */
+    lp_printf(b, "iv.md_refused=%d,%s\n", r6_iv_md_refused(), lp_nosp(r6_iv_cam_name(r6_iv_md_refused()), w, sizeof(w)));
     lp_printf(b, "iv.cam=%d,%s\n", c, lp_nosp(r6_iv_cam_name(c), w, sizeof(w)));
     lp_printf(b, "iv.canon=%d,%s\n", k, lp_nosp(r6_iv_canon_name(k), w, sizeof(w)));
     lp_printf(b, "iv.canon_hard=%d\n", hard);
@@ -2376,6 +2382,48 @@ static volatile int lp_snap_busy = 0;     /* one snapshot at a time */
 static int lp_snap_seq = 0;               /* per boot */
 static int lp_file_no = 0;                /* last file number used in this boot */
 
+#ifdef CONFIG_R6_MOTION
+/* M9.3: R6 Motion (r6_motion.c): counters and last values, the newest triggers, one r6_fy_locate_done now (works with
+ * the detector off), the display. Comma lists: md.nr[] (b048 ring_f no_rec_new no_rec_done same_buf handout size
+ * other), md.gate[] (r6_md_gate_name order), md.rebase[] (start gate global pic) */
+static void lp_md_arr(struct lp_buf * b, const char * key, const uint32_t * v, int n)
+{
+    char t[120];
+    int j = 0;
+    t[0] = 0;
+    for (int i = 0; i < n && j < (int) sizeof(t) - 12; i++) j += snprintf(t + j, sizeof(t) - j, i ? ",%d" : "%d", (int) v[i]);
+    lp_printf(b, "%s=%s\n", key, t);
+}
+
+static void lp_md_log(struct lp_buf * b)
+{
+    const struct r6_md_stats * s = r6_md_stats();
+    int n = 0;
+    const char * k = r6_md_knames(&n);
+    for (int i = 0; i < n; i++, k += strlen(k) + 1) lp_printf(b, "md.%s=%d\n", k, (int) ((const int32_t *) s)[i]);
+    lp_printf(b, "md.state_name=%s\n", r6_md_state_name(s->state));
+    lp_printf(b, "md.gate_name=%s\n", r6_md_gate_name(s->gate_last));
+    lp_printf(b, "md.nr_last=%s\n", s->nr_last && s->nr_last[0] ? s->nr_last : "-");
+    lp_md_arr(b, "md.nr", s->nr, R6MD_NNR);
+    lp_md_arr(b, "md.gate", s->gate, R6MD_NGATES);
+    lp_md_arr(b, "md.rebase", s->rebase, R6MD_NRB);
+    lp_printf(b, "# md.last[i]=t,f2,state,score,hits_all,run,result (oldest first; result -1 open, 0 view, 1 shot, 2+k dropped)\n");
+    uint32_t nl = s->nlast;
+    int c = nl < R6MD_RING ? (int) nl : R6MD_RING;
+    for (int i = 0; i < c; i++)
+    {
+        const struct r6_md_last * e = &s->last[(nl - c + i) % R6MD_RING];
+        lp_printf(b, "md.last[%d]=%d,%d,%d,%d,%d,%d,%d\n", i, (int) e->t, (int) e->f2, e->state, e->score, e->hits, e->run, e->result);
+    }
+    struct r6_fy_loc l;
+    int ok = r6_fy_locate_done(&l);
+    lp_printf(b, "md.loc=%d,%s,%d,%d,%d,%d,%d,%d,%d\n", ok, ok ? "ok" : l.why, (int) l.f1, (int) l.f2, l.pick, l.pick1, l.gidx,
+        (int) l.b048, l.src);
+    const struct r6_grid_stats * g = r6_grid_stats();
+    lp_printf(b, "md.disp=%d,%d,%d,0x%08x\n", r6_md_disp_wanted(), (int) g->md_drawn, (int) g->md_n, (int) g->md_sig);
+}
+#endif
+
 /* each snapshot goes to a new file: no append, no seek, no overwrite */
 static int lp_write_log(struct lp_buf * b, char * name, int name_size)
 {
@@ -2425,6 +2473,9 @@ static void lp_snapshot_do(int delay_ms)
     lp_vmix_poll(&b);
 #ifdef CONFIG_R6_INTERVAL
     lp_iv_log(&b);
+#endif
+#ifdef CONFIG_R6_MOTION
+    lp_md_log(&b);                        /* M9.3 */
 #endif
     lp_x_log(&b);                         /* M9.1 Tor 0 */
     int trunc = b.trunc;
