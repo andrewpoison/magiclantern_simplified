@@ -25,6 +25,7 @@ ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_overlays.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_faceyuv.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_gdraw.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_interval.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_grid.o
 
 include ../Makefile
 .DEFAULT_GOAL := $(BUILD_DIR)/cam_complete

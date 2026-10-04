@@ -101,6 +101,10 @@ extern int lv_action_raw_get(uint32_t * value, int * len);   /* propvalues.c */
 #define R6H_TICK_MS 100
 #define R6H_RATE_MS 200            /* at most 5 draws per second */
 #define R6H_STALE_MS 1000
+#if R6H_X - R6H_FRAME != R6H_BOX_X0 || R6H_Y - R6H_FRAME != R6H_BOX_Y0 \
+ || R6H_X + R6H_W + R6H_FRAME != R6H_BOX_X1 || R6H_Y + R6H_H + R6H_FRAME != R6H_BOX_Y1
+#error "r6_overlays.h R6H_BOX_* must match the box (M9.1 grid exclusion)"
+#endif
 
 #define RD(a) (*(volatile uint32_t *)(a))
 

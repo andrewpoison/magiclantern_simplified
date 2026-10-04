@@ -34,7 +34,7 @@
  * rule: cached RAM, or 0x40001000..0x7FFFFFFF once Canon's memif copy verifies,
  * read-only) and they gate Start, Test and every tick (R6IV_GATE_CC_SETTINGS 1):
  * M, single, Tv in range, no AF, PROP_MECHALESS 0, Canon's interval timer and
- * focus bracketing bytes 0; [cc+0xB98] / [cc+0x830] make a picture wait. Start
+ * timer setting 0x80040064 bytes 0; [cc+0xB98] / [cc+0x830] make a picture wait. Start
  * is refused if the interval is shorter than Tv + 2 s. src/menu.c does not open
  * the ML menu while a picture runs (r6_iv_menu_block). An ML shutdown is taken
  * in every wait after the OFFs (nothing is held there).
@@ -108,7 +108,7 @@
  * the [I] CC pointer copies, [cc+0x730], [cc+0x3B4], [cc+0x5F8], the aux word,
  * ACCESS_REMAIN, the NR value [p+0x54C]. Since M8.2 the CC copies of AE mode,
  * drive, Tv, PROP_MECHALESS (ids [V], CC master table 0xE0FE3344), the AF flag
- * and the interval timer / focus bracketing bytes gate (R6IV_GATE_CC_SETTINGS
+ * and the interval timer / timer setting (0x80040064) bytes gate (R6IV_GATE_CC_SETTINGS
  * 1). Fixed limits: M, Tv <= 30 s (no Bulb), single shot, MF, LV running, no
  * Canon menu, interval >= Tv + 2 s, at most 50 pictures.
  *
@@ -315,14 +315,14 @@ static const char * const iv_stop_names[R6IV_NSTOPS] = {
 static const char * const iv_cam_names[R6IV_NCAMS] = {
     "ok", "movie mode", "not M", "Tv > 30s, Bulb or unknown", "not single shot", "not MF", "no card / full", "AEB on",
     "Canon CC: not M", "Canon CC: not single", "Canon CC: Tv Bulb / out of range", "Canon CC: AF active",
-    "Canon CC: mechaless mode", "Canon interval timer on", "Canon focus bracketing on", "interval < Tv + 2s",
+    "Canon CC: mechaless mode", "Canon interval timer on", "Canon timer setting (0x80040064) on", "interval < Tv + 2s",
 };
 static const char * const iv_canon_names[R6IV_NCANON] = {
     "ready", "CameraConductor not ready", "shutter callbacks not registered", "Canon switch path diverted",
     "CC event flag invalid", "factory release mark, reboot", "Canon remote sequence",
     "boot < 20 s", "LV not running", "review / GUI state", "Canon job running", "buffer full",
     "UI locked", "sensor cleaning", "ML menu", "shutter held / pending", "release sequence active",
-    "CC not in LV still", "Canon CC timer / bracketing flag",
+    "CC not in LV still", "Canon CC timer flag (0xB98 / 0x830)",
 };
 
 const struct r6_iv_stats * r6_iv_stats(void) { return &st; }

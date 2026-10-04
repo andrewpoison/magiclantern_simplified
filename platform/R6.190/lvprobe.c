@@ -67,6 +67,10 @@
  * No property writes, no EDMAC, no LV pixel reads, no memif window lookups
  * through Canon code.
  *
+ * M9.1: "Expo log" (Tor 0, read-only exposure values, section expo.* of the
+ * snapshot, see lp_x_* below); the RandomData ring is read with its 20
+ * slots; the grid's counters (grid.*, r6_grid.c).
+ *
  * Addresses: ROM0 1.9.0. Evidence per field: see the comments below and
  * the M7.0 report.
  */
@@ -99,6 +103,9 @@
 #ifdef CONFIG_R6_INTERVAL
 #include "lens.h"
 #include "r6_interval.h"
+#endif
+#ifdef CONFIG_R6_GRID
+#include "r6_grid.h"
 #endif
 
 /* CONFIG_LIVEVIEW compiles in force_liveview (fake_simple_button(BGMT_LV) in
@@ -183,7 +190,8 @@ static int lp_autostart = -2;
                                     * (copy 0xE079C626, getter DTS_GetAllRandomData 0xE079D026) */
 #define LP_RD_WORK       0x131B70  /* RandomData working copy, 0xF00 bytes (literal at 0xE079C640) */
 #define LP_RD_RING       0x132A70  /* published RandomData pointers, [LP_RD_RING + 4*idx] (0xE079C642) */
-#define LP_RD_RING_N     8         /* entries logged; Canon's ring size is unknown */
+#define LP_RD_RING_N     20        /* M9.1: 20 slots (ring step mod 0x14, 0xE079C69E; camera LVP00045 index 0x11),
+                                    * M7.2a..M8.2 read only 8 and refused an index >= 8 */
 #define LP_RD_SIZE       0xF00     /* 'RandomData Total(%d)' 0xE079C2B6 */
 #define LP_FY_STATE      0x1ED68   /* LvFaceYuvController: +0xC = ctx (0xB060 bytes, 0xE0808F32), s8 [+0] ring
                                     * index; ctx+0x20: 4 x 64-bit IBus addresses (0xE08092DC..0xE0809386) */
@@ -1130,6 +1138,24 @@ static void lp_census_m72a(struct lp_buf * b)
 #undef LGD
     }
 #endif
+#ifdef CONFIG_R6_GRID
+    {
+        /* M9.1: grids & masks (r6_grid.c) */
+        const struct r6_grid_stats * r = r6_grid_stats();
+#define LGR(name, val) lp_printf(b, "grid." name "=%d\n", (int) (val))
+        lp_printf(b, "grid.cfg=0x%08x\n", (int) r->cfg);
+        lp_printf(b, "grid.sig=0x%08x\n", (int) r->sig);
+        LGR("wanted", r6_grid_wanted());   LGR("drawn", r->drawn);           LGR("evf", r->evf);
+        LGR("y0", r->y0);                  LGR("px_line", r->px_line);       LGR("px_fill", r->px_fill);
+        LGR("px_shadow", r->px_shadow);    LGR("steps", r->steps);           LGR("off", r->off);
+        LGR("draws", r->draws);            LGR("erases", r->erases);         LGR("repairs", r->repairs);
+        LGR("repair_px", r->repair_px);    LGR("claim_ovl", r->claim_ovl);   LGR("cleanup_px", r->cleanup_px);
+        LGR("skip_foreign", r->skip_foreign); LGR("skip_mark", r->skip_mark); LGR("excl", r->excl);
+        LGR("us_last", r->us_last);        LGR("us_max", r->us_max);         LGR("us_draw_max", r->us_draw_max);
+        LGR("y0_mismatch", r->y0_mismatch); LGR("changed", r->changed);
+#undef LGR
+    }
+#endif
 #if defined(CONFIG_R6_GLOBAL_DRAW) && defined(FEATURE_HISTOGRAM)
     {
         const struct r6_mlhist_stats * m = r6_mlhist_stats();
@@ -1494,7 +1520,7 @@ static void lp_vmix_poll(struct lp_buf * b)
  * CameraConductor, the switch manager, the release counter, the job manager, the
  * FA-Neo node walk (only with a live job), the last-picture detail and the
  * passive trace. M8.2 adds the long-Tv fields (CC copies of NR / interval timer /
- * focus bracketing, the CC flags 0xB98 / 0x830 / 0x5F8, the snapshot's validity
+ * the 0x80040064 timer setting, the CC flags 0xB98 / 0x830 / 0x5F8, the snapshot's validity
  * mask, the Tv budget, the ML menu guard count, per-shot Tv / budget / timing).
  * Every pointer taken from a Canon structure passes ram_ok() for the whole
  * structure first (p: cached RAM or the verified uncached alias); otherwise the
@@ -1846,6 +1872,454 @@ static void lp_iv_log(struct lp_buf * b)
 }
 #endif
 
+/* ---- M9.1 Tor 0: exposure values, read only (docs/m9_plan.md 1.4) --------
+ * Debug > LV probe > "Expo log": own flag, OFF at boot, not saved; the
+ * status line does not depend on it. Reads approved by the user (2026-10-04),
+ * all plain RAM reads with the rules above (ram_ok: cached RAM, or the
+ * verified uncached alias; every pointer checked; nothing written, no Canon
+ * call):
+ *  - CameraConductor cc = [0x10AB8] (as M8) and its settings sheets: p =
+ *    [cc+0x34FC] is the master storage of CC's 417 properties (id table
+ *    0xE1C3AABC, row table 0xE0FE3344, getter 0xE0713E4C), [cc+0x34FC+4k]
+ *    k = 0..4; Canon's DataStore sheets [[0x10868]+0x2F4+4k] k = 0..10
+ *    (sheet save 0xE07129CA)
+ *  - the lens master buffers 0x127B88 (PROP_LENS_DYNAMIC_DATA, registered
+ *    with 0x8C bytes at 0xE058A974) and 0x1279B8 (PROP_LENS_STATIC_DATA)
+ *  - the LV ExactData ring: [0x132AC0 + 4 i], i = 0..19, records +0x48 Bv,
+ *    +0x4A Tv, +0x4C Av, +0x50 Iso (s16; DTS_GetExactDataOffset 0xE079D188,
+ *    "ExactData Bv:%x Tv:%x Av:%x Iso:%x" 0xE06A81C4), index dts[0x2C]
+ *  - the GUI ISO copy [[0x16954]+0x1EC] (GUI_GetIso 0xE07A76C4)
+ *  - the bulb fields of CC: state [cc+0x294], [cc+0xD30] (bulb running),
+ *    [cc+0xBA0] (bulb timer armed), byte [cc+0x16B] (SW1 snapshot), the
+ *    seconds tick [cc+0x99C], and Canon's timer RAM 0x1E568 (bulb ms),
+ *    0x1E5BC / 0x1E5C0 / 0x1E5C4 / 0x1E5C8 (timers A / B: active, ms)
+ *    (SHOOT_START 0xE031D7B4, EXPOSURE_START 0xE0643E08, m9/bulb)
+ *  - Canon's Tv substitution flag (0xE035A7B4 returns
+ *    [[[0x1085C+8]+0x644]+0x10]; with 1 CC_SetTv stores [p+0x25C] instead of
+ *    the request, 0xE03B0FC0..0xE03B0FEC)
+ * Ring A (expo.pr): extra ML property handlers, only on ids this build
+ * registers anyway (all in the baseline handler table with another
+ * handler, none on the deny list, never PROP_ISO), so Canon's slave list
+ * does not change. The handler runs in Canon's property task: it copies at
+ * most 8 bytes plus id, length and time, nothing else (no lock, no print).
+ * Ring B (expo.cb): every 200 ms (status task) the CC copies and bulb
+ * fields; each changed field is one entry (changes < 200 ms apart merge).
+ * ISO is only seen here (PROP_ISO stays denied).
+ * Snapshot section expo.*: pointers, sheets, raw + decoded values, lens
+ * buffers, the 20 ExactData records, the GUI ISO copy, handler value == CC
+ * copy, both rings. */
+#define LP_X_CC         0x10AB8    /* CameraConductor (set 0xE0295DCA; r6_interval.h R6IV_RAM_CC) */
+#define LP_X_CC_SIZE    0x3510     /* fields up to the sheet pointers [cc+0x34FC..0x350F] */
+#define LP_X_CC_P       0x34FC     /* p = sheet 0, current stills settings */
+#define LP_X_P_SIZE     0x930      /* fields read below 0x64C (r6_interval.h R6IV_P_SIZE) */
+#define LP_X_SHEET_SIZE 0x620      /* per sheet: AE 0x008 .. Tv 0x61E */
+#define LP_X_DS_PTR     0x10868    /* Canon's DataStore: sheet pointers [ds+0x2F4+4k], k = 0..10 */
+#define LP_X_DS_SIZE    0x320
+#define LP_X_LENSDYN    0x127B88   /* PROP_LENS_DYNAMIC_DATA master buffer (registration 0xE058A974, 0x8C bytes) */
+#define LP_X_LENSDYN_N  0x8C
+#define LP_X_LENSSTAT   0x1279B8   /* PROP_LENS_STATIC_DATA master buffer (lens.c asserts 0x1C8 bytes) */
+#define LP_X_LENSSTAT_N 0x1C8
+#define LP_X_EXACT      0x132AC0   /* ExactData record pointers, 20 slots (DTS_GetExactDataOffset 0xE079D188) */
+#define LP_X_EXACT_N    20
+#define LP_X_EXACT_IDX  (LP_DTS + 0x2C)   /* dts[0x2C]: newest-slot base of DTS_GetExactDataOffset (which one is the
+                                           * newest is open; all 20 are logged) */
+#define LP_X_EXACT_SIZE 0x54       /* record fields read: +0x48 .. +0x53 */
+#define LP_X_GUI_ISO    0x1EC      /* [[0x16954]+0x1EC] s16 (GUI_GetIso 0xE07A76C4) */
+#define LP_X_TVS_PTR    0x10864    /* [0x1085C+8] (Tv substitution flag 0xE035A7B4: [[x+0x644]+0x10]) */
+#define LP_X_TVS_SUB    0x25C      /* [p+0x25C] s16: the Tv CC_SetTv stores while the flag is 1 */
+
+static int lp_x_on = 0;                    /* menu "Expo log" (not saved) */
+static volatile int lp_x_reset = 1;        /* the sampler takes a new baseline */
+
+/* ---- ring A: the extra property handlers ---- */
+static const uint32_t lp_xph_ids[] = {
+    0x80000000, 0x80000001, 0x80000002, 0x80000003, 0x80000005, 0x80000006, 0x80000008, 0x80000009,
+    0x8000000B, 0x80000034, 0x8000003A, 0x8000003B, 0x8000003D, 0x8000004A, 0x80020037, 0x8003009A,
+};
+#define LP_XPH_N   ((int) COUNT(lp_xph_ids))
+enum { LP_XPH_DIAL, LP_XPH_AE, LP_XPH_METER, LP_XPH_DRIVE, LP_XPH_TV, LP_XPH_AV, LP_XPH_COMP, LP_XPH_FCOMP, LP_XPH_AEB,
+       LP_XPH_EXPSIM, LP_XPH_AEMOVIE, LP_XPH_AUTOISO, LP_XPH_ALO, LP_XPH_HTP, LP_XPH_LENSDYN, LP_XPH_LENSSTAT };
+#define LP_XPR_N   64            /* review: room for the mode-dial republishes; the lens ids stay out (lp_x_prop) */
+struct lp_xpr { uint32_t t, id, len, w0, w1; };
+static struct lp_xpr lp_xpr[LP_XPR_N];               /* written by the handler only (Canon's property task) */
+static volatile uint32_t lp_xpr_n = 0;
+static struct lp_xpr lp_xph_last[LP_XPH_N];          /* last delivery per id (also while the log is OFF) */
+static volatile uint32_t lp_xph_cnt[LP_XPH_N];
+
+static void lp_x_prop(unsigned property, void * priv, void * addr, unsigned len)
+{
+    int i = 0;
+    while (i < LP_XPH_N && lp_xph_ids[i] != property) i++;
+    if (i == LP_XPH_N) return;
+    uint32_t w[2] = { 0, 0 };
+    if (addr) memcpy(w, addr, MIN(len, 8u));           /* at most 8 bytes */
+    struct lp_xpr e = { .t = get_ms_clock(), .id = property, .len = len, .w0 = w[0], .w1 = w[1] };
+    lp_xph_last[i] = e;
+    lp_xph_cnt[i]++;
+    if (!lp_x_on || i >= LP_XPH_LENSDYN) return;     /* lens data (zoom / focus bursts): count + last only (expo.ph) */
+    uint32_t n = lp_xpr_n;
+    lp_xpr[n % LP_XPR_N] = e;
+    lp_xpr_n = n + 1;
+}
+
+/* the same handler for each id (REGISTER_PROP_HANDLER with an own block name) */
+#define LP_XPH(id) __attribute__((section(".prop_handlers"))) __attribute__((used)) \
+    static struct prop_handler lp_xph_##id = { .handler = lp_x_prop, .property = id, .property_length = 0 }
+LP_XPH(0x80000000);   /* shooting mode (dial) */
+LP_XPH(0x80000001);   /* AE mode */
+LP_XPH(0x80000002);   /* metering */
+LP_XPH(0x80000003);   /* drive */
+LP_XPH(0x80000005);   /* Tv, 2 bytes */
+LP_XPH(0x80000006);   /* Av, 2 bytes */
+LP_XPH(0x80000008);   /* exposure compensation (GUI sends 4) */
+LP_XPH(0x80000009);   /* flash compensation */
+LP_XPH(0x8000000B);   /* AEB */
+LP_XPH(0x80000034);   /* exposure simulation */
+LP_XPH(0x8000003A);   /* AE mode movie */
+LP_XPH(0x8000003B);   /* auto ISO range, 0x14 bytes */
+LP_XPH(0x8000003D);   /* ALO */
+LP_XPH(0x8000004A);   /* HTP / D+ */
+LP_XPH(0x80020037);   /* lens dynamic data, 0x8C bytes (length + 8 bytes only) */
+LP_XPH(0x8003009A);   /* lens static data (length + 8 bytes only) */
+
+/* ---- ring B: the CC copies and bulb fields, sampled every 200 ms ---- */
+enum { LP_XB_CC, LP_XB_P, LP_XB_RAM };
+enum { LP_XD_HEX, LP_XD_DEC, LP_XD_TV, LP_XD_AV, LP_XD_ISO, LP_XD_EV, LP_XD_AE, LP_XD_ISOPAIR, LP_XD_TVPAIR, LP_XD_HMS };
+struct lp_xf { const char * name; uint8_t base, size, dec, pad; uint32_t off; };
+static const struct lp_xf lp_xf[] = {
+    { "p",          LP_XB_CC,  4, LP_XD_HEX,     0, LP_X_CC_P },  /* sheet 0 pointer */
+    { "dial",       LP_XB_CC,  4, LP_XD_DEC,     0, 0x89C },      /* 0x80000000 */
+    { "ae",         LP_XB_P,   4, LP_XD_AE,      0, 0x008 },      /* 0x80000001 */
+    { "tv",         LP_XB_P,   2, LP_XD_TV,      0, 0x61E },      /* 0x80000005, EV * 768 */
+    { "av",         LP_XB_P,   2, LP_XD_AV,      0, 0x61C },      /* 0x80000006 */
+    { "iso",        LP_XB_P,   4, LP_XD_ISO,     0, 0x510 },      /* 0x80000007, 0 = Auto */
+    { "comp",       LP_XB_P,   2, LP_XD_EV,      0, 0x4A0 },      /* 0x80000008 */
+    { "drive",      LP_XB_P,   4, LP_XD_HEX,     0, 0x4C0 },      /* 0x80000003 */
+    { "aeb",        LP_XB_P,   4, LP_XD_EV,      0, 0x000 },      /* 0x8000000B, low s16 = step */
+    { "autoiso0",   LP_XB_P,   4, LP_XD_ISOPAIR, 0, 0x094 },      /* 0x8000003B, 5 x {max, min} */
+    { "autoiso1",   LP_XB_P,   4, LP_XD_ISOPAIR, 0, 0x098 },
+    { "autoiso2",   LP_XB_P,   4, LP_XD_ISOPAIR, 0, 0x09C },
+    { "autoiso3",   LP_XB_P,   4, LP_XD_ISOPAIR, 0, 0x0A0 },
+    { "autoiso4",   LP_XB_P,   4, LP_XD_ISOPAIR, 0, 0x0A4 },
+    { "isorange0",  LP_XB_P,   4, LP_XD_ISOPAIR, 0, 0x514 },      /* 0x80040033, 0x16 bytes: u16 {max, min}, u16 0, */
+    { "isorange_pad", LP_XB_P, 2, LP_XD_HEX,     0, 0x518 },      /* 4 x u16 {max, min} (ROM1 default sheet */
+    { "isorange1",  LP_XB_P,   4, LP_XD_ISOPAIR, 0, 0x51A },      /* 0xF0737920 + 0x514; review) */
+    { "isorange2",  LP_XB_P,   4, LP_XD_ISOPAIR, 0, 0x51E },
+    { "isorange3",  LP_XB_P,   4, LP_XD_ISOPAIR, 0, 0x522 },
+    { "isorange4",  LP_XB_P,   4, LP_XD_ISOPAIR, 0, 0x526 },
+    { "meter",      LP_XB_P,   4, LP_XD_HEX,     0, 0x584 },      /* 0x80000002 */
+    { "expsim",     LP_XB_P,   4, LP_XD_HEX,     0, 0x548 },      /* 0x80000034 */
+    { "htp",        LP_XB_P,   4, LP_XD_HEX,     0, 0x4FC },      /* 0x8000004A */
+    { "lenr",       LP_XB_P,   4, LP_XD_HEX,     0, 0x54C },      /* 0x80000048 */
+    { "tvrange",    LP_XB_P,   4, LP_XD_TVPAIR,  0, 0x114 },      /* C.Fn: fastest 0x114, slowest 0x116 */
+    { "bulbtimer",  LP_XB_P,   4, LP_XD_HMS,     0, 0x648 },      /* 0x8004005B {on, h, m, s} */
+    { "itimer",     LP_XB_P,   4, LP_XD_HMS,     0, 0x50A },      /* 0x8004005A {on, h, m, s} */
+    { "t634",       LP_XB_P,   4, LP_XD_HMS,     0, 0x634 },      /* 0x80040064: byte + h:m:s */
+    { "state",      LP_XB_CC,  4, LP_XD_DEC,     0, 0x294 },      /* CC state (12 = bulb) */
+    { "d30",        LP_XB_CC,  4, LP_XD_DEC,     0, 0xD30 },      /* bulb running */
+    { "ba0",        LP_XB_CC,  4, LP_XD_DEC,     0, 0xBA0 },      /* bulb timer armed */
+    { "snap_sw1",   LP_XB_CC,  1, LP_XD_DEC,     0, 0x16B },      /* SW1 byte as CC last saw it */
+    { "sec",        LP_XB_CC,  4, LP_XD_DEC,     0, 0x99C },      /* bulb seconds: only 0 <-> non-0 logged, max kept */
+    { "tvgate",     LP_XB_CC,  4, LP_XD_HEX,     0, 0x860 },      /* CC_SetTv stores nothing while 0 */
+    { "bulb_ms",    LP_XB_RAM, 4, LP_XD_DEC,     0, 0x1E568 },
+    { "ta",         LP_XB_RAM, 4, LP_XD_DEC,     0, 0x1E5BC },
+    { "ta_ms",      LP_XB_RAM, 4, LP_XD_DEC,     0, 0x1E5C0 },
+    { "tb",         LP_XB_RAM, 4, LP_XD_DEC,     0, 0x1E5C4 },
+    { "tb_ms",      LP_XB_RAM, 4, LP_XD_DEC,     0, 0x1E5C8 },
+};
+#define LP_XF_N    ((int) COUNT(lp_xf))
+#define LP_XF_SEC  32                              /* index of "sec" */
+#define LP_XCB_N   64
+struct lp_xcb { uint32_t t; uint8_t f, ok_old, ok_new, pad; uint32_t old, val; };
+static struct lp_xcb lp_xcb[LP_XCB_N];
+static volatile uint32_t lp_xcb_n = 0;
+static uint32_t lp_xv[LP_XF_N];
+static uint8_t lp_xok[LP_XF_N];
+static uint32_t lp_x_samples = 0, lp_x_bad_cc = 0, lp_x_bad_p = 0, lp_x_sec_max = 0, lp_x_t0 = 0;
+
+/* cc and p if readable (bit 0 cc, bit 1 p) */
+static int lp_x_ptrs(uint32_t * cc, uint32_t * p)
+{
+    *cc = RD(LP_X_CC); *p = 0;
+    if (!ram_ok(*cc, LP_X_CC_SIZE)) return 0;
+    *p = RD(*cc + LP_X_CC_P);
+    return ram_ok(*p, LP_X_P_SIZE) ? 3 : 1;
+}
+
+/* size bytes at base+off from the aligned word(s), little endian; 0 = not readable */
+static int lp_x_rd(uint32_t base, uint32_t off, int size, uint32_t * v)
+{
+    uint32_t a = base + off, w0, w1 = 0;
+    int sh = 8 * (a & 3);
+    if (!rd32(a & ~3u, &w0)) return 0;
+    if (sh + 8 * size > 32 && !rd32((a & ~3u) + 4, &w1)) return 0;
+    uint64_t q = ((uint64_t) w1 << 32) | w0;
+    *v = (uint32_t) (q >> sh);
+    if (size < 4) *v &= (1u << (8 * size)) - 1;
+    return 1;
+}
+
+static int lp_x_field(int i, uint32_t cc, uint32_t p, int vm, uint32_t * v)
+{
+    const struct lp_xf * f = &lp_xf[i];
+    if (f->base == LP_XB_RAM) return lp_x_rd(0, f->off, f->size, v);
+    if (f->base == LP_XB_CC) return (vm & 1) && lp_x_rd(cc, f->off, f->size, v);
+    return (vm & 2) && lp_x_rd(p, f->off, f->size, v);
+}
+
+/* status task, every LP_STATUS_TICK_MS while the log is ON; RAM reads only */
+static void lp_x_sample(void)
+{
+    lp_uc_update();
+    uint32_t cc, p;
+    int vm = lp_x_ptrs(&cc, &p), base = lp_x_reset;
+    if (!(vm & 1)) lp_x_bad_cc++;
+    else if (!(vm & 2)) lp_x_bad_p++;
+    uint32_t now = get_ms_clock();
+    if (base) { lp_xcb_n = 0; lp_x_sec_max = 0; lp_x_t0 = now; }
+    for (int i = 0; i < LP_XF_N; i++)
+    {
+        uint32_t v = 0;
+        int ok = lp_x_field(i, cc, p, vm, &v);
+        if (ok && i == LP_XF_SEC && v > lp_x_sec_max) lp_x_sec_max = v;
+        int diff = ok != lp_xok[i] || (ok && v != lp_xv[i]);
+        if (i == LP_XF_SEC && ok && lp_xok[i]) diff = (v == 0) != (lp_xv[i] == 0);
+        if (!base && diff)
+        {
+            uint32_t n = lp_xcb_n;
+            struct lp_xcb * e = &lp_xcb[n % LP_XCB_N];
+            e->t = now; e->f = i; e->ok_old = lp_xok[i]; e->ok_new = ok; e->old = lp_xv[i]; e->val = v;
+            lp_xcb_n = n + 1;
+        }
+        if (diff || base || i == LP_XF_SEC) { lp_xv[i] = v; lp_xok[i] = ok; }
+    }
+    lp_x_samples++;
+    lp_x_reset = 0;
+}
+
+/* ---- decoding (APEX * 768 = Canon's "Code768", 1/3 EV = 0x100) ---- */
+static const char * const lp_x_tv_names[] = {      /* Tv thirds -15 (30 s) .. 42 (1/16000) */
+    "30s", "25s", "20s", "15s", "13s", "10s", "8s", "6s", "5s", "4s", "3.2s", "2.5s", "2s", "1.6s", "1.3s", "1s",
+    "0.8s", "0.6s", "0.5s", "0.4s", "0.3s", "1/4", "1/5", "1/6", "1/8", "1/10", "1/13", "1/15", "1/20", "1/25",
+    "1/30", "1/40", "1/50", "1/60", "1/80", "1/100", "1/125", "1/160", "1/200", "1/250", "1/320", "1/400", "1/500",
+    "1/640", "1/800", "1/1000", "1/1250", "1/1600", "1/2000", "1/2500", "1/3200", "1/4000", "1/5000", "1/6400",
+    "1/8000", "1/10000", "1/12800", "1/16000",
+};
+static const char * const lp_x_av_names[] = {      /* Av thirds 0 (F1.0) .. 33 (F45) */
+    "F1.0", "F1.1", "F1.2", "F1.4", "F1.6", "F1.8", "F2.0", "F2.2", "F2.5", "F2.8", "F3.2", "F3.5", "F4.0", "F4.5",
+    "F5.0", "F5.6", "F6.3", "F7.1", "F8.0", "F9.0", "F10", "F11", "F13", "F14", "F16", "F18", "F20", "F22", "F25",
+    "F29", "F32", "F36", "F40", "F45",
+};
+static const uint32_t lp_x_iso_vals[] = {          /* Sv thirds 12 (ISO 50) .. 48 (ISO 204800) */
+    50, 64, 80, 100, 125, 160, 200, 250, 320, 400, 500, 640, 800, 1000, 1250, 1600, 2000, 2500, 3200, 4000, 5000,
+    6400, 8000, 10000, 12800, 16000, 20000, 25600, 32000, 40000, 51200, 64000, 80000, 102400, 128000, 160000, 204800,
+};
+
+static void lp_x_ev(char * s, int n, int v)        /* EV with one decimal, sign: "+0.3", "-1.0" */
+{
+    int t = (ABS(v) * 10 + 384) / 768;
+    snprintf(s, n, "%s%d.%d", v < 0 ? "-" : "+", t / 10, t % 10);
+}
+
+static void lp_x_iso(char * s, int n, uint32_t v)  /* low 16 bits: Sv * 768 */
+{
+    v &= 0xFFFF;
+    if (!v) { snprintf(s, n, "Auto"); return; }
+    if (!(v & 0xFF) && v / 256 >= 12 && v / 256 < 12 + COUNT(lp_x_iso_vals))
+        snprintf(s, n, "ISO%d", (int) lp_x_iso_vals[v / 256 - 12]);
+    else
+        snprintf(s, n, "Sv%d.%02d", (int) (v / 768), (int) ((v % 768) * 100 / 768));
+}
+
+static void lp_x_tv(char * s, int n, int v)        /* s16 Tv * 768 */
+{
+    if (v == (int16_t) 0xDF00) { snprintf(s, n, "Bulb"); return; }
+    if (v == (int16_t) 0xDC00) { snprintf(s, n, "special"); return; }
+    int k = v / 256 + 15;
+    if (!(v & 0xFF) && k >= 0 && k < (int) COUNT(lp_x_tv_names)) snprintf(s, n, "%s", lp_x_tv_names[k]);
+    else { char e[12]; lp_x_ev(e, sizeof(e), v); snprintf(s, n, "Tv%s", e); }   /* Tv APEX, not a third step */
+}
+
+static void lp_x_av(char * s, int n, int v)        /* s16 Av * 768 */
+{
+    if (v == (int16_t) 0xDC00) { snprintf(s, n, "special"); return; }
+    int k = v / 256;
+    if (!(v & 0xFF) && k >= 0 && k < (int) COUNT(lp_x_av_names)) snprintf(s, n, "%s", lp_x_av_names[k]);
+    else { char e[12]; lp_x_ev(e, sizeof(e), v); snprintf(s, n, "Av%s", e); }
+}
+
+static void lp_x_dec(char * s, int n, int dec, uint32_t v)
+{
+    static const char * const ae[] = { "P", "Tv", "Av", "M", "B" };
+    char a[16], b[16];
+    switch (dec)
+    {
+        case LP_XD_DEC:     snprintf(s, n, "%d", (int) v); break;
+        case LP_XD_TV:      lp_x_tv(s, n, (int16_t) v); break;
+        case LP_XD_AV:      lp_x_av(s, n, (int16_t) v); break;
+        case LP_XD_ISO:     lp_x_iso(s, n, v); break;
+        case LP_XD_EV:      lp_x_ev(s, n, (int16_t) v); break;
+        case LP_XD_AE:      snprintf(s, n, "%s", v < COUNT(ae) ? ae[v] : v == 0x16 ? "A+" : v == 0x37 ? "Fv" : "?"); break;
+        case LP_XD_ISOPAIR: if (v & 0xFFFF) lp_x_iso(a, sizeof(a), v); else snprintf(a, sizeof(a), "0");   /* "Auto": PROP_ISO only */
+                            if (v >> 16) lp_x_iso(b, sizeof(b), v >> 16); else snprintf(b, sizeof(b), "0");
+                            snprintf(s, n, "%s/%s", a, b); break;
+        case LP_XD_TVPAIR:  lp_x_tv(a, sizeof(a), (int16_t) v); lp_x_tv(b, sizeof(b), (int16_t) (v >> 16));
+                            snprintf(s, n, "%s..%s", a, b); break;
+        case LP_XD_HMS:     snprintf(s, n, "%d/%d:%02d:%02d", (int) (v & 0xFF), (int) ((v >> 8) & 0xFF),   /* no comma */
+                                     (int) ((v >> 16) & 0xFF), (int) (v >> 24)); break;
+        default:            snprintf(s, n, "0x%x", (int) v); break;
+    }
+}
+
+/* n bytes at a as hex, 64 bytes per line (key@0xOFF) */
+static void lp_x_hex(struct lp_buf * b, const char * key, uint32_t a, uint32_t n)
+{
+    if (!ram_ok(a, (n + 3) & ~3u)) { lp_printf(b, "%s=invalid@0x%08x\n", key, (int) a); return; }
+    for (uint32_t o = 0; o < n; o += 64)
+    {
+        char h[132];
+        int k = 0;
+        for (uint32_t i = o; i < n && i < o + 64; i++)
+            k += snprintf(h + k, sizeof(h) - k, "%02x", (int) ((RD(a + (i & ~3u)) >> (8 * (i & 3))) & 0xFF));
+        lp_printf(b, o < 0x100 ? "%s@0x%02x=%s\n" : "%s@0x%x=%s\n", key, (int) o, h);
+    }
+}
+
+/* [base+off] s16 of a checked sheet */
+static int lp_x_s16(uint32_t base, uint32_t off) { return (int16_t) (RD(base + (off & ~3u)) >> (8 * (off & 3))); }
+
+static void lp_x_sheet(struct lp_buf * b, const char * key, uint32_t s)
+{
+    if (!ram_ok(s, LP_X_SHEET_SIZE)) { lp_bad(b, key, s); return; }
+    lp_printf(b, "%s=0x%08x,%d,0x%04x,0x%04x,0x%08x,0x%04x\n", key, (int) s, (int) RD(s + 0x008),
+        (int) (lp_x_s16(s, 0x61E) & 0xFFFF), (int) (lp_x_s16(s, 0x61C) & 0xFFFF), (int) RD(s + 0x510),
+        (int) (lp_x_s16(s, 0x4A0) & 0xFFFF));
+}
+
+/* handler value (delivered bytes, at most 4) == CC copy: 1 / 0, "na" if one of them is missing */
+static int lp_x_fi(const char * name)
+{
+    for (int i = 0; i < LP_XF_N; i++) if (!strcmp(lp_xf[i].name, name)) return i;
+    return 0;
+}
+
+static void lp_x_match(struct lp_buf * b, const char * name, int i, int field, uint32_t cc, uint32_t p, int vm)
+{
+    uint32_t v = 0;
+    if (!lp_xph_cnt[i] || !lp_x_field(field, cc, p, vm, &v)) { lp_printf(b, "expo.match.%s=na\n", name); return; }
+    uint32_t n = MIN(lp_xph_last[i].len, 4u), size = lp_xf[field].size;
+    uint32_t m = n >= 4 ? 0xFFFFFFFF : (1u << (8 * n)) - 1;
+    if (size < 4) m &= (1u << (8 * size)) - 1;
+    lp_printf(b, "expo.match.%s=%d,0x%x,0x%x\n", name, (lp_xph_last[i].w0 & m) == (v & m), (int) (lp_xph_last[i].w0 & m), (int) (v & m));
+}
+
+static void lp_x_log(struct lp_buf * b)
+{
+    char k[40], s1[24], s2[24];
+    uint32_t cc, p, v;
+    lp_uc_update();
+    int vm = lp_x_ptrs(&cc, &p);
+    uint32_t ds = RD(LP_X_DS_PTR), gp = RD(LP_GUI_PTR), ex_idx = RD(LP_X_EXACT_IDX);
+    int dsok = ram_ok(ds, LP_X_DS_SIZE), gok = ram_ok(gp, LP_X_GUI_ISO + 4);
+    lp_printf(b, "# M9.1 Tor 0: exposure values, read only; expo.cb = CC copy changes (200 ms), expo.pr = property deliveries\n");
+    lp_printf(b, "expo.on=%d\n", lp_x_on);
+    lp_printf(b, "expo.samples=%d\n", (int) lp_x_samples);
+    lp_printf(b, "expo.t0=%d\n", (int) lp_x_t0);
+    lp_printf(b, "expo.bad_cc=%d\n", (int) lp_x_bad_cc);
+    lp_printf(b, "expo.bad_p=%d\n", (int) lp_x_bad_p);
+    lp_printf(b, "expo.v=0x%x\n", vm | (dsok << 2) | ((ex_idx < LP_X_EXACT_N) << 3) | (gok << 4));
+    lp_printf(b, "expo.cc=0x%08x\n", (int) cc);
+    lp_printf(b, "expo.p=0x%08x\n", (int) p);
+    lp_printf(b, "expo.p_region=%s\n", lp_region_name(p));
+    if (vm & 1)
+        for (int i = 0; i < 5; i++)
+        {
+            snprintf(k, sizeof(k), "expo.sheet[%d]", i);
+            lp_x_sheet(b, k, RD(cc + LP_X_CC_P + 4 * i));
+        }
+    lp_printf(b, "expo.ds=0x%08x\n", (int) ds);
+    if (dsok)
+        for (int i = 0; i < 11; i++)
+        {
+            snprintf(k, sizeof(k), "expo.ds.sheet[%d]", i);
+            lp_x_sheet(b, k, RD(ds + 0x2F4 + 4 * i));
+        }
+    /* current values, raw and decoded */
+    for (int i = 1; i < LP_XF_N; i++)                     /* 0 = p: expo.p above */
+    {
+        snprintf(k, sizeof(k), "expo.%s", lp_xf[i].name);
+        if (!lp_x_field(i, cc, p, vm, &v)) { lp_printf(b, "%s=na\n", k); continue; }
+        lp_x_dec(s1, sizeof(s1), lp_xf[i].dec, v);
+        lp_printf(b, "%s=0x%x,%s\n", k, (int) v, s1);
+    }
+    lp_printf(b, "expo.sec_max=%d\n", (int) lp_x_sec_max);
+    /* Canon's Tv substitution flag and the value it substitutes */
+    {
+        uint32_t a = RD(LP_X_TVS_PTR), c = ram_ok(a, 0x648) ? RD(a + 0x644) : 0;
+        if (ram_ok(a, 0x648) && ram_ok(c, 0x14)) lp_printf(b, "expo.tvsubst=%d\n", (int) RD(c + 0x10));
+        else lp_printf(b, "expo.tvsubst=invalid(0x%08x,0x%08x)\n", (int) a, (int) c);
+        if (vm & 2) { lp_x_tv(s1, sizeof(s1), lp_x_s16(p, LP_X_TVS_SUB)); lp_printf(b, "expo.tvsubst_val=0x%04x,%s\n", (int) (lp_x_s16(p, LP_X_TVS_SUB) & 0xFFFF), s1); }
+    }
+    if (gok) { lp_x_iso(s1, sizeof(s1), RD(gp + LP_X_GUI_ISO)); lp_printf(b, "expo.gui_iso=0x%04x,%s\n", (int) (RD(gp + LP_X_GUI_ISO) & 0xFFFF), s1); }
+    else lp_bad(b, "expo.gui_iso", gp);
+    /* handler value == CC copy */
+    lp_x_match(b, "dial", LP_XPH_DIAL, lp_x_fi("dial"), cc, p, vm);
+    lp_x_match(b, "ae", LP_XPH_AE, lp_x_fi("ae"), cc, p, vm);
+    lp_x_match(b, "tv", LP_XPH_TV, lp_x_fi("tv"), cc, p, vm);
+    lp_x_match(b, "av", LP_XPH_AV, lp_x_fi("av"), cc, p, vm);
+    lp_x_match(b, "comp", LP_XPH_COMP, lp_x_fi("comp"), cc, p, vm);
+    lp_x_match(b, "drive", LP_XPH_DRIVE, lp_x_fi("drive"), cc, p, vm);
+    lp_x_match(b, "aeb", LP_XPH_AEB, lp_x_fi("aeb"), cc, p, vm);
+    lp_x_match(b, "autoiso", LP_XPH_AUTOISO, lp_x_fi("autoiso0"), cc, p, vm);
+    lp_x_match(b, "meter", LP_XPH_METER, lp_x_fi("meter"), cc, p, vm);
+    lp_x_match(b, "expsim", LP_XPH_EXPSIM, lp_x_fi("expsim"), cc, p, vm);
+    lp_x_match(b, "htp", LP_XPH_HTP, lp_x_fi("htp"), cc, p, vm);
+    /* lens buffers (Canon's master copies) */
+    lp_printf(b, "expo.lensdyn.len=%d\n", lp_xph_cnt[LP_XPH_LENSDYN] ? (int) lp_xph_last[LP_XPH_LENSDYN].len : -1);
+    lp_printf(b, "expo.lensstat.len=%d\n", lp_xph_cnt[LP_XPH_LENSSTAT] ? (int) lp_xph_last[LP_XPH_LENSSTAT].len : -1);
+    lp_x_hex(b, "expo.lensdyn", LP_X_LENSDYN, LP_X_LENSDYN_N);
+    lp_x_hex(b, "expo.lensstat", LP_X_LENSSTAT, LP_X_LENSSTAT_N);
+    /* LV ExactData ring: 20 records Bv, Tv, Av, Iso */
+    lp_printf(b, "expo.exact.idx=%d\n", (int) ex_idx);
+    for (int i = 0; i < LP_X_EXACT_N; i++)
+    {
+        uint32_t r = RD(LP_X_EXACT + 4 * i);
+        snprintf(k, sizeof(k), "expo.exact[%d]", i);
+        if (!ram_ok(r, LP_X_EXACT_SIZE)) { lp_bad(b, k, r); continue; }
+        lp_printf(b, "%s=0x%08x,0x%04x,0x%04x,0x%04x,0x%04x\n", k, (int) r, (int) (lp_x_s16(r, 0x48) & 0xFFFF),
+            (int) (lp_x_s16(r, 0x4A) & 0xFFFF), (int) (lp_x_s16(r, 0x4C) & 0xFFFF), (int) (lp_x_s16(r, 0x50) & 0xFFFF));
+    }
+    /* deliveries per id (also while the log is OFF) */
+    for (int i = 0; i < LP_XPH_N; i++)
+    {
+        snprintf(k, sizeof(k), "expo.ph[0x%08x]", (int) lp_xph_ids[i]);
+        lp_printf(b, "%s=%d,%d,%d,0x%08x,0x%08x\n", k, (int) lp_xph_cnt[i], (int) lp_xph_last[i].t, (int) lp_xph_last[i].len,
+            (int) lp_xph_last[i].w0, (int) lp_xph_last[i].w1);
+    }
+    /* ring A, oldest first */
+    uint32_t n = lp_xpr_n;
+    lp_printf(b, "expo.pr.n=%d\n", (int) n);
+    lp_printf(b, "# expo.pr[i]=t,id,len,w0,w1\n");
+    for (uint32_t i = (n > LP_XPR_N ? n - LP_XPR_N : 0); i < n; i++)
+    {
+        const struct lp_xpr * e = &lp_xpr[i % LP_XPR_N];
+        lp_printf(b, "expo.pr[%d]=%d,0x%08x,%d,0x%08x,0x%08x\n", (int) i, (int) e->t, (int) e->id, (int) e->len, (int) e->w0, (int) e->w1);
+    }
+    /* ring B, oldest first */
+    n = lp_xcb_n;
+    lp_printf(b, "expo.cb.n=%d\n", (int) n);
+    lp_printf(b, "# expo.cb[i]=t,field,old,new,old_decoded,new_decoded (na = not readable)\n");
+    for (uint32_t i = (n > LP_XCB_N ? n - LP_XCB_N : 0); i < n; i++)
+    {
+        const struct lp_xcb * e = &lp_xcb[i % LP_XCB_N];
+        int f = e->f < LP_XF_N ? e->f : 0;
+        if (e->ok_old) lp_x_dec(s1, sizeof(s1), lp_xf[f].dec, e->old); else snprintf(s1, sizeof(s1), "na");
+        if (e->ok_new) lp_x_dec(s2, sizeof(s2), lp_xf[f].dec, e->val); else snprintf(s2, sizeof(s2), "na");
+        lp_printf(b, "expo.cb[%d]=%d,%s,0x%x,0x%x,%s,%s\n", (int) i, (int) e->t, lp_xf[f].name, (int) e->old, (int) e->val, s1, s2);
+    }
+}
+
+
 /* ---- log snapshot -------------------------------------------------------- */
 #define LP_LOG_SIZE (96 * 1024)   /* M7.2a camera: up to 51.5 KB; M7.3 adds ~7 KB (QEMU), ~60 KB expected;
                                    * transient malloc, freed after the write */
@@ -1906,6 +2380,7 @@ static void lp_snapshot_do(int delay_ms)
 #ifdef CONFIG_R6_INTERVAL
     lp_iv_log(&b);
 #endif
+    lp_x_log(&b);                         /* M9.1 Tor 0 */
     int trunc = b.trunc;
     b.cap = LP_LOG_SIZE;                  /* the trailer always fits */
     lp_printf(&b, "log_truncated=%d\n", trunc);
@@ -2156,6 +2631,7 @@ static void lp_status_task(void * unused)
     int cnt = 0, tick = 0, menu_seen = 0;
     TASK_LOOP
     {
+        if (lp_x_on) lp_x_sample();      /* M9.1 Tor 0: every tick, also with the ML menu open (RAM reads only) */
         if (lp_status_on && !gui_menu_shown())
         {
             if (menu_seen || tick % LP_STATUS_FORCE_N == 0) lp_sl_force = 1;
@@ -2196,11 +2672,20 @@ void lvprobe_status_enable(int mode)
 {
     lp_status_on = COERCE(mode, 0, 2);
     lp_sl_force = 1;                     /* print every line on the next draw */
-    if (lp_status_on && !lp_status_task_started)
+    if ((lp_status_on || lp_x_on) && !lp_status_task_started)     /* M9.1: also for the expo log alone */
     {
         lp_status_task_started = 1;
         task_create("lvprobe_status", 0x1e, 0x2000, lp_status_task, 0);
     }
+}
+
+/* M9.1 (menu, QEMU test): switch the expo log; ON takes a new baseline (ring B
+ * restarts); the status task samples it, the status line keeps its mode */
+void lvprobe_expo_enable(int on)
+{
+    if (on && !lp_x_on) lp_x_reset = 1;
+    lp_x_on = on ? 1 : 0;
+    lvprobe_status_enable(lp_status_on);
 }
 
 /* QEMU test only reads it; also shown as R<n> on the status line */
@@ -2285,6 +2770,16 @@ static MENU_UPDATE_FUNC(lp_fy_update)
     if (lp_fy_msg[0]) MENU_SET_VALUE("%s", lp_fy_msg);
 }
 
+static MENU_SELECT_FUNC(lp_x_toggle)
+{
+    lvprobe_expo_enable(!lp_x_on);
+}
+
+static MENU_UPDATE_FUNC(lp_x_update)
+{
+    if (lp_x_on) MENU_SET_RINFO("%d changes", (int) lp_xcb_n);
+}
+
 static struct menu_entry lp_menu[] = {
     {
         .name   = "LV probe",
@@ -2325,6 +2820,15 @@ static struct menu_entry lp_menu[] = {
                 .update = lp_fy_update,
                 .help   = "One-shot: 32x24 FaceYuv words (Y mean as UYVY / as YUYV).",
                 .help2  = "Read-only, uncached alias; details in the next log snapshot.",
+            },
+            {
+                .name   = "Expo log",
+                .priv   = &lp_x_on,
+                .max    = 1,
+                .select = lp_x_toggle,
+                .update = lp_x_update,
+                .help   = "M9.1: exposure values (Canon's CC copies) every 200 ms, deliveries.",
+                .help2  = "Read-only; in the next Log snapshot (expo.*). Not saved: OFF at boot.",
             },
             MENU_EOL
         },

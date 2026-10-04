@@ -56,6 +56,12 @@
 #include "refresh_guard.h"      /* idx_changes: Canon repainted layer 0 */
 #include "r6_layer.h"           /* resets: layer 0 address changed */
 #include "r6_faceyuv.h"         /* M7.7: R6_FY_H / R6_FY_PITCH (waveform row bound) */
+#ifdef CONFIG_R6_GRID
+#include "r6_grid.h"            /* M9.1: grids & masks */
+#ifdef FEATURE_R6_CANON_HISTOGRAM
+#include "r6_overlays.h"        /* r6h_mode, R6H_BOX_*: the grid's exclusion rectangle */
+#endif
+#endif
 #ifdef FEATURE_HISTOGRAM
 #ifndef FEATURE_R6_CANON_HISTOGRAM
 #error "R6 M7.5: ML's histogram needs Canon's bins (r6_overlays.c)"
@@ -2158,6 +2164,20 @@ static void r6_peak_off(void)
             uint16_t * b2 = (uint16_t*)(bvram + dirty_pixels[i] + BMPPITCH);
             uint16_t * m1 = (uint16_t*)(bvram_mirror + dirty_pixels[i]);
             uint16_t * m2 = (uint16_t*)(bvram_mirror + dirty_pixels[i] + BMPPITCH);
+            #ifdef CONFIG_R6_GRID
+            if ((*m1 | *m2) & 0x8080)       /* M9.1 review: a grid / spotmeter pixel (0x80 mark) took a pixel of the dot over */
+            {
+                for (int k = 0; k < 4; k++)
+                {
+                    uint8_t * pb = bvram + dirty_pixels[i] + (k >> 1) * BMPPITCH + (k & 1);
+                    uint8_t * pm = bvram_mirror + dirty_pixels[i] + (k >> 1) * BMPPITCH + (k & 1);
+                    if (*pm & 0x80) continue;     /* theirs: pixel and mark stay */
+                    if (*pb == *pm) *pb = 0;
+                    *pm = 0;
+                }
+                continue;
+            }
+            #endif
             if (*b1 == *m1) *b1 = 0;
             if (*b2 == *m2) *b2 = 0;
             *m1 = *m2 = 0;
@@ -4556,12 +4576,54 @@ static void r6_gd_erase(void)
             #endif
             if (d & R6GD_DRAWN_HIST) bmp_fill(COLOR_EMPTY, R6_GD_HIST_X - 1, R6_GD_HIST_Y - 1, HIST_WIDTH + 2, hist_height + 2);
             if (d & R6GD_DRAWN_WFM) bmp_fill(COLOR_EMPTY, R6_GD_WFM_X - 1, R6_GD_WFM_Y - 1, WAVEFORM_WIDTH + 2, R6_GD_WFM_H + 2);
+            #ifdef CONFIG_R6_GRID
+            /* M9.1: the grid's own pixels (indexed buffer and mirror mark;
+             * clrscr_mirror_do above leaves marked pixels alone) */
+            if (d & R6GD_DRAWN_GRID) r6_grid_erase();
+            #endif
             r6_gd_st.drawn = 0;
             r6_gd_st.erase_n++;
             r6_gd_st.refresh_req++;
             ml_refresh_display_needed = 1;
         }
     )
+}
+#endif
+
+#ifdef CONFIG_R6_GRID
+/* M9.1 (platform/R6.190/r6_grid.c): one grid step, every R6_GD_GRID_MS from
+ * the overlay task, BMP_LOCK held by the caller. The ML menu and the overlay
+ * gate are checked again here, inside the lock. Exclusions: the erase / hash
+ * rectangles of the boxes that redraw when their area in ML's buffer changes
+ * (r6_grid.h): ML's histogram and waveform boxes (as in r6_gd_erase), the
+ * spotmeter (R6_SPOT_BOX in spotmeter_step; where it is drawn, else at the
+ * centre where spotmeter_step puts it on R6), "Histogram (Canon)". */
+static void r6_grid_tick(void)
+{
+    if (!lv || gui_menu_shown() || !bvram_mirror || !zebra_should_run()) return;
+    struct r6_grid_rect ex[R6_GRID_NEXCL];
+    int n = 0;
+    #define R6GR_EX(x, y, w, h) do { ex[n].x0 = (x); ex[n].y0 = (y); ex[n].x1 = (x) + (w); ex[n].y1 = (y) + (h); n++; } while (0)
+    #ifdef FEATURE_HISTOGRAM
+    if (hist_draw) R6GR_EX(R6_GD_HIST_X - 1, R6_GD_HIST_Y - 1, HIST_WIDTH + 2, hist_height + 2);
+    #endif
+    #ifdef FEATURE_WAVEFORM
+    if (waveform_draw) R6GR_EX(R6_GD_WFM_X - 1, R6_GD_WFM_Y - 1, WAVEFORM_WIDTH + 2, R6_GD_WFM_H + 2);
+    #endif
+    #ifdef FEATURE_SPOTMETER
+    if (spotmeter_draw)
+    {
+        int xc = spotmeter_dirty ? spot_prev_xcb : os.x0 + os.x_ex / 2;
+        int yc = spotmeter_dirty ? spot_prev_ycb : os.y0 + os.y_ex / 2;
+        int dx = spotmeter_formula == 2 ? 52 : 26;
+        R6GR_EX(xc - dx - 4, (yc & ~1) - 13, 2 * dx + 12, 51);
+    }
+    #endif
+    #ifdef FEATURE_R6_CANON_HISTOGRAM
+    if (r6h_mode) R6GR_EX(R6H_BOX_X0, R6H_BOX_Y0, R6H_BOX_X1 - R6H_BOX_X0, R6H_BOX_Y1 - R6H_BOX_Y0);
+    #endif
+    #undef R6GR_EX
+    if (r6_grid_step(ex, n)) { r6_gd_st.refresh_req++; ml_refresh_display_needed = 1; }
 }
 #endif
 
@@ -4691,6 +4753,17 @@ livev_hipriority_task( void* unused )
                 r6_evf_seen = r6_gd_evf;
                 vram_params_set_dirty();    /* M7.7: os.y0 / bm2lv follow the screen (src/vram.c) */
             }
+        }
+        #endif
+        #ifdef CONFIG_R6_GRID
+        /* M9.1: grids & masks before the other overlays (their mirror marks
+         * keep zebras / false color / peaking off the lines); a repair only
+         * unless the settings, the screen or an exclusion changed */
+        if (r6_grid_wanted() || r6_grid_stats()->drawn)     /* review: OFF and erased: no lock, no step */
+        {
+            static int r6_gr_aux = 0;
+            if (should_run_polling_action(R6_GD_GRID_MS, &r6_gr_aux))
+                BMP_LOCK( r6_grid_tick(); )
         }
         #endif
         #if 0

@@ -52,7 +52,7 @@ enum r6_iv_cam {
     /* M8.2 */
     R6IV_CAM_CC_MECHA,       /* [p+0x92C] (PROP_MECHALESS 0x80020061) != 0: SW2 OFF in state 5 would be RELEASE_STOP */
     R6IV_CAM_CC_ITIMER,      /* byte [p+0x50A] (0x8004005A, [I] Canon's interval timer) != 0 */
-    R6IV_CAM_CC_FBRK,        /* byte [p+0x634] (0x80040064, [I] focus bracketing) != 0 */
+    R6IV_CAM_CC_FBRK,        /* byte [p+0x634] (0x80040064, a Canon timer setting: h:m:s at +1..+3) != 0 */
     R6IV_CAM_INTERVAL,       /* Start only: interval < Tv + 2 s (r6_interval.c iv_interval_fit) */
     R6IV_NCAMS
 };
@@ -77,7 +77,7 @@ enum r6_iv_canon {
     R6IV_CANON_SWHELD,       /* a shutter byte set, SW events pending / working, or the self-release macro in flight */
     R6IV_CANON_RELSEQ,       /* Canon's release sequence running ([0x108AC] / [cc+0xB54]) */
     R6IV_CANON_CCSTATE,      /* CC not idle in LV still (table, LV kind, shoot type, dispatch, state 1 / 3, torn read) */
-    R6IV_CANON_CCFLAG,       /* M8.2: [cc+0xB98] or [cc+0x830] != 0 (Canon's focus bracketing / interval timer flags) */
+    R6IV_CANON_CCFLAG,       /* M8.2: [cc+0xB98] or [cc+0x830] != 0 (set by the [p+0x634] timer setting / the interval timer) */
     R6IV_NCANON
 };
 
@@ -208,7 +208,7 @@ struct r6_iv_cc {
     /* M8.2 */
     uint32_t p_lenr;         /* [p+0x54C] long exposure NR 0x80000048 [V id, I values] */
     uint32_t p_itimer;       /* byte [p+0x50A] 0x8004005A [I interval timer] */
-    uint32_t p_fbrk;         /* byte [p+0x634] 0x80040064 [I focus bracketing] */
+    uint32_t p_fbrk;         /* byte [p+0x634] 0x80040064 (timer setting, h:m:s at +1..+3; log key name kept) */
     uint32_t b98;            /* [cc+0xB98] */
     uint32_t c830;           /* [cc+0x830] */
     uint32_t r5f8;           /* [cc+0x5F8] (log only) */
@@ -334,7 +334,9 @@ void r6_iv_budget(int * tv_ub, int * busy, int * need, int * need_nr, int * fit)
 #define R6IV_P_LENR          0x54C     /* CC copy of 0x80000048, long exposure NR (CC master table; ATest get / set
                                         * 0xE06569EA / 0xE065699E) [V id, I values 0 / 1 / 2] */
 #define R6IV_P_FBRK_W        0x634     /* word holding byte 0x634 (byte 0) = CC copy of 0x80040064: != 0 sets
-                                        * [cc+0xB98] = 1 (ldrb 0xE0643EBA, str 0xE0643ED2) [V code, I "focus bracketing"] */
+                                        * [cc+0xB98] = 1 (ldrb 0xE0643EBA, str 0xE0643ED2) [V code]; M9.1: it carries
+                                        * h:m:s at +1..+3 (0xE0643E78, 0xE070D602), i.e. a timer setting; the M8.2 name
+                                        * "focus bracketing" is doubtful (texts renamed, the gate is unchanged) */
 #define R6IV_P_92C           0x92C     /* CC copy of PROP_MECHALESS 0x80020061 (CC table idx 332 {0x34FC, 0x92C, 4}) [V id];
                                         * SW2 OFF in state 5 (0xE05E3498): RELEASE_STOP if 1, else deferred to state 6 [V] */
 #define R6IV_CC_B98          0xB98     /* SW1 OFF in state 5 (0xE05E3094): == 1 runs the state-6 handler 0xE05E2FE6 at once

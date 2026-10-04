@@ -48,6 +48,15 @@ struct r6_overlay_stats
 const struct r6_overlay_stats * r6_overlay_stats(void);
 const char * r6_overlay_reason(uint32_t state);
 
+/* M9.1: the setting (0 OFF, 1 Luma, 2 RGB) and the box with its frame in ML
+ * coordinates (x1 / y1 exclusive; r6_overlays.c checks them against R6H_*),
+ * for the grid's exclusion rectangle (src/zebra.c r6_grid_tick) */
+extern int r6h_mode;
+#define R6H_BOX_X0  572
+#define R6H_BOX_Y0  50
+#define R6H_BOX_X1  704
+#define R6H_BOX_Y1  118
+
 /* M7.5: ML's own histogram (src/zebra.c hist_build, FEATURE_HISTOGRAM) from
  * Canon's LV histogram bins instead of a pixel loop over FaceYuv. Same reads
  * and checks as the "Histogram (Canon)" box (DISP set 0/1, every used array

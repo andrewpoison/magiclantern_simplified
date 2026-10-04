@@ -60,6 +60,7 @@ extern int r6_gd_evf;               /* r6_gdraw.c: 1 = the last screen check saw
 #define R6_GD_PEAK_MS     250       /* M7.6: focus peaking at most 4 x per second (ML default: every 2nd frame);
                                      * ~57600 FaceYuv samples (y step 3, x step 2), 5 uncached reads each */
 #define R6_GD_RESHOW_MS   500       /* after Canon repainted layer 0 (VMIX index changed): re-show ML's pixels, at most 2 x per second */
+#define R6_GD_GRID_MS     250       /* M9.1: grid step (r6_grid.c): draw on a change, else repair only */
 #define R6_GD_CAP_DUTY    10        /* conversion cap: wait 10 x the last conversion time (~10 % of a core) */
 #define R6_GD_CAP_MAX_MS  2000      /* ... but at most 2 s */
 
@@ -132,7 +133,7 @@ struct r6_gd_stats
     uint32_t movie_sm, movie_lvms;   /* movie mode blocks by is_movie_mode() / by PROP_LV_MOVIE_SELECT */
     int32_t  shooting_mode, lv_movie_select;   /* last values seen by the gate */
     uint32_t reshow;                 /* of these: after Canon repainted layer 0 (VMIX index change, refresh_guard.c) */
-    uint32_t drawn;                  /* bit 0 zebra/false color/peaking (mirror), 1 histogram, 2 waveform, 3 spotmeter */
+    uint32_t drawn;                  /* bit 0 zebra/false color/peaking (mirror), 1 histogram, 2 waveform, 3 spotmeter, 4 grid (M9.1) */
     /* M7.6 */
     uint32_t evf_ok;                 /* screen checks passed on the EVF */
     uint32_t evf_switch;             /* LCD <-> EVF band changes seen by the overlay task (overlays erased once) */
@@ -152,5 +153,6 @@ extern struct r6_gd_stats r6_gd_st;
 #define R6GD_DRAWN_HIST   2
 #define R6GD_DRAWN_WFM    4
 #define R6GD_DRAWN_SPOT   8
+#define R6GD_DRAWN_GRID   16        /* M9.1: grids & masks (r6_grid.c), erased by r6_gd_erase as well */
 
 #endif
