@@ -5691,6 +5691,12 @@ static void menu_open()
     if (menu_shown)
         return;
 
+#ifdef CONFIG_R6_INTERVAL
+    /* R6 M8.2: no SetGUIRequestMode(0x2003) while R6 Interval takes a picture (exposure + NR up to ~65 s) */
+    extern int r6_iv_menu_block(void);
+    if (r6_iv_menu_block()) return;
+#endif
+
     DryosDebugMsg(0, 15, "in menu_open");
     
     // start in my menu, if configured

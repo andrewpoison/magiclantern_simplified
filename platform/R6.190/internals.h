@@ -125,7 +125,9 @@
  * "R6 Interval" (r6_interval.c) takes pictures from its own task through the
  * two CameraConductor shutter callbacks (SW1 / SW2, as the MPU interrupt
  * calls them), nothing else new (no property write, no other Canon call, no
- * MMIO, no file). Only M, Tv <= 1 s, single shot, MF, at most 50 pictures;
+ * MMIO, no file). M8.2: src/menu.c menu_open() keeps the ML menu closed while
+ * a picture runs (r6_iv_menu_block). Only M, Tv <= 30 s (no Bulb), single
+ * shot, MF, no Canon interval timer / bracketing, at most 50 pictures;
  * every press checks Canon's state first (RAM reads) and every picture is
  * verified (counter / file number, Canon's job count back to 0, CC idle),
  * else the series stops. Never saved as running, never started at boot.

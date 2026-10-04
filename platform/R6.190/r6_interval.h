@@ -1,7 +1,7 @@
 #ifndef _r6_interval_h_
 #define _r6_interval_h_
 
-/* R6.190 M8.0 / M8.1: interval release ("R6 Interval", r6_interval.c) */
+/* R6.190 M8.0 / M8.1 / M8.2: interval release ("R6 Interval", r6_interval.c) */
 
 #include <stdint.h>
 
@@ -38,16 +38,22 @@ enum r6_iv_cam {
     R6IV_CAM_OK = 0,
     R6IV_CAM_MOVIE,          /* movie mode (is_movie_mode / PROP_LV_MOVIE_SELECT) */
     R6IV_CAM_MODE,           /* shooting mode not M (Tv mode: Canon's safety shift can lengthen the exposure) */
-    R6IV_CAM_TV,             /* Tv (PROP_SHUTTER as delivered) unknown or longer than 1 s */
+    R6IV_CAM_TV,             /* Tv (PROP_SHUTTER as delivered) unknown, longer than 30 s or Bulb (M8.2; M8.1: 1 s) */
     R6IV_CAM_DRIVE,          /* drive mode not single shot */
     R6IV_CAM_FOCUS,          /* not MF ((af_mode & 0xF) != 3) */
     R6IV_CAM_CARD,           /* no card / card full (avail_shot == 0) */
     R6IV_CAM_AEB,            /* exposure bracketing on (PROP_AEB step != 0): lengthens Tv in M */
-    /* M8.1: CameraConductor's own copies [I]; gate only with R6IV_GATE_CC_SETTINGS 1 (0 in this build: logged) */
-    R6IV_CAM_CC_MODE,        /* [[cc+0x34FC]+8] != 3 (M) */
-    R6IV_CAM_CC_DRIVE,       /* [[cc+0x34FC]+0x4C0] != 0 (single) */
-    R6IV_CAM_CC_BULB,        /* (u16) [[cc+0x34FC]+0x61E] == 0xDF00 (Bulb) */
+    /* CameraConductor's own copies (ids [V]: CC master table 0xE0FE3344), p = [cc+0x34FC]; gated since M8.2
+     * (R6IV_GATE_CC_SETTINGS 1), only while cc is valid (an invalid cc is the Canon check's CCPTR) */
+    R6IV_CAM_CC_MODE,        /* p not readable, or [p+8] (AE 0x80000001) != 3 (M) */
+    R6IV_CAM_CC_DRIVE,       /* [p+0x4C0] (drive 0x80000003) != 0 (single) */
+    R6IV_CAM_CC_BULB,        /* (s16) [p+0x61E] (PROP_SET_TV 0x80000005) not a Tv of 30 s .. 1/16000 (Bulb 0xDF00 / 0xDC00) */
     R6IV_CAM_CC_AF,          /* [cc+0x2C0] == 1 (AF active) */
+    /* M8.2 */
+    R6IV_CAM_CC_MECHA,       /* [p+0x92C] (PROP_MECHALESS 0x80020061) != 0: SW2 OFF in state 5 would be RELEASE_STOP */
+    R6IV_CAM_CC_ITIMER,      /* byte [p+0x50A] (0x8004005A, [I] Canon's interval timer) != 0 */
+    R6IV_CAM_CC_FBRK,        /* byte [p+0x634] (0x80040064, [I] focus bracketing) != 0 */
+    R6IV_CAM_INTERVAL,       /* Start only: interval < Tv + 2 s (r6_interval.c iv_interval_fit) */
     R6IV_NCAMS
 };
 
@@ -71,6 +77,7 @@ enum r6_iv_canon {
     R6IV_CANON_SWHELD,       /* a shutter byte set, SW events pending / working, or the self-release macro in flight */
     R6IV_CANON_RELSEQ,       /* Canon's release sequence running ([0x108AC] / [cc+0xB54]) */
     R6IV_CANON_CCSTATE,      /* CC not idle in LV still (table, LV kind, shoot type, dispatch, state 1 / 3, torn read) */
+    R6IV_CANON_CCFLAG,       /* M8.2: [cc+0xB98] or [cc+0x830] != 0 (Canon's focus bracketing / interval timer flags) */
     R6IV_NCANON
 };
 
@@ -93,9 +100,9 @@ struct r6_iv_shot {
     uint16_t sw1_ms;         /* SW1 ON -> taken (state 2 or [cc+0xA68] bit 1); 0xFFFF = not taken */
     uint16_t acc_ms;         /* SW2 ON -> first 'accepted' signal; 0xFFFF = none */
     uint16_t off_ms;         /* SW2 hold (SW2 ON -> OFFs) */
-    uint16_t seq_ms;         /* OFFs -> Canon idle again; 0xFFFF = not idle */
     uint8_t  off_why;        /* why the OFFs went out (r6_interval.c IV_WHY_*) */
     uint8_t  off_state;      /* CC state when the OFFs went out */
+    uint32_t seq_ms;         /* OFFs -> Canon idle again; 0xFFFFFFFF = not idle (M8.2: 32 bit, log -1) */
     uint16_t states;         /* bit s = CC state s seen during the picture (0..15) */
     int16_t  d_rel;          /* RAM release counter delta; -32768 = not used */
     int16_t  d_jid;          /* [0x9DB8] delta */
@@ -104,7 +111,17 @@ struct r6_iv_shot {
     uint8_t  late;           /* late-watch mask (after a timeout OFF) */
     uint8_t  second;         /* 1 = a second release seen after Canon was idle */
     uint16_t final;          /* failed final checks (bits, r6_interval.c IV_FIN_*) */
-    uint16_t pad;
+    /* M8.2 (long Tv) */
+    int16_t  tv;             /* PROP Tv (EV * 768) at the pre-SW2 check; -32768 = not read */
+    int16_t  tv_cc;          /* CC copy (s16) [p+0x61E] at the pre-SW2 check; -32768 = not read */
+    uint8_t  r92c;           /* [p+0x92C] (PROP_MECHALESS) at the pre-SW2 check */
+    uint8_t  nr;             /* low byte of [p+0x54C] (long exposure NR) */
+    uint8_t  cflag;          /* [cc+0xB98] | [cc+0x830] << 1 */
+    uint8_t  pad2;
+    uint32_t busy;           /* ms added to the SEQ / PIC / JOB budgets (2 x Tv bound for Tv >= 1 s, else 0) */
+    uint32_t s5_ms;          /* SW1 ON -> first state 5 seen; 0 = none */
+    uint32_t exp_ms;         /* first state 5 -> first state 6 seen; 0 = none */
+    int32_t  slot_late;      /* SW1 ON - slot (ms); 0 for "Test: 1 picture" */
 };
 
 struct r6_iv_stats {
@@ -127,6 +144,8 @@ struct r6_iv_stats {
     int test;                /* 1 = the last / current run is "Test: 1 picture" */
     int cnt_last;            /* total_shots_count / file number after ML's last picture (or at the start) */
     int fn_last;
+    /* M8.2 */
+    uint32_t menu_blocked;   /* ML menu opens refused while a picture runs (r6_iv_menu_block, src/menu.c) */
 };
 
 /* M8.1: one read-only snapshot of the CameraConductor and the switch path (r6_interval.c iv_cc_read) */
@@ -164,11 +183,11 @@ struct r6_iv_cc {
     uint32_t a6c;            /* [cc+0xA6C] */
     uint32_t b54;            /* [cc+0xB54] */
     uint32_t bfc;            /* [cc+0xBFC] */
-    uint32_t p;              /* [cc+0x34FC] */
-    uint32_t p_ae;           /* [p+0x008] [I] */
-    uint32_t p_drive;        /* [p+0x4C0] [I] */
-    uint32_t p_tv;           /* (u16) [p+0x61E] [I] */
-    uint32_t p_92c;          /* [p+0x92C] */
+    uint32_t p;              /* [cc+0x34FC]; M8.2: read with r6_fy_ram_ok (cached RAM or the verified uncached alias) */
+    uint32_t p_ae;           /* [p+0x008] AE mode 0x80000001 [V id] */
+    uint32_t p_drive;        /* [p+0x4C0] drive 0x80000003 [V id] */
+    uint32_t p_tv;           /* (u16) [p+0x61E] PROP_SET_TV 0x80000005 [V id] */
+    uint32_t p_92c;          /* [p+0x92C] PROP_MECHALESS 0x80020061 [V id] */
     uint32_t swhack_q;       /* [0x1E43C] */
     uint32_t relseq;         /* [0x108AC] */
     uint32_t relcb;          /* [0x108A8] */
@@ -186,12 +205,21 @@ struct r6_iv_cc {
     int tsc;                 /* total_shots_count (ML) */
     int fn;                  /* file number (ML) */
     int gui;                 /* CURRENT_GUI_MODE */
+    /* M8.2 */
+    uint32_t p_lenr;         /* [p+0x54C] long exposure NR 0x80000048 [V id, I values] */
+    uint32_t p_itimer;       /* byte [p+0x50A] 0x8004005A [I interval timer] */
+    uint32_t p_fbrk;         /* byte [p+0x634] 0x80040064 [I focus bracketing] */
+    uint32_t b98;            /* [cc+0xB98] */
+    uint32_t c830;           /* [cc+0x830] */
+    uint32_t r5f8;           /* [cc+0x5F8] (log only) */
+    int lv;                  /* r6_interval.c iv_t_lv >= 0 (Canon LV running) */
+    int gstate;              /* gui_state */
 };
 
 /* M8.1: detail of the last picture (reset at every SW1 ON, kept until the next one) */
-#define R6IV_TRACE 48
+#define R6IV_TRACE 64                    /* M8.2: 48 -> 64 */
 #define R6IV_PTRACE 64
-struct r6_iv_tr { uint16_t dt; char code; char pad; uint32_t v; };
+struct r6_iv_tr { uint32_t dt; uint32_t v; char code; char pad[3]; };   /* M8.2: dt 32 bit (ms since SW1 ON) */
 struct r6_iv_ptr { uint32_t t; char code; char pad[3]; uint32_t v; };
 struct r6_iv_last {
     struct r6_iv_cc pre, off, post;  /* before SW1 ON, when the OFFs went out, after the settle */
@@ -215,6 +243,11 @@ void r6_iv_cc_read(struct r6_iv_cc * s); /* M8.1: one read-only snapshot (no Can
 int r6_iv_press_info(uint32_t n[4], uint32_t * refused);  /* returns ML's held switches (bit 1 SW1, 2 SW2), must be 0 */
 int r6_iv_ptrace(int i, struct r6_iv_ptr * e);   /* passive trace, i = 0 oldest; returns the count (<= R6IV_PTRACE) */
 int r6_iv_gate_cc_settings(void);      /* R6IV_GATE_CC_SETTINGS */
+/* M8.2 */
+int r6_iv_tv_min(void);                /* R6IV_TV_EV768_MIN (EV * 768 of the longest Tv allowed, 30 s) */
+int r6_iv_menu_block(void);            /* src/menu.c menu_open(): 1 = a picture is running (counts the attempt) */
+void r6_iv_budget(int * tv_ub, int * busy, int * need, int * need_nr, int * fit);   /* for the log: Tv bound (ms,
+                                        * -1 = no Tv), budget add-on, interval need / NR need (ms), interval fit 0 / 1 / 2 */
 
 /* Canon RAM read by r6_interval.c (read-only) */
 #define R6IV_RAM_JOBCNT    0x9DC0      /* live job count [0x9D9C+0x24]: CreateJob checks it (cbz 0xE07C9E5E),
@@ -291,10 +324,24 @@ int r6_iv_gate_cc_settings(void);      /* R6IV_GATE_CC_SETTINGS */
 #define R6IV_CC_B54          0xB54     /* 1 from ActReleaseSequenceStart (0xE031DD14) to ActRelSeqComp (0xE031E15A) */
 #define R6IV_CC_BFC          0xBFC     /* re-post builder gate */
 #define R6IV_CC_P            0x34FC    /* p: CC copies of the settings [I] */
-#define R6IV_P_AE            0x008     /* AE mode (3 = M) [I] */
-#define R6IV_P_DRIVE         0x4C0     /* drive (0 = single) [I] */
-#define R6IV_P_TV_W          0x61C     /* word holding the u16 Tv at 0x61E (0xDF00 = Bulb) [I] */
-#define R6IV_P_92C           0x92C     /* SW2 OFF in state 5: RELEASE_STOP if 1, else deferred [V] use */
+#define R6IV_P_AE            0x008     /* CC copy of AE mode 0x80000001 (3 = M) (CC master table 0xE0FE3344) [V id] */
+#define R6IV_P_DRIVE         0x4C0     /* CC copy of drive 0x80000003 (0 = single) [V id] */
+#define R6IV_P_TV_W          0x61C     /* word holding the s16 CC copy of PROP_SET_TV 0x80000005 at 0x61E (EV * 768,
+                                        * 0xDF00 / 0xDC00 = Bulb; state 12 for AE 3 with 0xDF00, 0xE031D82A..0xE031D84E) [V id] */
+#define R6IV_P_ITIMER_W      0x508     /* word holding byte 0x50A (byte 2) = CC copy of 0x8004005A: != 0 makes
+                                        * JudgeIntervalTimerShooting 0xE0643C82 (ldrb 0xE0643C9E, from 0xE031DD90 at the
+                                        * start of the release sequence) set [cc+0x830] = 1 [V code, I "interval timer"] */
+#define R6IV_P_LENR          0x54C     /* CC copy of 0x80000048, long exposure NR (CC master table; ATest get / set
+                                        * 0xE06569EA / 0xE065699E) [V id, I values 0 / 1 / 2] */
+#define R6IV_P_FBRK_W        0x634     /* word holding byte 0x634 (byte 0) = CC copy of 0x80040064: != 0 sets
+                                        * [cc+0xB98] = 1 (ldrb 0xE0643EBA, str 0xE0643ED2) [V code, I "focus bracketing"] */
+#define R6IV_P_92C           0x92C     /* CC copy of PROP_MECHALESS 0x80020061 (CC table idx 332 {0x34FC, 0x92C, 4}) [V id];
+                                        * SW2 OFF in state 5 (0xE05E3498): RELEASE_STOP if 1, else deferred to state 6 [V] */
+#define R6IV_CC_B98          0xB98     /* SW1 OFF in state 5 (0xE05E3094): == 1 runs the state-6 handler 0xE05E2FE6 at once
+                                        * instead of deferring; set by the [p+0x634] path 0xE0643ED2 [V] */
+#define R6IV_CC_C830         0x830     /* JudgeIntervalTimerShooting fShooting: set to 1 at 0xE0643CB0 [V] */
+#define R6IV_CC_R5F8         0x5F8     /* SW1 OFF in state 5: == 1 sets [cc+0xBB8] (0xE05E30A4); the [p+0x634] path
+                                        * sets [cc+0xB98] only while it is 0 (0xE0643EC2) [V]; log only */
 #define R6IV_LV_STILL_TABLE  0xE1C399DC /* LV still state table (CC state rows 0xE1C3609C .. 0xE1C3615C) */
 #define R6IV_SW_EVENT_MASK   0x3C00    /* class-2 bits 0x400 SW1 ON, 0x800 SW1 OFF, 0x1000 SW2 ON, 0x2000 SW2 OFF */
 #define R6IV_SWMGR_SIZE      0x10      /* [mgr] arr, [mgr+4] sts, [mgr+0xC] hook */
