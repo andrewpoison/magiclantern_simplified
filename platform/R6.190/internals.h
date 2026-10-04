@@ -126,8 +126,9 @@
  * two CameraConductor shutter callbacks (SW1 / SW2, as the MPU interrupt
  * calls them), nothing else new (no property write, no other Canon call, no
  * MMIO, no file). M8.2: src/menu.c menu_open() keeps the ML menu closed while
- * a picture runs (r6_iv_menu_block). Only M, Tv <= 30 s (no Bulb), single
- * shot, MF, no Canon interval timer / timer setting 0x80040064, at most 50 pictures;
+ * a picture runs (r6_iv_menu_block). Only M with Tv <= 30 s, or B with Canon's
+ * bulb timer 31..60 s (M9.2), single shot, MF, no Canon interval timer / timer
+ * setting 0x80040064, at most 50 pictures;
  * every press checks Canon's state first (RAM reads) and every picture is
  * verified (counter / file number, Canon's job count back to 0, CC idle),
  * else the series stops. Never saved as running, never started at boot.

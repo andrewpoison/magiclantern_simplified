@@ -24,6 +24,9 @@
  *    -30..449 there, r6_gdraw.h / src/vram.c)
  *  - LiveViewApp dialog (0x1624C) != 0
  *  - a verified FaceYuv frame (r6_fy_lv_frame via get_yuv422_vram)
+ *  - M9.2: no bulb picture of R6 Interval running (r6_iv_bulb_running; also
+ *    after its overrun stop while Canon's bulb runs): Canon shows no live
+ *    image, ML would draw on a stale frame. The user's own bulb does not pause.
  * Same rules as the M7.3 histogram overlay (r6_overlays.c). RAM reads only,
  * every pointer checked (r6_fy_ram_ok); nothing written, no Canon call.
  */
@@ -37,6 +40,9 @@
 #include "vram.h"
 #include "r6_faceyuv.h"
 #include "r6_gdraw.h"
+#ifdef CONFIG_R6_INTERVAL
+#include "r6_interval.h"           /* M9.2: r6_iv_bulb_running */
+#endif
 
 #ifdef CONFIG_R6_GLOBAL_DRAW
 
@@ -97,6 +103,7 @@ int r6_gd_evf = 0;
 static const char * const gd_names[R6GD_NREASONS] = {
     "drawn", "Canon LV off", "Canon GUI mode", "GUI state", "INFO/settings screen",
     "display off", "not LCD/EVF", "no LV dialog", "no FaceYuv frame", "movie mode", "EVF layout",
+    "ML bulb picture",
 };
 
 const char * r6_gd_reason(int r)
@@ -108,6 +115,9 @@ static int gd_check(void)
 {
     uint32_t v = 1;
     int len = 0;
+#ifdef CONFIG_R6_INTERVAL
+    if (r6_iv_bulb_running()) return R6GD_ML_BULB;          /* M9.2: erase and stop during ML's bulb */
+#endif
     if (!lv_action_raw_get(&v, &len) || len != 4 || v != 0) return R6GD_NO_LV;
     if (CURRENT_GUI_MODE != 0) return R6GD_GUI;
     r6_gd_st.shooting_mode = shooting_mode;

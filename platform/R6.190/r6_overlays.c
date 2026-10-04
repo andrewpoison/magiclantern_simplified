@@ -63,6 +63,9 @@
 #include "propvalues.h"
 #include "tasks.h"
 #include "r6_overlays.h"
+#ifdef CONFIG_R6_INTERVAL
+#include "r6_interval.h"           /* M9.2: r6_iv_bulb_running */
+#endif
 
 #ifdef FEATURE_R6_CANON_HISTOGRAM
 
@@ -83,7 +86,7 @@ extern int lv_action_raw_get(uint32_t * value, int * len);   /* propvalues.c */
 #define OV_DTS           0x1200C   /* DataStore: +0x10 use working copy, +0x1C ring index (0xE079D026) */
 #define OV_RD_WORK       0x131B70  /* RandomData working copy */
 #define OV_RD_RING       0x132A70  /* published RandomData pointers */
-#define OV_RD_RING_N     8
+#define OV_RD_RING_N     20        /* M9.2: 20 slots: ring step mod 0x14 (0xE079C69E); camera index 0..0x13; lvprobe.c LP_RD_RING_N */
 #define OV_RD_SIZE       0xF00
 #define OV_MEMIF_WIN     0x1355A4  /* RAM copy of the static memif windows, [11] = copied flag */
 #define OV_DISPDEV_PTR   0xEA40    /* [[0xEA40]+0x18] = display mask (0xE01694C8) */
@@ -125,7 +128,7 @@ static int r6h_force = 1;                   /* next draw repaints the whole box 
 static const char * const r6h_names[R6H_NREASONS] = {
     "shown", "off", "no LV", "ML menu", "Canon GUI", "OLC", "display off", "not LCD",
     "no LV dialog", "no hist set", "bad pointer", "sum != numPix", "no FrameNum", "stale",
-    "ML histogram on", "torn",
+    "ML histogram on", "torn", "ML bulb picture",
 };
 
 const char * r6_overlay_reason(uint32_t s)
@@ -209,6 +212,9 @@ static int r6h_gui_state(void)
 {
     if (!r6h_mode) return R6H_OFF;
     if (gui_menu_shown()) return R6H_MENU;
+#ifdef CONFIG_R6_INTERVAL
+    if (r6_iv_bulb_running()) return R6H_ML_BULB;           /* M9.2: no live image during ML's bulb */
+#endif
 #ifdef FEATURE_HISTOGRAM
     /* M7.4: ML's own histogram (Overlay > Global Draw + Histogram) uses the
      * same box position: only one of them at a time. Only when ML's can

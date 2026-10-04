@@ -25,6 +25,7 @@ enum {
     R6H_STALE,       /* FrameNum unchanged for 1 s */
     R6H_MLHIST,      /* M7.4: ML's own histogram (Global Draw) is enabled: same box position */
     R6H_TORN,        /* M7.5 (ML histogram only): the published set changed during every copy attempt */
+    R6H_ML_BULB,     /* M9.2: R6 Interval's bulb picture runs (r6_iv_bulb_running): no live image */
     R6H_NREASONS
 };
 

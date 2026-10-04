@@ -1,7 +1,7 @@
 #ifndef _r6_interval_h_
 #define _r6_interval_h_
 
-/* R6.190 M8.0 / M8.1 / M8.2: interval release ("R6 Interval", r6_interval.c) */
+/* R6.190 M8.0 / M8.1 / M8.2 / M9.2: interval release ("R6 Interval", r6_interval.c); M9.2: B with Canon's bulb timer */
 
 #include <stdint.h>
 
@@ -30,6 +30,13 @@ enum r6_iv_stop {
     R6IV_STOP_SEQ,           /* M8.1: Canon's release sequence not idle again (stop_val = failed idle bits) */
     R6IV_STOP_CCSTATE,       /* M8.1: Canon state after the picture not as expected (stop_val = final bits) */
     R6IV_STOP_FOREIGN,       /* M8.1: a picture that ML did not take, between two slots (stop_val = delta) */
+    R6IV_STOP_BULB_NOTIMER,  /* M9.2: bulb without Canon's timer (no BA0 / timer A seen within R6IV_BULB_CLASS_MS;
+                              * ML's SW1 OFF ended it at once: a very short frame; stop_val = d30_ms) */
+    R6IV_STOP_BULB_EARLY,    /* M9.2: bulb ended before T - R6IV_BULB_EARLY_MS (user's full press or Canon; stop_val = d30_ms) */
+    R6IV_STOP_BULB_OVERRUN,  /* M9.2: bulb still running at T + R6IV_BULB_OVER_MS, or at the 3 s check nothing that could
+                              * end it (timer A / B 0 and BA0 0 or seconds 0, review F1); stopped at once, no call
+                              * (stop_val = d30_ms) */
+    R6IV_STOP_BULB_NOT12,    /* M9.2: B mode, but Canon did not start a bulb (state 5 / 6 / sequence end; stop_val = off_state) */
     R6IV_NSTOPS
 };
 
@@ -37,8 +44,9 @@ enum r6_iv_stop {
 enum r6_iv_cam {
     R6IV_CAM_OK = 0,
     R6IV_CAM_MOVIE,          /* movie mode (is_movie_mode / PROP_LV_MOVIE_SELECT) */
-    R6IV_CAM_MODE,           /* shooting mode not M (Tv mode: Canon's safety shift can lengthen the exposure) */
-    R6IV_CAM_TV,             /* Tv (PROP_SHUTTER as delivered) unknown, longer than 30 s or Bulb (M8.2; M8.1: 1 s) */
+    R6IV_CAM_MODE,           /* shooting mode not M or B (Tv mode: Canon's safety shift can lengthen the exposure);
+                              * M9.2 review F2: also a series whose mode changed since its start (stop_val = new mode) */
+    R6IV_CAM_TV,             /* M: Tv (PROP_SHUTTER as delivered) unknown, longer than 30 s or Bulb (M8.2; M8.1: 1 s) */
     R6IV_CAM_DRIVE,          /* drive mode not single shot */
     R6IV_CAM_FOCUS,          /* not MF ((af_mode & 0xF) != 3) */
     R6IV_CAM_CARD,           /* no card / card full (avail_shot == 0) */
@@ -53,7 +61,17 @@ enum r6_iv_cam {
     R6IV_CAM_CC_MECHA,       /* [p+0x92C] (PROP_MECHALESS 0x80020061) != 0: SW2 OFF in state 5 would be RELEASE_STOP */
     R6IV_CAM_CC_ITIMER,      /* byte [p+0x50A] (0x8004005A, [I] Canon's interval timer) != 0 */
     R6IV_CAM_CC_FBRK,        /* byte [p+0x634] (0x80040064, a Canon timer setting: h:m:s at +1..+3) != 0 */
-    R6IV_CAM_INTERVAL,       /* Start only: interval < Tv + 2 s (r6_interval.c iv_interval_fit) */
+    R6IV_CAM_INTERVAL,       /* Start only: interval < Tv + 2 s (r6_interval.c iv_interval_fit; B: bulb time + 2 s) */
+    /* M9.2 (B with Canon's bulb timer; BULB_BUSY also in M, skeptic C1) */
+    R6IV_CAM_TVB,            /* B: PROP_SHUTTER not delivered as 2 bytes 0xDF00 */
+    R6IV_CAM_CC_NOTB,        /* B: p not readable or [p+8] (AE) != 4 */
+    R6IV_CAM_CC_TVB,         /* B: (s16) [p+0x61E] != 0xDF00 */
+    R6IV_CAM_BULB_OFF,       /* B: byte [p+0x648] (Canon bulb timer enable) != 1 */
+    R6IV_CAM_BULB_TIME,      /* B: T = h*3600 + m*60 + s outside R6IV_BULB_MIN_S .. R6IV_BULB_MAX_S, or m / s > 59 */
+    R6IV_CAM_BULB_BUSY,      /* M and B: [cc+0xD30] / [cc+0xBA0] / [0x1E5BC] / [0x1E5C4] / [cc+0x99C] != 0 (a bulb runs or
+                              * did not end cleanly; spec R2, skeptic C1 / C5) */
+    R6IV_CAM_CC_R5E8,        /* B: [cc+0x5E8] != 0 (skeptic D2: the re-post builder 0xE0640BCE branches on it and
+                              * 0xE0718122 keeps Canon's bulb timer on for 1 / 2; camera value 0) */
     R6IV_NCAMS
 };
 
@@ -122,6 +140,21 @@ struct r6_iv_shot {
     uint32_t s5_ms;          /* SW1 ON -> first state 5 seen; 0 = none */
     uint32_t exp_ms;         /* first state 5 -> first state 6 seen; 0 = none */
     int32_t  slot_late;      /* SW1 ON - slot (ms); 0 for "Test: 1 picture" */
+    /* M9.2 (bulb; 0 for M pictures except drive / r5e8) */
+    uint8_t  bulb;           /* IV_BCLASS_*: 0 not a bulb, 1 timer bulb, 2 no timer seen in the classification window */
+    uint8_t  bend;           /* IV_BEND_*: why phase W ended */
+    uint8_t  bbtn;           /* real button seen in phase W: bit 0 DF, bit 1 E0 */
+    uint8_t  bwarn;          /* IV_BW_* */
+    uint8_t  drive;          /* low byte of [p+0x4C0] at the pre-SW2 check (M and B) */
+    uint8_t  r5e8;           /* low byte of [cc+0x5E8] at the pre-SW2 check (M and B); 1 / 2 keep Canon's timer on in 0xE06423AA */
+    uint16_t bt;             /* bulb time T (s) from [p+0x648] at the pre-SW2 check */
+    uint16_t sec_max;        /* highest [cc+0x99C] seen in phase W */
+    uint16_t clk_back;       /* phase W: clock steps back (or jumps > R6IV_BULB_GLITCH_MS) seen and skipped (skeptic C3) */
+    uint32_t bulbw;          /* [p+0x648] at the pre-SW2 check */
+    uint32_t bulbw_after;    /* [p+0x648] at the end of the picture (Canon may switch its timer off itself, K10) */
+    uint32_t ta_ms;          /* [0x1E5C0] the first time [0x1E5BC] was seen 1 */
+    uint32_t bulb_ms;        /* [0x1E568] when phase W ended (Canon's measured bulb time) */
+    uint32_t d30_ms;         /* OFFs (t3) -> [cc+0xD30] 0 or state != 12 seen, elapsed (OVERRUN / SHUTDOWN: t3 -> the stop) */
 };
 
 struct r6_iv_stats {
@@ -146,6 +179,8 @@ struct r6_iv_stats {
     int fn_last;
     /* M8.2 */
     uint32_t menu_blocked;   /* ML menu opens refused while a picture runs (r6_iv_menu_block, src/menu.c) */
+    /* M9.2 */
+    uint32_t bulb_warn;      /* OR of IV_BW_* over the bulb pictures of the current / last run (reset at the start) */
 };
 
 /* M8.1: one read-only snapshot of the CameraConductor and the switch path (r6_interval.c iv_cc_read) */
@@ -214,6 +249,13 @@ struct r6_iv_cc {
     uint32_t r5f8;           /* [cc+0x5F8] (log only) */
     int lv;                  /* r6_interval.c iv_t_lv >= 0 (Canon LV running) */
     int gstate;              /* gui_state */
+    /* M9.2: bulb (cc words only with R6IV_V_CC, bulbw only with R6IV_V_P, the timer RAM always, read after the cc block) */
+    uint32_t d30;            /* [cc+0xD30] */
+    uint32_t ba0;            /* [cc+0xBA0] */
+    uint32_t sec;            /* [cc+0x99C] */
+    uint32_t bulbw;          /* [p+0x648] */
+    uint32_t ta, ta_ms, tb, tb_ms;   /* [0x1E5BC] [0x1E5C0] [0x1E5C4] [0x1E5C8] */
+    uint32_t bulb_ms;        /* [0x1E568] */
 };
 
 /* M8.1: detail of the last picture (reset at every SW1 ON, kept until the next one) */
@@ -247,7 +289,13 @@ int r6_iv_gate_cc_settings(void);      /* R6IV_GATE_CC_SETTINGS */
 int r6_iv_tv_min(void);                /* R6IV_TV_EV768_MIN (EV * 768 of the longest Tv allowed, 30 s) */
 int r6_iv_menu_block(void);            /* src/menu.c menu_open(): 1 = a picture is running (counts the attempt) */
 void r6_iv_budget(int * tv_ub, int * busy, int * need, int * need_nr, int * fit);   /* for the log: Tv bound (ms,
-                                        * -1 = no Tv), budget add-on, interval need / NR need (ms), interval fit 0 / 1 / 2 */
+                                        * -1 = no Tv), budget add-on, interval need / NR need (ms), interval fit 0 / 1 / 2
+                                        * (M9.2, B: T from Canon's bulb timer, busy 2 T + 5 s + T / 16) */
+/* M9.2 */
+int r6_iv_bulb_t(const struct r6_iv_cc * s);   /* T (s) from [p+0x648] if p valid, enable 1, m / s <= 59; else -1 */
+int r6_iv_bulb_min_s(void);                    /* R6IV_BULB_MIN_S (31) */
+int r6_iv_bulb_max_s(void);                    /* R6IV_BULB_MAX_S (60) */
+int r6_iv_bulb_running(void);                  /* 1 = ML's bulb picture runs, or Canon's bulb after an overrun stop (overlays pause) */
 
 /* Canon RAM read by r6_interval.c (read-only) */
 #define R6IV_RAM_JOBCNT    0x9DC0      /* live job count [0x9D9C+0x24]: CreateJob checks it (cbz 0xE07C9E5E),
@@ -348,5 +396,24 @@ void r6_iv_budget(int * tv_ub, int * busy, int * need, int * need_nr, int * fit)
 #define R6IV_SW_EVENT_MASK   0x3C00    /* class-2 bits 0x400 SW1 ON, 0x800 SW1 OFF, 0x1000 SW2 ON, 0x2000 SW2 OFF */
 #define R6IV_SWMGR_SIZE      0x10      /* [mgr] arr, [mgr+4] sts, [mgr+0xC] hook */
 #define R6IV_JOBCLASS_SIG    0xE1F95BF4 /* address of the ROM string "JobClass": [jobref] / [jobdata] (0xE07D42E6) */
+
+/* M9.2: bulb with Canon's bulb timer (read only; spec m9/m92 spec_m92.md, camera log M9.1 LVP00056) */
+#define R6IV_CC_SEC          0x99C     /* bulb seconds: ++ every 1 s from EXPOSURE_START (tick 0xE070D5E8), 0 at the ends that go
+                                        * through 0xE070DD9E (0xE070DDAA; 0xE031DF14 calls it only in state 12, skeptic R2) */
+#define R6IV_CC_BA0          0xBA0     /* 1 = Canon's bulb timer armed: SHOOT_START into 12 with byte [p+0x648] != 0 (0xE031D87C);
+                                        * 0 by timer A (0xE070E076), a full press in 12 (Sw2OnBulbing 0xE05E3380), 0xE0642376
+                                        * (0xE06423A4); SHOOT_START never clears it, RELEASE_CANCEL leaves it 1 (skeptic C2) */
+#define R6IV_CC_D30          0xD30     /* 1 = bulb running: SHOOT_START into 12 (0xE031D864); 0 by the bulb end 0xE02EB9BE (0xE02EB9F0)
+                                        * and SW1 OFF in 2 / 3 / 6 (0xE05E2EEA / 0xE05E3048); RELEASE_CANCEL 0xE031E0AA / ERROR leave it 1 */
+#define R6IV_P_BULBT         0x648     /* CC copy of PROP 0x8004005B (CC table idx 237): byte 0 enable, 1 h, 2 m, 3 s
+                                        * (0xE0643E22..0xE0643E2E; camera LVP00056 0x23000001 = on, 0:00:35) */
+#define R6IV_RAM_BULB_MS     0x1E568   /* [0x1E548+0x20]: 0 at SHOOT_START (0xE02F6F36), (end - start) / 100 * 100, min 100, at the
+                                        * end (0xE02F6F7C), before RELEASE_STOP and D30 = 0 */
+#define R6IV_RAM_TA          0x1E5BC   /* [0x1E548+0x74] timer A armed (0xE02F7340); cleared only by its cancel 0xE02F7360 (camera:
+                                        * 0 again at the end, K8) */
+#define R6IV_RAM_TA_MS       0x1E5C0   /* [0x1E548+0x78] timer A ms = s * 1000 (0xE02F734C) */
+#define R6IV_RAM_TB          0x1E5C4   /* [0x1E548+0x7C] timer B armed (0xE02F7396); cancel 0xE02F73BA */
+#define R6IV_RAM_TB_MS       0x1E5C8   /* [0x1E548+0x80] timer B ms (0xE02F73A8) */
+#define R6IV_TV_BULB         (-8448)   /* (s16) 0xDF00: PROP_SHUTTER and [p+0x61E] in B (camera LVP00056) */
 
 #endif /* _r6_interval_h_ */

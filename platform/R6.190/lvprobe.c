@@ -345,6 +345,16 @@ static void lp_bad(struct lp_buf * b, const char * key, uint32_t base)
         lp_printf(b, "%s=invalid(0x%08x)\n", key, (int) base);
 }
 
+/* a name as one token (spaces -> '_'): every log line stays key=value without spaces (M9.2: also the overlay
+ * reason names, e.g. "ML bulb picture") */
+static const char * lp_nosp(const char * s, char * buf, int n)
+{
+    int i = 0;
+    for (; s[i] && i < n - 1; i++) buf[i] = s[i] == ' ' ? '_' : s[i];
+    buf[i] = 0;
+    return buf;
+}
+
 /* fixed Canon global */
 static void lp_glob(struct lp_buf * b, const char * key, uint32_t addr)
 {
@@ -1039,7 +1049,8 @@ static void lp_census_m72a(struct lp_buf * b)
         const struct r6_overlay_stats * o = r6_overlay_stats();
 #define LO(name, val) lp_printf(b, "ovh." name "=%d\n", (int) (val))
         LO("mode", o->mode);
-        lp_printf(b, "ovh.state=%s\n", r6_overlay_reason(o->state));
+        char nbo[40];
+        lp_printf(b, "ovh.state=%s\n", lp_nosp(r6_overlay_reason(o->state), nbo, sizeof(nbo)));
         LO("box", o->box);
         LO("ticks", o->ticks);
         LO("draws", o->draws);
@@ -1095,8 +1106,9 @@ static void lp_census_m72a(struct lp_buf * b)
         {
             snprintf(k, sizeof(k), "gd.reason[%d]", i);           lp_printf(b, "%s=%d\n", k, (int) g->reasons[i]);
         }
-        lp_printf(b, "gd.last=%s\n", r6_gd_reason(g->last));
-        lp_printf(b, "gd.last_outside_menu=%s\n", r6_gd_reason(g->last_outside_menu));
+        char nbg[40];
+        lp_printf(b, "gd.last=%s\n", lp_nosp(r6_gd_reason(g->last), nbg, sizeof(nbg)));
+        lp_printf(b, "gd.last_outside_menu=%s\n", lp_nosp(r6_gd_reason(g->last_outside_menu), nbg, sizeof(nbg)));
         lp_printf(b, "gd.mask=0x%08x\n", (int) g->mask);
         LGD("ovl", g->ovl);
         LGD("zebra_n", g->zebra_n);        LGD("zebra_changed", g->zebra_changed);
@@ -1120,7 +1132,7 @@ static void lp_census_m72a(struct lp_buf * b)
         LGD("lv_movie_select", g->lv_movie_select);
         LGD("hcanon_n", g->hcanon_n);      LGD("hcanon_us", g->hcanon_us);         LGD("hcanon_us_max", g->hcanon_us_max);
         LGD("hcanon_ok", g->hcanon_ok);    LGD("hcanon_fail", g->hcanon_fail);
-        lp_printf(b, "gd.hcanon_state=%s\n", r6_overlay_reason(g->hcanon_state));
+        lp_printf(b, "gd.hcanon_state=%s\n", lp_nosp(r6_overlay_reason(g->hcanon_state), nbg, sizeof(nbg)));
         LGD("hist_valid", g->hist_valid);  LGD("hist_none", g->hist_none);       LGD("hist_hold", g->hist_hold);
         LGD("wfm_n", g->wfm_n);            LGD("wfm_us", g->wfm_us);               LGD("wfm_us_max", g->wfm_us_max);
         LGD("wfm_samples", g->wfm_samples);
@@ -1166,7 +1178,8 @@ static void lp_census_m72a(struct lp_buf * b)
         {
             snprintf(k, sizeof(k), "mlh.reason[%d]", i);          lp_printf(b, "%s=%d\n", k, (int) m->reasons[i]);
         }
-        lp_printf(b, "mlh.last=%s\n", r6_overlay_reason(m->last));
+        char nbm[40];
+        lp_printf(b, "mlh.last=%s\n", lp_nosp(r6_overlay_reason(m->last), nbm, sizeof(nbm)));
         LMH("set", m->set);                LMH("numpix", m->numpix);               LMH("frame", m->frame);
         LMH("us_last", m->us_last);        LMH("us_max", m->us_max);
 #undef LMH
@@ -1522,17 +1535,15 @@ static void lp_vmix_poll(struct lp_buf * b)
  * passive trace. M8.2 adds the long-Tv fields (CC copies of NR / interval timer /
  * the 0x80040064 timer setting, the CC flags 0xB98 / 0x830 / 0x5F8, the snapshot's validity
  * mask, the Tv budget, the ML menu guard count, per-shot Tv / budget / timing).
+ * M9.2 adds the bulb fields: Canon's bulb timer word [p+0x648], [cc+0xD30] /
+ * [cc+0xBA0] / [cc+0x99C], the timer RAM 0x1E568 / 0x1E5BC..0x1E5C8 (iv.bulb.*,
+ * 9 more fields per iv.last.* snapshot), the bulb limits / warning bits / overrun
+ * latch, and per shot the bulb class, end, button, warnings, drive, [cc+0x5E8],
+ * T, seconds, timer words, Canon's measured bulb time and the clock glitches.
  * Every pointer taken from a Canon structure passes ram_ok() for the whole
  * structure first (p: cached RAM or the verified uncached alias); otherwise the
  * key prints invalid(0x...) and nothing is dereferenced (also for 0: no NULL keys
  * in this block). */
-static const char * lp_nosp(const char * s, char * buf, int n)
-{
-    int i = 0;
-    for (; s[i] && i < n - 1; i++) buf[i] = s[i] == ' ' ? '_' : s[i];
-    buf[i] = 0;
-    return buf;
-}
 
 /* 32-bit field [base+off] of a Canon structure of n bytes (whole structure range-checked) */
 static void lp_ivw(struct lp_buf * b, const char * key, uint32_t base, uint32_t n, uint32_t off)
@@ -1562,16 +1573,19 @@ static void lp_ivb2(struct lp_buf * b, const char * key, uint32_t base, uint32_t
     lp_ivb(b, key, RD(base + poff), n2, off);
 }
 
-/* one r6_iv_cc snapshot on one line (M8.2: 29 fields) */
+/* one r6_iv_cc snapshot on one line (M8.2: 29 fields; M9.2: 38) */
 static void lp_iv_cc(struct lp_buf * b, const char * key, const struct r6_iv_cc * s)
 {
-    lp_printf(b, "%s=%d,%d,%d,%d,%d,%d,0x%x,0x%x,%d,0x%x,0x%x,%d,%d,%d,%d,%d,%d,%d,%d,%d,0x%x,0x%x,%d,%d,%d,%d,%d,%d,%d\n", key,
+    lp_printf(b, "%s=%d,%d,%d,%d,%d,%d,0x%x,0x%x,%d,0x%x,0x%x,%d,%d,%d,%d,%d,%d,%d,%d,%d,0x%x,0x%x,%d,%d,%d,%d,%d,%d,%d"
+                 ",%d,%d,%d,0x%x,%d,%d,%d,%d,%d\n", key,
         (int) s->state, (int) s->state_prev, (int) s->relseq, (int) s->b54, s->df, s->e0, (int) s->pend, (int) s->work,
         (int) s->shmode, (int) s->a68, (int) s->a6c, (int) s->r888, (int) s->relcnt, (int) s->jobs, (int) s->jid,
         (int) s->jdone, (int) s->access,
         s->faneo[0] == R6IV_RAM_FANEO && s->faneo[1] == R6IV_RAM_FANEO, s->tsc, s->fn, s->gui,
         (int) s->p_tv, (int) s->p_92c, (int) s->p_lenr, (int) s->p_itimer, (int) s->p_fbrk, (int) s->b98, (int) s->c830,
-        (int) s->r5f8);
+        (int) s->r5f8,
+        (int) s->d30, (int) s->ba0, (int) s->sec, (int) s->bulbw, (int) s->ta, (int) s->ta_ms, (int) s->tb, (int) s->tb_ms,
+        (int) s->bulb_ms);
 }
 
 /* FA-Neo node walk (approved Option 4, only with a live job: a jobref of a finished job points to
@@ -1640,6 +1654,8 @@ static void lp_iv_faneo(struct lp_buf * b)
     lp_printf(b, "iv.job.fa.stable=%d\n", memcmp(&f, &f2, sizeof(f)) == 0);
 }
 
+#define LP_IV_SHOTS_LOG 32        /* M9.2 review: picture-ring entries in the log (~190 B each); the worst case
+                                   * (Expo log on with full rings, 64 pictures) stays below LP_LOG_SIZE */
 static void lp_iv_log(struct lp_buf * b)
 {
     const struct r6_iv_stats * s = r6_iv_stats();
@@ -1681,6 +1697,10 @@ static void lp_iv_log(struct lp_buf * b)
         lp_printf(b, "iv.need_nr_ms=%d\n", need_nr);
         lp_printf(b, "iv.interval_fit=%d\n", fit);
     }
+    lp_printf(b, "iv.bulb.min_s=%d\n", r6_iv_bulb_min_s());           /* M9.2 */
+    lp_printf(b, "iv.bulb.max_s=%d\n", r6_iv_bulb_max_s());
+    lp_printf(b, "iv.bulb.warn=0x%x\n", (int) s->bulb_warn);
+    lp_printf(b, "iv.bulb.running=%d\n", r6_iv_bulb_running());
     lp_printf(b, "iv.cam=%d,%s\n", c, lp_nosp(r6_iv_cam_name(c), w, sizeof(w)));
     lp_printf(b, "iv.canon=%d,%s\n", k, lp_nosp(r6_iv_canon_name(k), w, sizeof(w)));
     lp_printf(b, "iv.canon_hard=%d\n", hard);
@@ -1742,6 +1762,27 @@ static void lp_iv_log(struct lp_buf * b)
         struct r6_iv_cc cs;                     /* M8.2: the validity mask of r6_interval.c's own read (camera: 0x1f) */
         r6_iv_cc_read(&cs);
         lp_printf(b, "iv.cc.v=0x%x\n", (int) cs.valid);
+        /* M9.2: Canon's bulb timer (-1 = off / not readable), the bulb flags and the timer RAM, from the same read */
+        lp_printf(b, "iv.bulb.t=%d\n", r6_iv_bulb_t(&cs));
+        if (cs.valid & R6IV_V_P) lp_printf(b, "iv.bulb.word=0x%08x\n", (int) cs.bulbw);
+        else lp_bad(b, "iv.bulb.word", (cs.valid & R6IV_V_CC) ? cs.p : cs.cc);
+        if (cs.valid & R6IV_V_CC)
+        {
+            lp_printf(b, "iv.bulb.d30=%d\n", (int) cs.d30);
+            lp_printf(b, "iv.bulb.ba0=%d\n", (int) cs.ba0);
+            lp_printf(b, "iv.bulb.sec=%d\n", (int) cs.sec);
+        }
+        else
+        {
+            lp_bad(b, "iv.bulb.d30", cs.cc);
+            lp_bad(b, "iv.bulb.ba0", cs.cc);
+            lp_bad(b, "iv.bulb.sec", cs.cc);
+        }
+        lp_printf(b, "iv.bulb.ta=%d\n", (int) cs.ta);
+        lp_printf(b, "iv.bulb.ta_ms=%d\n", (int) cs.ta_ms);
+        lp_printf(b, "iv.bulb.tb=%d\n", (int) cs.tb);
+        lp_printf(b, "iv.bulb.tb_ms=%d\n", (int) cs.tb_ms);
+        lp_printf(b, "iv.bulb.ms=%d\n", (int) cs.bulb_ms);
     }
     lp_ivw(b, "iv.cc.evflag", cc, R6IV_CC_SIZE, R6IV_CC_EVFLAG);
     lp_ivw(b, "iv.cc.table", cc, R6IV_CC_SIZE, R6IV_CC_TABLE);
@@ -1824,28 +1865,33 @@ static void lp_iv_log(struct lp_buf * b)
     lp_glob(b, "iv.job.class_s", 0x9DA4);
     lp_iv_faneo(b);
 
-    int n = MIN((int) s->shots, R6IV_RING);
+    int n = MIN((int) s->shots, LP_IV_SHOTS_LOG);   /* M9.2 review: the newest 32 of the 64 (log < 96 KB) */
     lp_printf(b, "# iv.shot[i]=t,ret,dur,d_cnt,d_fn,pic_ms,job_ms,jobs_after,js_before,js_after,wait_ms,wait_mask,"
                  "sw1_ms,acc_ms,off_ms,seq_ms,off_why,off_state,states,d_rel,d_jid,sm_before,sm_after,late,second,final,"
-                 "tv,tv_cc,busy,s5_ms,exp_ms,slot_late,r92c,nr,cflag\n");
+                 "tv,tv_cc,busy,s5_ms,exp_ms,slot_late,r92c,nr,cflag,"
+                 "bulb,bend,bbtn,bwarn,drive,r5e8,bt,sec_max,bulbw,bulbw_after,ta_ms,bulb_ms,d30_ms,clk_back\n");
     for (int i = 0; i < n; i++)
     {
         const struct r6_iv_shot * e = &s->ring[(s->shots - n + i) % R6IV_RING];
         lp_printf(b, "iv.shot[%d]=%d,%d,%d,%d,%d,%d,%d,%d,0x%x,0x%x,%d,0x%x,%d,%d,%d,%d,%d,%d,0x%x,%d,%d,%d,%d,0x%x,%d,0x%x,"
-                     "%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+                     "%d,%d,%d,%d,%d,%d,%d,%d,%d,"
+                     "%d,%d,0x%x,0x%x,%d,%d,%d,%d,0x%x,0x%x,%d,%d,%d,%d\n",
             (int) (s->shots - n + i),
             (int) e->t, (int) e->ret, (int) e->dur, (int) e->d_cnt, (int) e->d_fn, (int) e->pic_ms,
             (int) e->job_ms, (int) e->jobs_after, (int) e->js_before, (int) e->js_after,
             (int) e->wait_ms, (int) e->wait_mask,
             e->sw1_ms, e->acc_ms, e->off_ms, (int) e->seq_ms, e->off_why, e->off_state, e->states, e->d_rel, e->d_jid,
             e->sm_before, e->sm_after, e->late, e->second, e->final,
-            e->tv, e->tv_cc, (int) e->busy, (int) e->s5_ms, (int) e->exp_ms, (int) e->slot_late, e->r92c, e->nr, e->cflag);
+            e->tv, e->tv_cc, (int) e->busy, (int) e->s5_ms, (int) e->exp_ms, (int) e->slot_late, e->r92c, e->nr, e->cflag,
+            e->bulb, e->bend, e->bbtn, e->bwarn, e->drive, e->r5e8, e->bt, e->sec_max, (int) e->bulbw, (int) e->bulbw_after,
+            (int) e->ta_ms, (int) e->bulb_ms, (int) e->d30_ms, e->clk_back);
     }
 
     /* last picture: snapshots and trace (codes: r6_interval.c iv_tr_codes, 1..4 the switch calls, X the reason) */
     const struct r6_iv_last * l = r6_iv_last();
     lp_printf(b, "# iv.last.*=state,state_prev,relseq,b54,df,e0,pend,work,shmode,a68,a6c,r888,relcnt,jobs,jid,jdone,"
-                 "access,faneo_empty,tsc,fn,gui,p_tv,p_92c,p_lenr,p_itimer,p_fbrk,b98,c830,r5f8\n");
+                 "access,faneo_empty,tsc,fn,gui,p_tv,p_92c,p_lenr,p_itimer,p_fbrk,b98,c830,r5f8,"
+                 "d30,ba0,sec,bulbw,ta,ta_ms,tb,tb_ms,bulb_ms\n");
     lp_iv_cc(b, "iv.last.pre", &l->pre);
     lp_iv_cc(b, "iv.last.off", &l->off);
     lp_iv_cc(b, "iv.last.post", &l->post);

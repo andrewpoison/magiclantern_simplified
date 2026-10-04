@@ -78,6 +78,7 @@ enum {
     R6GD_MOVIE,      /* movie mode: not reviewed (recording is invisible to ML, PROP_MVR_REC_START denied);
                       * is_movie_mode() (shooting_mode) OR PROP_LV_MOVIE_SELECT == 2 (second, independent indicator) */
     R6GD_EVF_LAYOUT, /* M7.7: EVF, but Canon's live EVF image info is not the top-aligned 1280x854 stills layout */
+    R6GD_ML_BULB,    /* M9.2: ML's bulb picture (r6_iv_bulb_running): Canon shows no live image, the frame is stale */
     R6GD_NREASONS
 };
 
