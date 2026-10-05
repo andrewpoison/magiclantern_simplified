@@ -153,6 +153,16 @@
  * CONFIG_R6_GRID. */
 #define CONFIG_R6_MOTION
 
+/* R6.190 M10.1 (docs/m10_plan.md section 1, approved 2026-10-05): src/lens.c decodes the R6 1.9.0 lens data
+ * (platform/R6.190/include/platform/lens.h: PROP_LENS_DYNAMIC_DATA 0x8C bytes, PROP_LENS_STATIC_DATA 0x1D0) and
+ * PROP_APERTURE / PROP_APERTURE_AUTO as 2 bytes Code768 (APEX * 768). Only bytes Canon already delivers to the
+ * registered handlers are read differently: no property write, no new Canon call, no new memory access. Other
+ * lengths are ignored (no ASSERT), near = far = 0 has no distance, far 0xFFFF = infinity, 64-bit distance math,
+ * FL > 2000 mm rejected, extender 0xFF = none. The handlers run in Canon's property task (dynamic data up to
+ * ~5 / s): decode and plain stores only, no lock, no print, no allocation. focus_ring_powersave_fix (a property
+ * write request on every focus ring turn) is compiled out. */
+#define CONFIG_R6_LENS_DATA
+
 #define CONFIG_TASK_STRUCT_V2_SMP
 #define CONFIG_TASK_ATTR_STRUCT_V5
 

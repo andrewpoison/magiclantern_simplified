@@ -1949,6 +1949,20 @@ static void lp_iv_log(struct lp_buf * b)
  *  - Canon's Tv substitution flag (0xE035A7B4 returns
  *    [[[0x1085C+8]+0x644]+0x10]; with 1 CC_SetTv stores [p+0x25C] instead of
  *    the request, 0xE03B0FC0..0xE03B0FEC)
+ * M10.1 Tor 0b (docs/m10_plan.md 2.6, approved 2026-10-05; same rules, read
+ * only): the CC fields that gate or steer CC_SetTv ([cc+0x62C] > 1 stores
+ * nothing 0xE0717C32, [cc+0x31C] == 1 stores in any AE mode 0xE0716F9A,
+ * [cc+0x5E8] / [cc+0x2E0] / [cc+0x304] "normal context" 0xE0718160..0xE071819C,
+ * [cc+0xB78] M memory +0x50 0xE03B13A6, backup slot 0x59 flag [cc+0x2A18] and
+ * its Tv [cc+0x316E] 0xE0712FD0, [cc+0x724] clamp 0xE03B12A2), the sheet's
+ * exposure step [p+0xD4] (2 = 1/3, 1 = 1/2, 0xE0641FD0), [p+0x5B8] (clamp,
+ * 0x8002002E), [p+0x670] (flash firing, 0x80040013); Canon's M memory: the
+ * record [[0x10868]+0x2E8] (PROPAD 0x02080002, DataStore init 0xE07119F6,
+ * expected != ds+4) with Tv / Av at +0x40 / +0x42 / +0x50 / +0x52
+ * (0xE034BB50, 0xE03B13CA) and the copy at ds+4; the substitution flags
+ * 8..11 [[[0x10864]+0x5A4 / 0x644 / 0x6E4 / 0x784]+0x10] (getters 0xE035A7A8
+ * .. 0xE035A7CC). Plus ML's own decoded lens values (expo.lensml, src/lens.c
+ * CONFIG_R6_LENS_DATA) and CONTROL_BV (LVAE_STRUCT+0x28).
  * Ring A (expo.pr): extra ML property handlers, only on ids this build
  * registers anyway (all in the baseline handler table with another
  * handler, none on the deny list, never PROP_ISO), so Canon's slave list
@@ -1969,8 +1983,8 @@ static void lp_iv_log(struct lp_buf * b)
 #define LP_X_DS_SIZE    0x320
 #define LP_X_LENSDYN    0x127B88   /* PROP_LENS_DYNAMIC_DATA master buffer (registration 0xE058A974, 0x8C bytes) */
 #define LP_X_LENSDYN_N  0x8C
-#define LP_X_LENSSTAT   0x1279B8   /* PROP_LENS_STATIC_DATA master buffer (lens.c asserts 0x1C8 bytes) */
-#define LP_X_LENSSTAT_N 0x1C8
+#define LP_X_LENSSTAT   0x1279B8   /* PROP_LENS_STATIC_DATA master buffer (registration 0xE058A922, 0x1D0 bytes) */
+#define LP_X_LENSSTAT_N 0x1D0      /* M10.1: all of it (M9.1 logged 0x1C8, ML's R5 size) */
 #define LP_X_EXACT      0x132AC0   /* ExactData record pointers, 20 slots (DTS_GetExactDataOffset 0xE079D188) */
 #define LP_X_EXACT_N    20
 #define LP_X_EXACT_IDX  (LP_DTS + 0x2C)   /* dts[0x2C]: newest-slot base of DTS_GetExactDataOffset (which one is the
@@ -1979,6 +1993,9 @@ static void lp_iv_log(struct lp_buf * b)
 #define LP_X_GUI_ISO    0x1EC      /* [[0x16954]+0x1EC] s16 (GUI_GetIso 0xE07A76C4) */
 #define LP_X_TVS_PTR    0x10864    /* [0x1085C+8] (Tv substitution flag 0xE035A7B4: [[x+0x644]+0x10]) */
 #define LP_X_TVS_SUB    0x25C      /* [p+0x25C] s16: the Tv CC_SetTv stores while the flag is 1 */
+#define LP_X_TVS_SIZE   0x788      /* M10.1: the flag objects 8..11 at [x+0x5A4 / 0x644 / 0x6E4 / 0x784] */
+#define LP_X_MM_OFF     0x2E8      /* M10.1: [ds+0x2E8] = Canon's M memory record (PROPAD 0x02080002) */
+#define LP_X_MM_SIZE    0x54       /* fields read: +0x40 .. +0x53 */
 
 static int lp_x_on = 0;                    /* menu "Expo log" (not saved) */
 static volatile int lp_x_reset = 1;        /* the sampler takes a new baseline */
@@ -2035,7 +2052,7 @@ LP_XPH(0x80020037);   /* lens dynamic data, 0x8C bytes (length + 8 bytes only) *
 LP_XPH(0x8003009A);   /* lens static data (length + 8 bytes only) */
 
 /* ---- ring B: the CC copies and bulb fields, sampled every 200 ms ---- */
-enum { LP_XB_CC, LP_XB_P, LP_XB_RAM };
+enum { LP_XB_CC, LP_XB_P, LP_XB_RAM, LP_XB_DS, LP_XB_MM, LP_XB_SUB };   /* M10.1: DataStore, M memory, flags 8..11 */
 enum { LP_XD_HEX, LP_XD_DEC, LP_XD_TV, LP_XD_AV, LP_XD_ISO, LP_XD_EV, LP_XD_AE, LP_XD_ISOPAIR, LP_XD_TVPAIR, LP_XD_HMS };
 struct lp_xf { const char * name; uint8_t base, size, dec, pad; uint32_t off; };
 static const struct lp_xf lp_xf[] = {
@@ -2078,6 +2095,28 @@ static const struct lp_xf lp_xf[] = {
     { "ta_ms",      LP_XB_RAM, 4, LP_XD_DEC,     0, 0x1E5C0 },
     { "tb",         LP_XB_RAM, 4, LP_XD_DEC,     0, 0x1E5C4 },
     { "tb_ms",      LP_XB_RAM, 4, LP_XD_DEC,     0, 0x1E5C8 },
+    /* M10.1 Tor 0b (docs/m10_plan.md 2.6): what gates or steers CC_SetTv, the step setting, the M memory, flags */
+    { "c62c",       LP_XB_CC,  4, LP_XD_DEC,     0, 0x62C },      /* > 1: CC_SetTv stores nothing (0xE0717C32) */
+    { "c5e8",       LP_XB_CC,  4, LP_XD_DEC,     0, 0x5E8 },      /* "normal context" needs 0 (0xE0718160) */
+    { "cb78",       LP_XB_CC,  4, LP_XD_DEC,     0, 0xB78 },      /* != 0: M memory at +0x50 (0xE03B13A6) */
+    { "tvbak",      LP_XB_CC,  4, LP_XD_DEC,     0, 0x2A18 },     /* backup slot 0x59 flag (0xE0712FD0) */
+    { "tvbak_val",  LP_XB_CC,  2, LP_XD_TV,      0, 0x316E },     /* its Tv (s16), written back into [p+0x61E] */
+    { "c724",       LP_XB_CC,  4, LP_XD_DEC,     0, 0x724 },      /* 0 + 0xE0717422 == 1: only the slow end clamped */
+    { "c2e0",       LP_XB_CC,  4, LP_XD_DEC,     0, 0x2E0 },      /* "normal context" needs 0 (0xE0718192) */
+    { "c304",       LP_XB_CC,  4, LP_XD_DEC,     0, 0x304 },      /* "normal context" needs 0 (0xE071819C) */
+    { "c31c",       LP_XB_CC,  4, LP_XD_DEC,     0, 0x31C },      /* 1: CC_SetTv stores in any AE mode (0xE0716F9A) */
+    { "step",       LP_XB_P,   4, LP_XD_DEC,     0, 0x0D4 },      /* exposure step 2 = 1/3, 1 = 1/2 (0xE0641FD0) */
+    { "tvclamp",    LP_XB_P,   4, LP_XD_HEX,     0, 0x5B8 },      /* 0x8002002E: 1 = clamp both ends */
+    { "flash",      LP_XB_P,   4, LP_XD_HEX,     0, 0x670 },      /* 0x80040013 flash firing */
+    { "mmem",       LP_XB_DS,  4, LP_XD_HEX,     0, LP_X_MM_OFF }, /* the M memory record pointer [ds+0x2E8] */
+    { "mm_tv",      LP_XB_MM,  2, LP_XD_TV,      0, 0x040 },      /* M memory Tv / Av (dial -> M loads them, */
+    { "mm_av",      LP_XB_MM,  2, LP_XD_AV,      0, 0x042 },      /* 0xE034BB50) */
+    { "mm_tv50",    LP_XB_MM,  2, LP_XD_TV,      0, 0x050 },      /* the same while [cc+0xB78] != 0 */
+    { "mm_av52",    LP_XB_MM,  2, LP_XD_AV,      0, 0x052 },
+    { "subst8",     LP_XB_SUB, 4, LP_XD_DEC,     0, 0x5A4 },      /* substitution flags 8..11: [[[0x10864]+off]+0x10] */
+    { "subst9",     LP_XB_SUB, 4, LP_XD_DEC,     0, 0x644 },      /* (9 = expo.tvsubst, getter 0xE035A7B4) */
+    { "subst10",    LP_XB_SUB, 4, LP_XD_DEC,     0, 0x6E4 },
+    { "subst11",    LP_XB_SUB, 4, LP_XD_DEC,     0, 0x784 },
 };
 #define LP_XF_N    ((int) COUNT(lp_xf))
 #define LP_XF_SEC  32                              /* index of "sec" */
@@ -2111,11 +2150,31 @@ static int lp_x_rd(uint32_t base, uint32_t off, int size, uint32_t * v)
     return 1;
 }
 
+/* M10.1 Tor 0b: the base of a DataStore / M memory / flag field, every pointer checked (0 = not readable) */
+static int lp_x_base2(int base, uint32_t off, uint32_t * a)
+{
+    if (base == LP_XB_SUB)                                 /* [[0x10864]+off] */
+    {
+        uint32_t t = RD(LP_X_TVS_PTR);
+        if (!ram_ok(t, LP_X_TVS_SIZE)) return 0;
+        *a = RD(t + off);
+        return ram_ok(*a, 0x14);
+    }
+    uint32_t ds = RD(LP_X_DS_PTR);
+    if (!ram_ok(ds, LP_X_DS_SIZE)) return 0;
+    if (base == LP_XB_DS) { *a = ds; return 1; }
+    *a = RD(ds + LP_X_MM_OFF);                             /* LP_XB_MM */
+    return ram_ok(*a, LP_X_MM_SIZE);
+}
+
 static int lp_x_field(int i, uint32_t cc, uint32_t p, int vm, uint32_t * v)
 {
     const struct lp_xf * f = &lp_xf[i];
+    uint32_t a;
     if (f->base == LP_XB_RAM) return lp_x_rd(0, f->off, f->size, v);
     if (f->base == LP_XB_CC) return (vm & 1) && lp_x_rd(cc, f->off, f->size, v);
+    if (f->base == LP_XB_SUB) return lp_x_base2(f->base, f->off, &a) && lp_x_rd(a, 0x10, f->size, v);
+    if (f->base == LP_XB_DS || f->base == LP_XB_MM) return lp_x_base2(f->base, 0, &a) && lp_x_rd(a, f->off, f->size, v);
     return (vm & 2) && lp_x_rd(p, f->off, f->size, v);
 }
 
@@ -2314,6 +2373,46 @@ static void lp_x_log(struct lp_buf * b)
     }
     if (gok) { lp_x_iso(s1, sizeof(s1), RD(gp + LP_X_GUI_ISO)); lp_printf(b, "expo.gui_iso=0x%04x,%s\n", (int) (RD(gp + LP_X_GUI_ISO) & 0xFFFF), s1); }
     else lp_bad(b, "expo.gui_iso", gp);
+    /* M10.1 Tor 0b: the M memory record vs. its copy at ds+4 (memcpy 0xE07119FC; the record is expected elsewhere) */
+    if (dsok)
+    {
+        lp_printf(b, "expo.mmem.is_ds4=%d\n", RD(ds + LP_X_MM_OFF) == ds + 4);
+        lp_printf(b, "# expo.ds4.mm=tv,av,tv50,av52 of the copy at ds+4 (s16 Code768)\n");
+        lp_printf(b, "expo.ds4.mm=0x%04x,0x%04x,0x%04x,0x%04x\n", (int) (lp_x_s16(ds, 4 + 0x40) & 0xFFFF),
+            (int) (lp_x_s16(ds, 4 + 0x42) & 0xFFFF), (int) (lp_x_s16(ds, 4 + 0x50) & 0xFFFF), (int) (lp_x_s16(ds, 4 + 0x52) & 0xFFFF));
+    }
+    else lp_bad(b, "expo.mmem.is_ds4", ds);
+    /* M10.1: ML's own decoded lens values (src/lens.c CONFIG_R6_LENS_DATA) and CONTROL_BV (lens.c uses PROP_APERTURE
+     * only while it is 0) */
+    {
+        const struct r6_lens_dbg * d = &r6_lens_dbg;
+        uint32_t cbv = 0;
+        int cbv_ok = lp_x_rd(0, LVAE_STRUCT + 0x28, 2, &cbv);
+        char nm[sizeof(lens_info.name)];
+        int j = 0;
+        for (; j < (int) sizeof(nm) - 1 && lens_info.name[j]; j++)
+        {
+            char c = lens_info.name[j];
+            nm[j] = (c <= ' ' || c >= 0x7F || c == '=' || c == ',') ? '_' : c;
+        }
+        nm[j] = 0;
+        lp_printf(b, "# expo.lensml=exists,lens_id,focal_mm,dist_cm,focus_pos,IS,mf,st2,st3,near_cm,far_cm,extender,ext_raw,fl_bad\n");
+        lp_printf(b, "expo.lensml=%d,%d,%d,%d,%d,%d,%d,0x%02x,0x%02x,%d,%d,0x%02x,0x%02x,%d\n", (int) lens_info.lens_exists,
+            (int) lens_info.lens_id, (int) lens_info.focal_len, (int) lens_info.focus_dist, (int) lens_info.focus_pos,
+            (int) lens_info.IS, (d->st2 >> 7) & 1, (int) d->st2, (int) d->st3, (int) d->near, (int) d->far,
+            (int) lens_info.lens_extender, (int) d->ext, (int) d->fl_bad);
+        lp_printf(b, "# expo.lensml.av=raw,f_x10,raw_min,raw_max,control_bv,dof_near_mm,dof_far_mm,hyperfocal_mm,focal_min,focal_max\n");
+        if (cbv_ok) snprintf(s1, sizeof(s1), "%d", (int) cbv); else snprintf(s1, sizeof(s1), "na");
+        lp_printf(b, "expo.lensml.av=0x%02x,%d,0x%02x,0x%02x,%s,%d,%d,%d,%d,%d\n", (int) lens_info.raw_aperture,
+            (int) lens_info.aperture, (int) lens_info.raw_aperture_min, (int) lens_info.raw_aperture_max, s1,
+            (int) lens_info.dof_near, (int) lens_info.dof_far, (int) lens_info.hyperfocal, (int) lens_info.lens_focal_min,
+            (int) lens_info.lens_focal_max);
+        lp_printf(b, "# expo.lensml.n=dyn,dyn_bad,stat,stat_bad,av,av_bad,av_auto,av_auto_bad,av_last,av_auto_last\n");
+        lp_printf(b, "expo.lensml.n=%d,%d,%d,%d,%d,%d,%d,%d,0x%04x,0x%04x\n", (int) d->dyn_n, (int) d->dyn_bad,
+            (int) d->stat_n, (int) d->stat_bad, (int) d->av_n, (int) d->av_bad, (int) d->aa_n, (int) d->aa_bad,
+            (int) d->av_last, (int) d->aa_last);
+        lp_printf(b, "expo.lensml.name=%s\n", nm);
+    }
     /* handler value == CC copy */
     lp_x_match(b, "dial", LP_XPH_DIAL, lp_x_fi("dial"), cc, p, vm);
     lp_x_match(b, "ae", LP_XPH_AE, lp_x_fi("ae"), cc, p, vm);

@@ -1366,10 +1366,51 @@ PROP_HANDLER( PROP_MVR_REC_START )
 }
 
 #if defined(CONFIG_DIGIC_8X)
+#ifdef CONFIG_R6_LENS_DATA
+#ifdef FEATURE_EXPO_OVERRIDE
+#error "R6 (M10.1): PROP_APERTURE's expo override branch is not ported to the 2-byte Code768 decoding"
+#endif
+/* R6 1.9.0 (M10.1): what the lens handlers accepted / ignored, for the Expo log (platform lens.h, lvprobe.c) */
+struct r6_lens_dbg r6_lens_dbg;
+
+/* R6 1.9.0 Av in Code768 (APEX * 768, s16; 0xDF00 = no value) -> ML raw aperture (1/8 EV, 8 = F1.0).
+ * Canon converts ML-style raw codes with (raw - 8) * 96 (0xE05702F4), so raw = 8 + (v + 48) / 96 (nearest):
+ * 0x300 (F1.4) -> 0x10, 0x1800 (F16) -> 0x48; 1/3 stops land on Canon's old codes (0x400 -> 0x13, 0x500 -> 0x15).
+ * 0 = outside ML's aperture table (raw 8..96, v 0..0x2100; negative: 0xDF00, 0xDC00, below F1.0).
+ * (x * 43691) >> 22 == x / 96 for 0 <= x < 131072: no compiler reciprocal constant >= 0x80000000 (canon_gate). */
+static int r6_av768_raw(int v)
+{
+    if (v < 0 || v > (96 - 8) * 96) return 0;
+    return 8 + (int) ((((uint32_t) v + 48) * 43691u) >> 22);
+}
+
+/* PROP_APERTURE / PROP_APERTURE_AUTO buffer: exactly 2 bytes Code768 (only those 2 are read), else 0 = ignore */
+static int r6_av_prop(const uint32_t * buf, unsigned len, uint16_t * last)
+{
+    if (!buf || len != 2) return 0;
+    uint16_t v = *(const uint16_t *) buf;
+    *last = v;
+    return r6_av768_raw((int16_t) v);
+}
+
+/* review L1: a real aperture beyond ML's table (Code768 above F45: F51 .. with an extender) is accepted as "unknown"
+ * (raw 0: no DOF, no stale f-number); special values (0xDF00, 0xDC00, negative) stay ignored */
+static int r6_av_beyond(const uint32_t * buf, unsigned len)
+{
+    return buf && len == 2 && *(const int16_t *) buf > (96 - 8) * 96;
+}
+#endif
+
 //confirmed R, RP, M50
 PROP_HANDLER( PROP_LENS_STATIC_DATA )
 {
+#ifdef CONFIG_R6_LENS_DATA
+    /* R6 1.9.0: Canon registers 0x1D0 bytes (0xE058A8EC); any other length is ignored, no ASSERT in Canon's task */
+    if (!buf || len != sizeof(struct prop_lens_static_data)) { r6_lens_dbg.stat_bad++; return; }
+    r6_lens_dbg.stat_n++;
+#else
     ASSERT(len == sizeof(struct prop_lens_static_data));
+#endif
 
     const struct prop_lens_static_data * _static = (void*) buf;
     strncpy( lens_info.name, _static->lens_name, sizeof(lens_info.name) );
@@ -1383,6 +1424,10 @@ PROP_HANDLER( PROP_LENS_STATIC_DATA )
     lens_info.lens_focal_min   = _static->fl_wide;
     lens_info.lens_focal_max   = _static->fl_tele;
     lens_info.lens_extender    = _static->extender_id[0];
+#ifdef CONFIG_R6_LENS_DATA
+    r6_lens_dbg.ext = _static->extender_id[0];
+    if (lens_info.lens_extender == 0xFF) lens_info.lens_extender = 0;   /* R6 logs without extender: 0xFF = none [assumed] */
+#endif
 
     lens_info.IS               = _static->lens_is_funct_exists;
 
@@ -1639,6 +1684,16 @@ PROP_HANDLER( PROP_SHUTTER )
 
 PROP_HANDLER( PROP_APERTURE )
 {
+#ifdef CONFIG_R6_LENS_DATA
+    /* R6 1.9.0: 2 bytes Code768 (log "expo.ph[0x80000006]=..,2,0x00000300"); another length or a special value
+     * (0xDF00, negative) is ignored, above F45 "unknown" (raw 0, review L1). As before only used while
+     * CONTROL_BV == 0 (LVAE_STRUCT+0x28, Canon RAM). */
+    int raw = r6_av_prop(buf, len, &r6_lens_dbg.av_last);
+    if (!raw && !r6_av_beyond(buf, len)) { r6_lens_dbg.av_bad++; return; }
+    r6_lens_dbg.av_n++;
+    if (!CONTROL_BV) lensinfo_set_aperture(raw);
+    lens_display_set_dirty();
+#else
     //~ NotifyBox(2000, "%x %x %x %x ", buf[0], CONTROL_BV, lens_info.raw_aperture_min, lens_info.raw_aperture_max);
     if (!CONTROL_BV)
     {
@@ -1656,10 +1711,20 @@ PROP_HANDLER( PROP_APERTURE )
     bv_auto_update();
     #endif
     lens_display_set_dirty();
+#endif
 }
 
 PROP_HANDLER( PROP_APERTURE_AUTO )
 {
+#ifdef CONFIG_R6_LENS_DATA
+    /* R6 1.9.0: decoded like PROP_APERTURE (2 bytes Code768), anything else ignored. Whether the R6 delivers this id
+     * at all is open (no literal in ROM0, not in the M9 logs); a Code768 0 is F1.0, not "no value". */
+    int raw = r6_av_prop(buf, len, &r6_lens_dbg.aa_last);
+    if (!raw && !r6_av_beyond(buf, len)) { r6_lens_dbg.aa_bad++; return; }   /* above F45: unknown (review L1) */
+    r6_lens_dbg.aa_n++;
+    if (!CONTROL_BV) lensinfo_set_aperture(raw);
+    lens_display_set_dirty();
+#else
     /* this gets updated in Tv mode (where PROP_APERTURE is not updated); same for P, Auto and so on */
     /* it becomes 0 when camera is no longer metering */
 
@@ -1678,6 +1743,7 @@ PROP_HANDLER( PROP_APERTURE_AUTO )
     }
 
     lens_display_set_dirty();
+#endif
 }
 
 PROP_HANDLER( PROP_SHUTTER_AUTO )
@@ -1858,6 +1924,7 @@ static void update_stuff()
     iso_components_update();
 }
 
+#ifndef CONFIG_R6_LENS_DATA
 static void focus_ring_powersave_fix()
 {
     if (!RECORDING && is_manual_focus())
@@ -1866,6 +1933,7 @@ static void focus_ring_powersave_fix()
         powersave_prolong();
     }
 }
+#endif
 
 void _lens_dynamic_data_post_update()
 {
@@ -1888,7 +1956,13 @@ void _lens_dynamic_data_post_update()
 
         idle_wakeup_reset_counters(-11);
         lens_display_set_dirty();
+#ifndef CONFIG_R6_LENS_DATA
         focus_ring_powersave_fix();
+#else
+        /* R6 (M10.1): no focus_ring_powersave_fix - powersave_prolong requests a property write
+         * (PROP_ICU_AUTO_POWEROFF) on every focus ring turn in LV with MF; property writes stay off on the R6,
+         * also if they are approved one day (docs/m10_plan.md 1.3) */
+#endif
 
         #ifdef FEATURE_LV_ZOOM_SETTINGS
         zoom_focus_ring_trigger();
@@ -1957,7 +2031,61 @@ void _prop_lv_lens_request_update()
 }
 #endif
 
-#if defined(CONFIG_DIGIC_8X)
+#if defined(CONFIG_DIGIC_8X) && defined(CONFIG_R6_LENS_DATA)
+/* R6 1.9.0 (M10.1): 0x8C bytes (registration 0xE058A96A), up to ~5 per second in Canon's property task: decode and
+ * plain stores only (no lock, no print, no allocation); any other length is ignored */
+PROP_HANDLER( PROP_LENS_DYNAMIC_DATA )
+{
+    if (!buf || len != sizeof(struct prop_lens_dynamic_data)) { r6_lens_dbg.dyn_bad++; return; }
+
+    const struct prop_lens_dynamic_data * const _dynamic = (void*) buf;
+    unsigned fl = _dynamic->FL, near = _dynamic->focus_near, far = _dynamic->focus_far;
+    r6_lens_dbg.dyn_n++;
+    r6_lens_dbg.near = near; r6_lens_dbg.far = far;
+    r6_lens_dbg.st2 = _dynamic->st2; r6_lens_dbg.st3 = _dynamic->st3;
+    r6_lens_dbg.fl_bad = fl > 5000;
+
+    lens_info.focal_len = fl > 5000 ? 0 : fl;            /* bogus (0xFFFF): 0, as the PROP_LV_LENS handler does;
+                                                           * review L4: real maximum 2400 mm (RF 1200 + RF 2x) */
+    lens_info.IS        = _dynamic->st3 & 0xF;           /* IS bits 2 / 1 (LensIf_GetISSwitch 0xE0749ADC) [meaning assumed] */
+    /* st2 bit 7 = MF [assumed]: logged only (r6_lens_dbg), af_mode keeps coming from PROP_AF_MODE */
+
+    /* widest / smallest aperture (Code768) -> ML's limits; anything else (no lens, 0xDF00): no limits (no clamping) */
+    int amin = r6_av768_raw(_dynamic->AVO), amax = r6_av768_raw(_dynamic->AVMAX);
+    if (amin && amax > 8 && amin <= amax)                /* review L3: no real lens stops down only to F1.0 */
+    {
+        lens_info.raw_aperture_min = amin;
+        lens_info.raw_aperture_max = amax;
+        if (lens_info.raw_aperture && (lens_info.raw_aperture < amin || lens_info.raw_aperture > amax))
+            lensinfo_set_aperture(COERCE(lens_info.raw_aperture, amin, amax));   /* valid limits changed */
+    }
+    else
+    {
+        lens_info.raw_aperture_min = lens_info.raw_aperture_max = 0;
+    }
+
+    /* harmonic mean 2 * near * far / (near + far) of the cm values, in 64 bit (near * far > 2^30 overflowed);
+     * far 0xFFFF = infinity [assumed] (DOF Settings shows " Infty"); near = far = 0: no distance, no division */
+    if (far == 0xFFFF)
+        lens_info.focus_dist = 0xFFFF;
+    else if (near + far == 0)
+        lens_info.focus_dist = 0;
+    else
+        lens_info.focus_dist = (unsigned) ((2ull * near * far) / (near + far));
+
+    if(_dynamic->focusPos == 0xFFFF)
+    {
+        // lens doesn't report focusPos, work around by using focus distance instead.
+        lens_info.focus_pos     = lens_info.focus_dist;
+    }
+    else
+    {
+        lens_info.focus_pos     = _dynamic->focusPos;
+    }
+
+    _lens_dynamic_data_post_update();
+}
+#elif defined(CONFIG_DIGIC_8X)
 PROP_HANDLER( PROP_LENS_DYNAMIC_DATA )
 {
     if(len != sizeof(struct prop_lens_dynamic_data))
