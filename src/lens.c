@@ -1399,6 +1399,21 @@ static int r6_av_beyond(const uint32_t * buf, unsigned len)
 {
     return buf && len == 2 && *(const int16_t *) buf > (96 - 8) * 96;
 }
+
+/* M10.1 fix C: Canon's set aperture as ML raw, from the last PROP_APERTURE / PROP_APERTURE_AUTO that ML applied
+ * (CONTROL_BV == 0); 0 = none yet or unknown (above F45, review L1). Canon keeps its set value when the lens limits
+ * move and sends no new PROP_APERTURE on a zoom (camera log M10.1: set F1.4 with an F5-6.3 zoom, set F5.0 at 600 mm);
+ * the lens cannot open wider than AVO. ML therefore shows the set value under the current limits. Clamping
+ * lens_info.raw_aperture itself lost the set value: F6.3 stayed after 150 -> 600 -> 150 mm (LVP00068, LVP00070..76). */
+static int r6_av_set = 0;
+
+/* M10.1b: Canon's set aperture as remembered here (ML raw, 0 = none yet or unknown) for the Expo log, last field of
+ * expo.lensml.av (lvprobe.c); lens_info.raw_aperture shows it under the current lens limits, so the log tells a set
+ * value outside the limits (camera log M10.1: set F1.4 with an F5-6.3 zoom) from a clamped one */
+int r6_lens_av_set(void)
+{
+    return r6_av_set;
+}
 #endif
 
 //confirmed R, RP, M50
@@ -1687,11 +1702,11 @@ PROP_HANDLER( PROP_APERTURE )
 #ifdef CONFIG_R6_LENS_DATA
     /* R6 1.9.0: 2 bytes Code768 (log "expo.ph[0x80000006]=..,2,0x00000300"); another length or a special value
      * (0xDF00, negative) is ignored, above F45 "unknown" (raw 0, review L1). As before only used while
-     * CONTROL_BV == 0 (LVAE_STRUCT+0x28, Canon RAM). */
+     * CONTROL_BV == 0 (LVAE_STRUCT+0x28, Canon RAM). Fix C: kept as Canon's set value for later limit changes. */
     int raw = r6_av_prop(buf, len, &r6_lens_dbg.av_last);
     if (!raw && !r6_av_beyond(buf, len)) { r6_lens_dbg.av_bad++; return; }
     r6_lens_dbg.av_n++;
-    if (!CONTROL_BV) lensinfo_set_aperture(raw);
+    if (!CONTROL_BV) { r6_av_set = raw; lensinfo_set_aperture(raw); }
     lens_display_set_dirty();
 #else
     //~ NotifyBox(2000, "%x %x %x %x ", buf[0], CONTROL_BV, lens_info.raw_aperture_min, lens_info.raw_aperture_max);
@@ -1718,11 +1733,12 @@ PROP_HANDLER( PROP_APERTURE_AUTO )
 {
 #ifdef CONFIG_R6_LENS_DATA
     /* R6 1.9.0: decoded like PROP_APERTURE (2 bytes Code768), anything else ignored. Whether the R6 delivers this id
-     * at all is open (no literal in ROM0, not in the M9 logs); a Code768 0 is F1.0, not "no value". */
+     * at all is open (no literal in ROM0, not in the M9 / M10.1 logs); a Code768 0 is F1.0, not "no value".
+     * Fix C: replaces the set value like PROP_APERTURE, else the next dynamic update would undo it. */
     int raw = r6_av_prop(buf, len, &r6_lens_dbg.aa_last);
     if (!raw && !r6_av_beyond(buf, len)) { r6_lens_dbg.aa_bad++; return; }   /* above F45: unknown (review L1) */
     r6_lens_dbg.aa_n++;
-    if (!CONTROL_BV) lensinfo_set_aperture(raw);
+    if (!CONTROL_BV) { r6_av_set = raw; lensinfo_set_aperture(raw); }
     lens_display_set_dirty();
 #else
     /* this gets updated in Tv mode (where PROP_APERTURE is not updated); same for P, Auto and so on */
@@ -2056,12 +2072,16 @@ PROP_HANDLER( PROP_LENS_DYNAMIC_DATA )
     {
         lens_info.raw_aperture_min = amin;
         lens_info.raw_aperture_max = amax;
-        if (lens_info.raw_aperture && (lens_info.raw_aperture < amin || lens_info.raw_aperture > amax))
-            lensinfo_set_aperture(COERCE(lens_info.raw_aperture, amin, amax));   /* valid limits changed */
+        /* fix C: Canon's set value under the new limits (set F1.4: F5.0 at 150 mm, F6.3 at 600 mm, F5.0 again at
+         * 150 mm; unknown stays unknown), also while CONTROL_BV != 0 (r6_av_set holds only applied values);
+         * lensinfo_set_aperture (update_stuff) only on a change, this handler runs up to ~5 times per second */
+        int eff = r6_av_set ? COERCE(r6_av_set, amin, amax) : 0;
+        if (eff != lens_info.raw_aperture)
+            lensinfo_set_aperture(r6_av_set);                /* valid limits changed */
     }
     else
     {
-        lens_info.raw_aperture_min = lens_info.raw_aperture_max = 0;
+        lens_info.raw_aperture_min = lens_info.raw_aperture_max = 0;   /* aperture kept as it is (as before) */
     }
 
     /* harmonic mean 2 * near * far / (near + far) of the cm values, in 64 bit (near * far > 2^30 overflowed);

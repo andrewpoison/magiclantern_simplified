@@ -31,6 +31,10 @@ static CONFIG_INT( "dof.info.formula", dof_info_formula, 0);
 
 #ifdef CONFIG_FULLFRAME
 static CONFIG_INT( "dof.info.coc.ff", dof_info_coc, 29);
+#elif defined(CONFIG_R6_LENS_DATA)
+/* R6 (M10.1b): full frame (36 x 24 mm), the full-frame circle of confusion for the DOF values. internals.h does not set
+ * CONFIG_FULLFRAME (that would also change raw.c, lens.c, tweaks.c, flexinfo.c and lv-img-engio.c). */
+static CONFIG_INT( "dof.info.coc.ff", dof_info_coc, 29);
 #else
 static CONFIG_INT( "dof.info.coc.apsc", dof_info_coc, 19);
 #endif
@@ -201,6 +205,19 @@ void focus_calc_dof()
         uint64_t dof_far = fl + (fd*H - 2*fl*fd + fl2)/(H-fd); // in mm relative to the sensor plane
         lens_info.dof_far = MIN(dof_far, 1000 * 1000);
     }
+#ifdef CONFIG_R6_LENS_DATA
+    /* R6 (M10.1b): focus distance 0xFFFF = focused at infinity (src/lens.c, far 0xFFFF). The limit of the formulas
+     * above for fd -> infinity: near = H + fl = the hyperfocal distance (referenced to the sensor like the other
+     * values), far = infinity. Taken as 655.35 m they gave 542 .. 830 m at 600 mm F6.1 instead of 3.1 km .. infinity
+     * (camera log M10.1, LVP00069, CoC 19 um; 2.0 km with the R6 default 29 um). fd + fl is the distance this
+     * computation used (focus_dist read once above); every other distance, the flags and the diffraction values stay
+     * as computed. */
+    if (fd + fl == 0xFFFF * 10)
+    {
+        lens_info.dof_near = lens_info.hyperfocal;
+        lens_info.dof_far = 1000 * 1000; // infinity
+    }
+#endif
 
     // update DOF flags
     lens_info.dof_flags = dof_flags;

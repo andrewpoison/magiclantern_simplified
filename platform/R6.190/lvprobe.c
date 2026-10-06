@@ -1963,6 +1963,22 @@ static void lp_iv_log(struct lp_buf * b)
  * 8..11 [[[0x10864]+0x5A4 / 0x644 / 0x6E4 / 0x784]+0x10] (getters 0xE035A7A8
  * .. 0xE035A7CC). Plus ML's own decoded lens values (expo.lensml, src/lens.c
  * CONFIG_R6_LENS_DATA) and CONTROL_BV (LVAE_STRUCT+0x28).
+ * M10.1b Tor 0c (docs/m10_plan.md 2.11, read only under the same approval):
+ * [cc+0xA84] (CC state 3 means "nothing active" only while it is 0: the AE
+ * timer is armed only then 0xE070D6B2, screen exits 0xE0643FF8; set to 1
+ * 0xE06DAF00), Canon's global [0x5184] (X-sync source of 0xE0A0B72C: 0 ->
+ * 0x1800 = 1/250, 2 -> 0x1700 / 0x1680), the backup-slot flags of the checks
+ * every Tv request runs, [cc+0x28B4+4*slot] (0xE0712FB0 / 0xE0713006; the
+ * slot API's base [0x1086C] is the CC object, allocated 0xE0711E7E): step
+ * block 0x28 [cc+0x2954] (restore 0xE0395B30), AEB 0xF [cc+0x28F0]
+ * (0xE03B2C22, only while [cc+0xB74] == 0, 0xE03B2C12), compensation 0x2D
+ * [cc+0x2968] (0xE03B2934), ALO 0x20 [cc+0x2934] (0xE03DAF52), flash 0x66
+ * [cc+0x2A4C] (0xE03DD544), plus [cc+0xB74]; the sheet's byte [p+0x5F4]
+ * (the input of 0xE0717AC4: ldrb 0xE0717AB0 / 0xE07177E8), [p+0xD8] (word 2
+ * of the step block p+0xD4: 1 <-> 2 resets AEB, 0xE0395BB6 -> 0xE0395F4E)
+ * and [p+0x100] (word 3 of the block p+0xF8: a change re-checks AEB,
+ * 0xE0395D56). All in ring B and the snapshot. ML's remembered set aperture
+ * (src/lens.c fix C) is the last field of expo.lensml.av.
  * Ring A (expo.pr): extra ML property handlers, only on ids this build
  * registers anyway (all in the baseline handler table with another
  * handler, none on the deny list, never PROP_ISO), so Canon's slave list
@@ -2117,6 +2133,18 @@ static const struct lp_xf lp_xf[] = {
     { "subst9",     LP_XB_SUB, 4, LP_XD_DEC,     0, 0x644 },      /* (9 = expo.tvsubst, getter 0xE035A7B4) */
     { "subst10",    LP_XB_SUB, 4, LP_XD_DEC,     0, 0x6E4 },
     { "subst11",    LP_XB_SUB, 4, LP_XD_DEC,     0, 0x784 },
+    /* M10.1b Tor 0c (all 32-bit loads in the ROM excerpts except p5f4: ldrb) */
+    { "ca84",       LP_XB_CC,  4, LP_XD_DEC,     0, 0xA84 },      /* != 0: state 3 without AE timer (0xE070D6B2, 0xE0643FF8) */
+    { "xsync_src",  LP_XB_RAM, 4, LP_XD_DEC,     0, 0x5184 },     /* X-sync 0xE0A0B72C: 0 -> 1/250, 2 -> 1/200 (0xE0A0B732) */
+    { "slot28",     LP_XB_CC,  4, LP_XD_DEC,     0, 0x2954 },     /* slot flags [cc+0x28B4+4*slot] (0xE0712FB0): step block */
+    { "slot0f",     LP_XB_CC,  4, LP_XD_DEC,     0, 0x28F0 },     /* AEB (restored only while cb74 == 0, 0xE03B2C22) */
+    { "slot2d",     LP_XB_CC,  4, LP_XD_DEC,     0, 0x2968 },     /* exposure compensation (restore 0xE03B2934) */
+    { "slot20",     LP_XB_CC,  4, LP_XD_DEC,     0, 0x2934 },     /* ALO (restore 0xE03DAF52) */
+    { "slot66",     LP_XB_CC,  4, LP_XD_DEC,     0, 0x2A4C },     /* flash (restore 0xE03DD544) */
+    { "cb74",       LP_XB_CC,  4, LP_XD_DEC,     0, 0xB74 },      /* != 0: AEB slot 0xF not restored (0xE03B2C12) */
+    { "p5f4",       LP_XB_P,   1, LP_XD_DEC,     0, 0x5F4 },      /* byte, input of 0xE0717AC4 (0xE0717AB0, 0xE07177E8) */
+    { "pd8",        LP_XB_P,   4, LP_XD_DEC,     0, 0x0D8 },      /* step block word 2: 1 <-> 2 resets AEB (0xE0395BB6) */
+    { "p100",       LP_XB_P,   4, LP_XD_HEX,     0, 0x100 },      /* block p+0xF8 word 3: change -> AEB check (0xE0395D56) */
 };
 #define LP_XF_N    ((int) COUNT(lp_xf))
 #define LP_XF_SEC  32                              /* index of "sec" */
@@ -2324,6 +2352,8 @@ static void lp_x_match(struct lp_buf * b, const char * name, int i, int field, u
     lp_printf(b, "expo.match.%s=%d,0x%x,0x%x\n", name, (lp_xph_last[i].w0 & m) == (v & m), (int) (lp_xph_last[i].w0 & m), (int) (v & m));
 }
 
+extern int r6_lens_av_set(void);   /* src/lens.c (CONFIG_R6_LENS_DATA, M10.1b fix C): Canon's set aperture, ML raw */
+
 static void lp_x_log(struct lp_buf * b)
 {
     char k[40], s1[24], s2[24];
@@ -2401,12 +2431,12 @@ static void lp_x_log(struct lp_buf * b)
             (int) lens_info.lens_id, (int) lens_info.focal_len, (int) lens_info.focus_dist, (int) lens_info.focus_pos,
             (int) lens_info.IS, (d->st2 >> 7) & 1, (int) d->st2, (int) d->st3, (int) d->near, (int) d->far,
             (int) lens_info.lens_extender, (int) d->ext, (int) d->fl_bad);
-        lp_printf(b, "# expo.lensml.av=raw,f_x10,raw_min,raw_max,control_bv,dof_near_mm,dof_far_mm,hyperfocal_mm,focal_min,focal_max\n");
+        lp_printf(b, "# expo.lensml.av=raw,f_x10,raw_min,raw_max,control_bv,dof_near_mm,dof_far_mm,hyperfocal_mm,focal_min,focal_max,av_set\n");
         if (cbv_ok) snprintf(s1, sizeof(s1), "%d", (int) cbv); else snprintf(s1, sizeof(s1), "na");
-        lp_printf(b, "expo.lensml.av=0x%02x,%d,0x%02x,0x%02x,%s,%d,%d,%d,%d,%d\n", (int) lens_info.raw_aperture,
+        lp_printf(b, "expo.lensml.av=0x%02x,%d,0x%02x,0x%02x,%s,%d,%d,%d,%d,%d,0x%02x\n", (int) lens_info.raw_aperture,
             (int) lens_info.aperture, (int) lens_info.raw_aperture_min, (int) lens_info.raw_aperture_max, s1,
             (int) lens_info.dof_near, (int) lens_info.dof_far, (int) lens_info.hyperfocal, (int) lens_info.lens_focal_min,
-            (int) lens_info.lens_focal_max);
+            (int) lens_info.lens_focal_max, r6_lens_av_set());
         lp_printf(b, "# expo.lensml.n=dyn,dyn_bad,stat,stat_bad,av,av_bad,av_auto,av_auto_bad,av_last,av_auto_last\n");
         lp_printf(b, "expo.lensml.n=%d,%d,%d,%d,%d,%d,%d,%d,0x%04x,0x%04x\n", (int) d->dyn_n, (int) d->dyn_bad,
             (int) d->stat_n, (int) d->stat_bad, (int) d->av_n, (int) d->av_bad, (int) d->aa_n, (int) d->aa_bad,
