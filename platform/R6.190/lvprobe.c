@@ -71,6 +71,11 @@
  * snapshot, see lp_x_* below); the RandomData ring is read with its 20
  * slots; the grid's counters (grid.*, r6_grid.c).
  *
+ * M10.2: the Tv write path's state and its 32-entry write ring (pw.*, from
+ * r6_propw.c), R6 Interval's bracket (iv.bkt.*), and the Tor 0d fields of the
+ * expo log (D1, read only: Canon's multi-shot settings, the raw C.Fn Tv range,
+ * the CC backups, the flash predicate inputs, the CC object globals).
+ *
  * Addresses: ROM0 1.9.0. Evidence per field: see the comments below and
  * the M7.0 report.
  */
@@ -103,6 +108,9 @@
 #ifdef CONFIG_R6_INTERVAL
 #include "lens.h"
 #include "r6_interval.h"
+#endif
+#ifdef CONFIG_R6_PROPW_TV
+#include "r6_propw.h"
 #endif
 #ifdef CONFIG_R6_GRID
 #include "r6_grid.h"
@@ -1577,11 +1585,11 @@ static void lp_ivb2(struct lp_buf * b, const char * key, uint32_t base, uint32_t
     lp_ivb(b, key, RD(base + poff), n2, off);
 }
 
-/* one r6_iv_cc snapshot on one line (M8.2: 29 fields; M9.2: 38) */
+/* one r6_iv_cc snapshot on one line (M8.2: 29 fields; M9.2: 38; M10.2: 44) */
 static void lp_iv_cc(struct lp_buf * b, const char * key, const struct r6_iv_cc * s)
 {
     lp_printf(b, "%s=%d,%d,%d,%d,%d,%d,0x%x,0x%x,%d,0x%x,0x%x,%d,%d,%d,%d,%d,%d,%d,%d,%d,0x%x,0x%x,%d,%d,%d,%d,%d,%d,%d"
-                 ",%d,%d,%d,0x%x,%d,%d,%d,%d,%d\n", key,
+                 ",%d,%d,%d,0x%x,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", key,
         (int) s->state, (int) s->state_prev, (int) s->relseq, (int) s->b54, s->df, s->e0, (int) s->pend, (int) s->work,
         (int) s->shmode, (int) s->a68, (int) s->a6c, (int) s->r888, (int) s->relcnt, (int) s->jobs, (int) s->jid,
         (int) s->jdone, (int) s->access,
@@ -1589,7 +1597,8 @@ static void lp_iv_cc(struct lp_buf * b, const char * key, const struct r6_iv_cc 
         (int) s->p_tv, (int) s->p_92c, (int) s->p_lenr, (int) s->p_itimer, (int) s->p_fbrk, (int) s->b98, (int) s->c830,
         (int) s->r5f8,
         (int) s->d30, (int) s->ba0, (int) s->sec, (int) s->bulbw, (int) s->ta, (int) s->ta_ms, (int) s->tb, (int) s->tb_ms,
-        (int) s->bulb_ms);
+        (int) s->bulb_ms,
+        (int) s->p_hdr, (int) s->p_me, (int) s->p_wbb, (int) s->p_fbkt, (int) s->p_msnr, (int) s->p_shtype);   /* M10.2 */
 }
 
 /* FA-Neo node walk (approved Option 4, only with a live job: a jobref of a finished job points to
@@ -1658,8 +1667,9 @@ static void lp_iv_faneo(struct lp_buf * b)
     lp_printf(b, "iv.job.fa.stable=%d\n", memcmp(&f, &f2, sizeof(f)) == 0);
 }
 
-#define LP_IV_SHOTS_LOG 32        /* M9.2 review: picture-ring entries in the log (~190 B each); the worst case
-                                   * (Expo log on with full rings, 64 pictures) stays below LP_LOG_SIZE */
+#define LP_IV_SHOTS_LOG 24        /* M9.2 review: picture-ring entries in the log (~190 B each); the worst case
+                                   * (Expo log on with full rings, 64 pictures) stays below LP_LOG_SIZE. M10.2 (spec 6.3):
+                                   * 32 -> 24, the write ring and the Tor 0d fields left < 2 KB of the 96 KB (QEMU m102) */
 static void lp_iv_log(struct lp_buf * b)
 {
     const struct r6_iv_stats * s = r6_iv_stats();
@@ -1706,6 +1716,20 @@ static void lp_iv_log(struct lp_buf * b)
     lp_printf(b, "iv.bulb.warn=0x%x\n", (int) s->bulb_warn);
     lp_printf(b, "iv.bulb.running=%d\n", r6_iv_bulb_running());
     lp_printf(b, "iv.mode=%d\n", s->mode);                            /* M9.3: 0 interval, 1 motion release, 2 motion view */
+    {
+        const struct r6_iv_bkt * bkp = r6_iv_bkt();                      /* M10.2: the run's bracket */
+        char t[80];
+        int j = 0;
+        t[0] = 0;
+        lp_printf(b, "iv.bkt=%d,%d,%d,%d,%d,%d,%d\n", bkp->mode, bkp->n, bkp->step, bkp->order, _r6pw_ev_on(), bkp->k, bkp->ev);
+        lp_printf(b, "iv.bkt.base=0x%04x\n", bkp->base & 0xFFFF);
+        for (int i = 0; i < bkp->n && i < R6IV_BKT_MAXN; i++) j += snprintf(t + j, sizeof(t) - j, i ? ",0x%04x" : "0x%04x", bkp->list[i] & 0xFFFF);
+        lp_printf(b, "iv.bkt.list=%s\n", t[0] ? t : "-");
+        lp_printf(b, "iv.bkt.need_ms=%d\n", bkp->need);
+        lp_printf(b, "iv.bkt.need_nr_ms=%d\n", bkp->need_nr);
+        lp_printf(b, "iv.bkt.fit=%d\n", bkp->fit);
+        lp_printf(b, "iv.bkt.writes=%d\n", bkp->writes);
+    }
     lp_printf(b, "iv.md_refused=%d,%s\n", r6_iv_md_refused(), lp_nosp(r6_iv_cam_name(r6_iv_md_refused()), w, sizeof(w)));
     lp_printf(b, "iv.cam=%d,%s\n", c, lp_nosp(r6_iv_cam_name(c), w, sizeof(w)));
     lp_printf(b, "iv.canon=%d,%s\n", k, lp_nosp(r6_iv_canon_name(k), w, sizeof(w)));
@@ -1871,17 +1895,18 @@ static void lp_iv_log(struct lp_buf * b)
     lp_glob(b, "iv.job.class_s", 0x9DA4);
     lp_iv_faneo(b);
 
-    int n = MIN((int) s->shots, LP_IV_SHOTS_LOG);   /* M9.2 review: the newest 32 of the 64 (log < 96 KB) */
+    int n = MIN((int) s->shots, LP_IV_SHOTS_LOG);   /* M9.2 review: the newest LP_IV_SHOTS_LOG of the 64 (log < 96 KB) */
     lp_printf(b, "# iv.shot[i]=t,ret,dur,d_cnt,d_fn,pic_ms,job_ms,jobs_after,js_before,js_after,wait_ms,wait_mask,"
                  "sw1_ms,acc_ms,off_ms,seq_ms,off_why,off_state,states,d_rel,d_jid,sm_before,sm_after,late,second,final,"
                  "tv,tv_cc,busy,s5_ms,exp_ms,slot_late,r92c,nr,cflag,"
-                 "bulb,bend,bbtn,bwarn,drive,r5e8,bt,sec_max,bulbw,bulbw_after,ta_ms,bulb_ms,d30_ms,clk_back\n");
+                 "bulb,bend,bbtn,bwarn,drive,r5e8,bt,sec_max,bulbw,bulbw_after,ta_ms,bulb_ms,d30_ms,clk_back,"
+                 "bk,bn,want,ev,wr\n");
     for (int i = 0; i < n; i++)
     {
         const struct r6_iv_shot * e = &s->ring[(s->shots - n + i) % R6IV_RING];
         lp_printf(b, "iv.shot[%d]=%d,%d,%d,%d,%d,%d,%d,%d,0x%x,0x%x,%d,0x%x,%d,%d,%d,%d,%d,%d,0x%x,%d,%d,%d,%d,0x%x,%d,0x%x,"
                      "%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                     "%d,%d,0x%x,0x%x,%d,%d,%d,%d,0x%x,0x%x,%d,%d,%d,%d\n",
+                     "%d,%d,0x%x,0x%x,%d,%d,%d,%d,0x%x,0x%x,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
             (int) (s->shots - n + i),
             (int) e->t, (int) e->ret, (int) e->dur, (int) e->d_cnt, (int) e->d_fn, (int) e->pic_ms,
             (int) e->job_ms, (int) e->jobs_after, (int) e->js_before, (int) e->js_after,
@@ -1890,14 +1915,15 @@ static void lp_iv_log(struct lp_buf * b)
             e->sm_before, e->sm_after, e->late, e->second, e->final,
             e->tv, e->tv_cc, (int) e->busy, (int) e->s5_ms, (int) e->exp_ms, (int) e->slot_late, e->r92c, e->nr, e->cflag,
             e->bulb, e->bend, e->bbtn, e->bwarn, e->drive, e->r5e8, e->bt, e->sec_max, (int) e->bulbw, (int) e->bulbw_after,
-            (int) e->ta_ms, (int) e->bulb_ms, (int) e->d30_ms, e->clk_back);
+            (int) e->ta_ms, (int) e->bulb_ms, (int) e->d30_ms, e->clk_back,
+            e->bk, e->bn, e->want, e->ev, e->wr);                                         /* M10.2 */
     }
 
     /* last picture: snapshots and trace (codes: r6_interval.c iv_tr_codes, 1..4 the switch calls, X the reason) */
     const struct r6_iv_last * l = r6_iv_last();
     lp_printf(b, "# iv.last.*=state,state_prev,relseq,b54,df,e0,pend,work,shmode,a68,a6c,r888,relcnt,jobs,jid,jdone,"
                  "access,faneo_empty,tsc,fn,gui,p_tv,p_92c,p_lenr,p_itimer,p_fbrk,b98,c830,r5f8,"
-                 "d30,ba0,sec,bulbw,ta,ta_ms,tb,tb_ms,bulb_ms\n");
+                 "d30,ba0,sec,bulbw,ta,ta_ms,tb,tb_ms,bulb_ms,hdr,me,wbb,fbkt,msnr,shtype\n");
     lp_iv_cc(b, "iv.last.pre", &l->pre);
     lp_iv_cc(b, "iv.last.off", &l->off);
     lp_iv_cc(b, "iv.last.post", &l->post);
@@ -1993,7 +2019,7 @@ static void lp_iv_log(struct lp_buf * b)
 #define LP_X_CC         0x10AB8    /* CameraConductor (set 0xE0295DCA; r6_interval.h R6IV_RAM_CC) */
 #define LP_X_CC_SIZE    0x3510     /* fields up to the sheet pointers [cc+0x34FC..0x350F] */
 #define LP_X_CC_P       0x34FC     /* p = sheet 0, current stills settings */
-#define LP_X_P_SIZE     0x930      /* fields read below 0x64C (r6_interval.h R6IV_P_SIZE) */
+#define LP_X_P_SIZE     0xB9C      /* M10.2: fields up to [p+0xB98] (r6_interval.h R6IV_P_SIZE) */
 #define LP_X_SHEET_SIZE 0x620      /* per sheet: AE 0x008 .. Tv 0x61E */
 #define LP_X_DS_PTR     0x10868    /* Canon's DataStore: sheet pointers [ds+0x2F4+4k], k = 0..10 */
 #define LP_X_DS_SIZE    0x320
@@ -2068,7 +2094,8 @@ LP_XPH(0x80020037);   /* lens dynamic data, 0x8C bytes (length + 8 bytes only) *
 LP_XPH(0x8003009A);   /* lens static data (length + 8 bytes only) */
 
 /* ---- ring B: the CC copies and bulb fields, sampled every 200 ms ---- */
-enum { LP_XB_CC, LP_XB_P, LP_XB_RAM, LP_XB_DS, LP_XB_MM, LP_XB_SUB };   /* M10.1: DataStore, M memory, flags 8..11 */
+enum { LP_XB_CC, LP_XB_P, LP_XB_RAM, LP_XB_DS, LP_XB_MM, LP_XB_SUB,    /* M10.1: DataStore, M memory, flags 8..11 */
+       LP_XB_FLB, LP_XB_CCG };                                          /* M10.2: flash bytes, CC object globals (computed) */
 enum { LP_XD_HEX, LP_XD_DEC, LP_XD_TV, LP_XD_AV, LP_XD_ISO, LP_XD_EV, LP_XD_AE, LP_XD_ISOPAIR, LP_XD_TVPAIR, LP_XD_HMS };
 struct lp_xf { const char * name; uint8_t base, size, dec, pad; uint32_t off; };
 static const struct lp_xf lp_xf[] = {
@@ -2096,7 +2123,7 @@ static const struct lp_xf lp_xf[] = {
     { "expsim",     LP_XB_P,   4, LP_XD_HEX,     0, 0x548 },      /* 0x80000034 */
     { "htp",        LP_XB_P,   4, LP_XD_HEX,     0, 0x4FC },      /* 0x8000004A */
     { "lenr",       LP_XB_P,   4, LP_XD_HEX,     0, 0x54C },      /* 0x80000048 */
-    { "tvrange",    LP_XB_P,   4, LP_XD_TVPAIR,  0, 0x114 },      /* C.Fn: fastest 0x114, slowest 0x116 */
+    { "tvrange",    LP_XB_P,   4, LP_XD_TVPAIR,  0, 0x114 },      /* Canon's cached dial limits: fastest 0x114, slowest 0x116 (K36) */
     { "bulbtimer",  LP_XB_P,   4, LP_XD_HMS,     0, 0x648 },      /* 0x8004005B {on, h, m, s} */
     { "itimer",     LP_XB_P,   4, LP_XD_HMS,     0, 0x50A },      /* 0x8004005A {on, h, m, s} */
     { "t634",       LP_XB_P,   4, LP_XD_HMS,     0, 0x634 },      /* 0x80040064: byte + h:m:s */
@@ -2122,7 +2149,7 @@ static const struct lp_xf lp_xf[] = {
     { "c304",       LP_XB_CC,  4, LP_XD_DEC,     0, 0x304 },      /* "normal context" needs 0 (0xE071819C) */
     { "c31c",       LP_XB_CC,  4, LP_XD_DEC,     0, 0x31C },      /* 1: CC_SetTv stores in any AE mode (0xE0716F9A) */
     { "step",       LP_XB_P,   4, LP_XD_DEC,     0, 0x0D4 },      /* exposure step 2 = 1/3, 1 = 1/2 (0xE0641FD0) */
-    { "tvclamp",    LP_XB_P,   4, LP_XD_HEX,     0, 0x5B8 },      /* 0x8002002E: 1 = clamp both ends */
+    { "tvclamp",    LP_XB_P,   4, LP_XD_HEX,     0, 0x5B8 },      /* 0x8002002E movie HDR (ATest_MovHDRG; key name kept, K6) */
     { "flash",      LP_XB_P,   4, LP_XD_HEX,     0, 0x670 },      /* 0x80040013 flash firing */
     { "mmem",       LP_XB_DS,  4, LP_XD_HEX,     0, LP_X_MM_OFF }, /* the M memory record pointer [ds+0x2E8] */
     { "mm_tv",      LP_XB_MM,  2, LP_XD_TV,      0, 0x040 },      /* M memory Tv / Av (dial -> M loads them, */
@@ -2145,6 +2172,42 @@ static const struct lp_xf lp_xf[] = {
     { "p5f4",       LP_XB_P,   1, LP_XD_DEC,     0, 0x5F4 },      /* byte, input of 0xE0717AC4 (0xE0717AB0, 0xE07177E8) */
     { "pd8",        LP_XB_P,   4, LP_XD_DEC,     0, 0x0D8 },      /* step block word 2: 1 <-> 2 resets AEB (0xE0395BB6) */
     { "p100",       LP_XB_P,   4, LP_XD_HEX,     0, 0x100 },      /* block p+0xF8 word 3: change -> AEB check (0xE0395D56) */
+    /* M10.2 Tor 0d (spec 6.2): the sheet keys (Tor 0 (a)) */
+    { "hdr",        LP_XB_P,   4, LP_XD_HEX,     0, 0x4EC },      /* byte 0 HDRFunc (0x80000045) */
+    { "me",         LP_XB_P,   4, LP_XD_HEX,     0, 0x5F4 },      /* byte 0 multiple exposure (p5f4 keeps the byte) */
+    { "wbb_ba",     LP_XB_P,   4, LP_XD_HEX,     0, 0x654 },      /* WB bracketing B/A 0..3 */
+    { "wbb_gm",     LP_XB_P,   4, LP_XD_HEX,     0, 0x658 },      /* WB bracketing G/M */
+    { "fbkt",       LP_XB_P,   4, LP_XD_HEX,     0, 0x918 },      /* focus bracketing on */
+    { "fbkt_n",     LP_XB_P,   4, LP_XD_DEC,     0, 0x91C },      /* focus bracketing shots */
+    { "msnr",       LP_XB_P,   4, LP_XD_DEC,     0, 0x4F4 },      /* 4 = multi-shot NR */
+    { "shtype",     LP_XB_P,   4, LP_XD_DEC,     0, 0xB98 },      /* shutter type, 3 = electronic (ROM-supported, K36) [I] */
+    { "cfnr",       LP_XB_P,   4, LP_XD_TVPAIR,  0, 0x110 },      /* raw C.Fn Tv range fast / slow (K36); tvrange = Canon's cache */
+    { "flicker",    LP_XB_P,   4, LP_XD_HEX,     0, 0x4E4 },      /* anti-flicker (log only) */
+    { "selfcnt",    LP_XB_P,   2, LP_XD_HEX,     0, 0x4A8 },      /* continuous self-timer */
+    { "alo",        LP_XB_P,   3, LP_XD_HEX,     0, 0x0A8 },      /* ALO effective / user / off in M (K17) */
+    { "safesh",     LP_XB_P,   4, LP_XD_HEX,     0, 0x0DC },      /* CFNExpoSafeShift */
+    { "safesh_m",   LP_XB_P,   4, LP_XD_HEX,     0, 0x0E0 },      /* CFNExpoSafeShift (Manual) */
+    { "pf8",        LP_XB_P,   4, LP_XD_HEX,     0, 0x0F8 },      /* AEB branch input (R1) */
+    /* M10.2 Tor 0d, D1 (Canon-RAM read approval; user answer 2026-10-06): CC backups, publish words, flash inputs, globals */
+    { "aebbak",     LP_XB_CC,  4, LP_XD_HEX,     0, 0x2BFC },     /* AEB backup (slot 0x0F) */
+    { "alobak",     LP_XB_CC,  3, LP_XD_HEX,     0, 0x2C54 },     /* ALO backup (slot 0x20) */
+    { "compbak",    LP_XB_CC,  2, LP_XD_EV,      0, 0x3038 },     /* comp backup (slot 0x2D), s16 */
+    { "gis",        LP_XB_CC,  4, LP_XD_HEX,     0, 0x93C },      /* GIS setting (0x8000004E) */
+    { "fpub",       LP_XB_CC,  4, LP_XD_HEX,     0, 0xD24 },      /* comp publish / force bit 0x80 */
+    { "fpub_lim",   LP_XB_CC,  4, LP_XD_HEX,     0, 0xD20 },
+    { "c8c",        LP_XB_CC,  4, LP_XD_HEX,     0, 0xC8C },
+    { "c60",        LP_XB_CC,  4, LP_XD_HEX,     0, 0xC60 },
+    { "c3bc",       LP_XB_CC,  1, LP_XD_HEX,     0, 0x3BC },
+    { "fl1",        LP_XB_CC,  4, LP_XD_HEX,     0, 0x7A8 },      /* flash predicate inputs (K37; row 43 uses fl1 / fl2) */
+    { "fl2",        LP_XB_CC,  4, LP_XD_HEX,     0, 0xA30 },
+    { "fl3",        LP_XB_CC,  4, LP_XD_HEX,     0, 0x728 },
+    { "fl4",        LP_XB_CC,  4, LP_XD_HEX,     0, 0x848 },
+    { "fl5",        LP_XB_FLB, 3, LP_XD_HEX,     0, 0 },          /* bytes [cc+0x794] | [cc+0xDB] << 8 | [cc+0xDC] << 16 */
+    { "fl6",        LP_XB_CC,  4, LP_XD_HEX,     0, 0x6D0 },
+    { "fl7",        LP_XB_CC,  4, LP_XD_HEX,     0, 0xBE8 },
+    { "fl8",        LP_XB_CC,  4, LP_XD_HEX,     0, 0xB38 },
+    { "ccg",        LP_XB_CCG, 1, LP_XD_HEX,     0, 0 },          /* bit 0 [0x1086C], 1 [0x2F800], 2 [0x10858], 3 [[0x10C28]+8] == cc,
+                                                                    * 4 [0x10870] != 0 (K38) */
 };
 #define LP_XF_N    ((int) COUNT(lp_xf))
 #define LP_XF_SEC  32                              /* index of "sec" */
@@ -2195,11 +2258,30 @@ static int lp_x_base2(int base, uint32_t off, uint32_t * a)
     return ram_ok(*a, LP_X_MM_SIZE);
 }
 
+/* M10.2 Tor 0d: the CC object globals (K38) as a bit mask; cc already checked */
+static uint32_t lp_x_ccg(uint32_t cc)
+{
+    uint32_t api = RD(0x10C28);
+    return (RD(0x1086C) == cc) | (RD(0x2F800) == cc) << 1 | (RD(0x10858) == cc) << 2
+        | (ram_ok(api, 0xC) && RD(api + 8) == cc) << 3 | (RD(0x10870) != 0) << 4;
+}
+
+/* M10.2 Tor 0d: the flash predicate bytes [cc+0x794] | [cc+0xDB] << 8 | [cc+0xDC] << 16 */
+static int lp_x_flb(uint32_t cc, uint32_t * v)
+{
+    uint32_t a, d, c;
+    if (!lp_x_rd(cc, 0x794, 1, &a) || !lp_x_rd(cc, 0xDB, 1, &d) || !lp_x_rd(cc, 0xDC, 1, &c)) return 0;
+    *v = a | d << 8 | c << 16;
+    return 1;
+}
+
 static int lp_x_field(int i, uint32_t cc, uint32_t p, int vm, uint32_t * v)
 {
     const struct lp_xf * f = &lp_xf[i];
     uint32_t a;
     if (f->base == LP_XB_RAM) return lp_x_rd(0, f->off, f->size, v);
+    if (f->base == LP_XB_FLB) return (vm & 1) && lp_x_flb(cc, v);              /* M10.2 */
+    if (f->base == LP_XB_CCG) { if (!(vm & 1)) return 0; *v = lp_x_ccg(cc); return 1; }
     if (f->base == LP_XB_CC) return (vm & 1) && lp_x_rd(cc, f->off, f->size, v);
     if (f->base == LP_XB_SUB) return lp_x_base2(f->base, f->off, &a) && lp_x_rd(a, 0x10, f->size, v);
     if (f->base == LP_XB_DS || f->base == LP_XB_MM) return lp_x_base2(f->base, 0, &a) && lp_x_rd(a, f->off, f->size, v);
@@ -2501,6 +2583,82 @@ static void lp_x_log(struct lp_buf * b)
 }
 
 
+#ifdef CONFIG_R6_PROPW_TV
+/* M10.2 (spec 6.1): the Tv write path (r6_propw.c) and its write ring, Tv values 0x%04x */
+static void lp_pw_log(struct lp_buf * b)
+{
+    const struct r6pw_state * s = _r6pw_state();
+    char w[40];
+    int now = get_ms_clock(), hn = 0, hlen = 0, ht = 0, lk = 0;
+    int16_t hv = 0;
+    uint32_t cc = 0, p = 0, v = 0, v2 = 0;
+    lp_printf(b, "# M10.2 Tor 1: the Tv write path (r6_propw.c); pw.w = write ring, oldest first\n");
+    lp_printf(b, "pw.on=%d\n", _r6pw_on());
+    lp_printf(b, "pw.id=0x80000005\n");
+    lp_printf(b, "pw.len=2\n");
+    lp_printf(b, "pw.win=%d,%d\n", R6PW_TV_MIN, R6PW_TV_MAX);
+    lp_printf(b, "pw.grid=%d\n", R6PW_GRID);
+    lp_printf(b, "pw.ms=%d,%d,%d,%d,%d,%d,%d\n", R6PW_CONFIRM_MS, R6PW_POLL_MS, R6PW_SPACING_MS, R6PW_SETTLE_MS, R6PW_STABLE_MS,
+        R6PW_HOLD_MS, R6PW_PEND_MS);
+    lp_printf(b, "pw.armed=%d,0x%04x\n", s->armed, s->base & 0xFFFF);
+    lp_printf(b, "pw.last=0x%04x,%d\n", s->last & 0xFFFF, (int) s->t_res);
+    lp_printf(b, "pw.open=%d,0x%04x,%d\n", s->open, s->open_want & 0xFFFF, (int) s->open_t);
+    lp_printf(b, "pw.dead=%d,%d\n", s->dead, s->dead_why);
+    lp_printf(b, "pw.sig=%d\n", s->sig);
+    lp_printf(b, "pw.pend=%d,%d,%d\n", s->pend, s->pend_why, s->pend ? now - (int) s->pend_t0 : 0);
+    lp_printf(b, "pw.offer=%d,0x%04x,0x%04x\n", s->offer, s->base & 0xFFFF, s->boot_rec & 0xFFFF);
+    lp_printf(b, "pw.boot=%d,%d\n", s->boot_done, s->mk_boot);
+    lp_printf(b, "pw.marker=%d\n", s->marker);
+    lp_printf(b, "pw.landed=%d,0x%04x,%d,%d,0x%04x,%d\n", s->landed_ae, s->landed_v & 0xFFFF, s->landed_ok,
+        s->landed_ae2, s->landed_v2 & 0xFFFF, s->landed_ok2);          /* review round 2 (S2-1): + the older record */
+    lp_printf(b, "pw.lim=%d\n", s->lim);
+    lp_printf(b, "pw.calls=%d\n", (int) s->calls);
+    lp_printf(b, "pw.uns=%d\n", s->uns);
+    _r6pw_log(&hn, &hv, &hlen, &ht);
+    lp_printf(b, "pw.h=%d,0x%04x,%d,%d\n", hn, hv & 0xFFFF, hlen, ht);
+    lp_printf(b, "pw.sticky=%d,%d,%d,%d\n", s->fgn_m, s->rec_moved, s->ovf, (int) s->t_ev);
+    lp_printf(b, "pw.watch=0x%04x,0x%04x,%d,%d\n", s->close_v & 0xFFFF, s->close_rec & 0xFFFF, s->w_other, s->w_recv);
+    _r6pw_locks(R6PW_WANT_NONE, R6PW_CLASS_HARD, &lk);              /* the hard rows now (read only) */
+    lp_printf(b, "pw.lock_now=%d,%s\n", lk, lp_nosp(_r6pw_lock_name(lk), w, sizeof(w)));
+    lp_printf(b, "pw.res=%d,%s,%d\n", s->last_res, lp_nosp(_r6pw_res_name(s->last_res), w, sizeof(w)), s->last_lock);
+    {
+        char mb[100];                                                  /* the newest notice as one token */
+        const char * m = _r6pw_msg();
+        int i = 0;
+        for (; m[i] && i < (int) sizeof(mb) - 1; i++) mb[i] = m[i] == ' ' ? '_' : m[i] == '\n' ? '|' : m[i] == '=' ? ':' : m[i];
+        mb[i] = 0;
+        lp_printf(b, "pw.msg=%s\n", i ? mb : "-");
+    }
+    lp_uc_update();
+    int vm = lp_x_ptrs(&cc, &p);
+    if ((vm & 2) && lp_x_rd(p, 0x110, 2, &v) && lp_x_rd(p, 0x112, 2, &v2)) lp_printf(b, "pw.cfnr=0x%04x,0x%04x\n", (int) v, (int) v2);
+    else lp_printf(b, "pw.cfnr=na\n");
+    uint32_t s1 = (vm & 1) ? RD(cc + 0x3500) : 0;                    /* sheet 1 = [cc+0x3500], inside [cc+0x34FC..0x350C] */
+    if ((vm & 1) && ram_ok(s1, 0x674))
+        lp_printf(b, "pw.s1=0x%08x,0x%08x,0x%08x,0x%08x,0x%04x\n", (int) RD(s1), (int) RD(s1 + 0xA8), (int) RD(s1 + 0x670),
+            (int) RD(s1 + 0xD4), (int) (RD(s1 + 0x61C) >> 16));
+    else lp_bad(b, "pw.s1", s1);
+    if (vm & 1) lp_printf(b, "pw.fpub=0x%08x,0x%08x\n", (int) RD(cc + 0xD24), (int) RD(cc + 0xD20));
+    else lp_bad(b, "pw.fpub", cc);
+    if (vm & 1) lp_printf(b, "pw.ccg=0x%02x\n", (int) lp_x_ccg(cc));
+    else lp_bad(b, "pw.ccg", cc);
+    struct r6pw_rec e;
+    int n = _r6pw_ring(0, &e);
+    lp_printf(b, "pw.w.n=%d\n", (int) _r6pw_ring_n());
+    lp_printf(b, "# pw.w[i]=t,kind,res,lock,ev,k,old,want,rep,cc,mm,ds4,d_ret,d_h,d_cc,d_mm,d_conf,ndel,nfor,fval,dep,sl0,sl1,c62c,"
+                 "state,bak,ae,fl\n");
+    for (int i = 0; i < n; i++)
+    {
+        _r6pw_ring(i, &e);
+        lp_printf(b, "pw.w[%d]=%d,%s,%s,%d,%d,%d,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,%d,%d,%d,%d,%d,%d,%d,0x%04x,0x%x,0x%02x,"
+                     "0x%02x,%d,%d,0x%04x,%d,0x%x\n", i, (int) e.t, _r6pw_kind_name(e.kind),
+            lp_nosp(_r6pw_res_name(e.res), w, sizeof(w)), e.lock, e.ev, e.k, e.old & 0xFFFF, e.want & 0xFFFF, e.rep & 0xFFFF,
+            e.cc & 0xFFFF, e.mm & 0xFFFF, e.ds4 & 0xFFFF, e.d_ret, e.d_h, e.d_cc, e.d_mm, e.d_conf, e.ndel, e.nfor,
+            e.fval & 0xFFFF, e.dep, e.sl0, e.sl1, e.c62c, e.state, e.bak & 0xFFFF, e.ae, e.fl);
+    }
+}
+#endif
+
 /* ---- log snapshot -------------------------------------------------------- */
 #define LP_LOG_SIZE (96 * 1024)   /* M7.2a camera: up to 51.5 KB; M7.3 adds ~7 KB (QEMU), ~60 KB expected;
                                    * transient malloc, freed after the write */
@@ -2602,6 +2760,9 @@ static void lp_snapshot_do(int delay_ms)
     lp_vmix_poll(&b);
 #ifdef CONFIG_R6_INTERVAL
     lp_iv_log(&b);
+#endif
+#ifdef CONFIG_R6_PROPW_TV
+    lp_pw_log(&b);                        /* M10.2 */
 #endif
 #ifdef CONFIG_R6_MOTION
     lp_md_log(&b);                        /* M9.3 */

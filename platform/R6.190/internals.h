@@ -135,6 +135,17 @@
  * Upstream's FEATURE_INTERVALOMETER stays off (r6_interval.c #errors on it). */
 #define CONFIG_R6_INTERVAL
 
+/* R6.190 M10.2 "Tor 1" (approved by the user 2026-10-05, effective after the clean M10.1b camera log 2026-10-06;
+ * spec m10/m102 spec_m102.md, docs/m10_plan.md 2.x / 5): the Tv write path (r6_propw.c) for R6 Interval's Bracket
+ * mode, the HDR bracket per Tv. Only Tv (PROP_SET_TV 0x80000005, exactly 2 bytes Code768), only in M, only the 1/3
+ * grid inside 1/8000 .. 30 s and Canon's own Tv ranges, never Bulb; one call site of _prop_request_change, called
+ * only from r6_iv_task, never two requests in flight, every write behind its locks and a confirmation window; the
+ * user's Tv is restored after every bracket (only while Canon's Tv is still ML's value); a marker file
+ * ML/SETTINGS/R6TV.LCK while ML's value may be set, with a notice and "Tv back to ..." at the next start; main switch
+ * "Tv writes" saved, default OFF; never a write at startup. CONFIG_PROP_REQUEST_CHANGE stays undefined and
+ * prop_write_allow[] stays empty; nothing of the write path is exported to modules or Lua. */
+#define CONFIG_R6_PROPW_TV
+
 /* M9.1: Overlay > "Grids & masks" (r6_grid.c, docs/m9_plan.md 1.3): thirds /
  * golden ratio / diagonals, centre mark, aspect frames with masks, safe areas,
  * computed (no card files; the upstream cropmarks stay off). Pixels in ML's

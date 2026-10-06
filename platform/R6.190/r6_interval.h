@@ -2,7 +2,8 @@
 #define _r6_interval_h_
 
 /* R6.190 M8.0 / M8.1 / M8.2 / M9.2: interval release ("R6 Interval", r6_interval.c); M9.2: B with Canon's bulb timer;
- * M9.3: up to 30 min, and R6 Motion's runs (r6_motion.c) through the same task and presser */
+ * M9.3: up to 30 min, and R6 Motion's runs (r6_motion.c) through the same task and presser; M10.2: Mode "Bracket"
+ * (HDR bracket per Tv in M, Tor 1 through r6_propw.c) */
 
 #include <stdint.h>
 
@@ -39,6 +40,8 @@ enum r6_iv_stop {
                               * (stop_val = d30_ms) */
     R6IV_STOP_BULB_NOT12,    /* M9.2: B mode, but Canon did not start a bulb (state 5 / 6 / sequence end; stop_val = off_state) */
     R6IV_STOP_TIME,          /* M9.3: R6 Motion: maximum duration reached (stop_val = the limit in ms) */
+    R6IV_STOP_TVW,           /* M10.2: a Tv write of the bracket did not end OK (stop_val = result << 8 | lock, r6_propw.h) */
+    R6IV_STOP_TVUSER,        /* M10.2: the user changed Tv (user evidence, spec 3.6a; stop_val = the user's Tv) */
     R6IV_NSTOPS
 };
 
@@ -58,11 +61,11 @@ enum r6_iv_cam {
     R6IV_CAM_CC_MODE,        /* p not readable, or [p+8] (AE 0x80000001) != 3 (M) */
     R6IV_CAM_CC_DRIVE,       /* [p+0x4C0] (drive 0x80000003) != 0 (single) */
     R6IV_CAM_CC_BULB,        /* (s16) [p+0x61E] (PROP_SET_TV 0x80000005) not a Tv of 30 s .. 1/16000 (Bulb 0xDF00 / 0xDC00) */
-    R6IV_CAM_CC_AF,          /* [cc+0x2C0] == 1 (AF active) */
+    R6IV_CAM_CC_AF,          /* [cc+0x2C0] == 1 (movie variant of the sheets, 0xE0711978 [I]; the M8.2 name "AF" kept) */
     /* M8.2 */
     R6IV_CAM_CC_MECHA,       /* [p+0x92C] (PROP_MECHALESS 0x80020061) != 0: SW2 OFF in state 5 would be RELEASE_STOP */
     R6IV_CAM_CC_ITIMER,      /* byte [p+0x50A] (0x8004005A, [I] Canon's interval timer) != 0 */
-    R6IV_CAM_CC_FBRK,        /* byte [p+0x634] (0x80040064, a Canon timer setting: h:m:s at +1..+3) != 0 */
+    R6IV_CAM_CC_FBRK,        /* byte [p+0x634] (0x80040064, time-lapse movie setting: h:m:s at +1..+3) != 0 */
     R6IV_CAM_INTERVAL,       /* Start only: interval < Tv + 2 s (r6_interval.c iv_interval_fit; B: bulb time + 2 s) */
     /* M9.2 (B with Canon's bulb timer; BULB_BUSY also in M, skeptic C1) */
     R6IV_CAM_TVB,            /* B: PROP_SHUTTER not delivered as 2 bytes 0xDF00 */
@@ -78,6 +81,19 @@ enum r6_iv_cam {
     R6IV_CAM_BUSY,           /* the other series (interval / motion) is running or starting */
     R6IV_CAM_MD_B,           /* R6 Motion "Release" in B (no bulb for motion: M, Tv up to 30 s) */
     R6IV_CAM_MD_MEM,         /* no memory for the motion detector (4.7 KB heap) */
+    /* M10.2 decision D2: Canon's multi-shot modes, in every R6 Interval mode and R6 Motion Release (one sheet read each) */
+    R6IV_CAM_CC_WBB,         /* [p+0x654] / [p+0x658] (WB bracketing B/A, G/M) != 0 */
+    R6IV_CAM_CC_HDR,         /* byte [p+0x4EC] (HDR mode 0x80000045) != 0 */
+    R6IV_CAM_CC_ME,          /* byte [p+0x5F4] (multiple exposure) != 0 */
+    R6IV_CAM_CC_FBKT,        /* [p+0x918] (focus bracketing) != 0 */
+    R6IV_CAM_CC_MSNR,        /* [p+0x4F4] == 4 (multi-shot noise reduction) */
+    /* M10.2 Bracket (Start / Test, spec 4.3) */
+    R6IV_CAM_BKT_MODE,       /* Mode Bracket outside M */
+    R6IV_CAM_TVW,            /* a hard lock row of the Tv write path (r6_iv_refused_pw: enum r6pw_lock) */
+    R6IV_CAM_BKT_LIST,       /* a bracket member outside the window / Canon's range / the C.Fn range / 1/200 (flash) */
+    R6IV_CAM_BKT_MAX,        /* brackets x shots > R6IV_MAX_PICS */
+    R6IV_CAM_TVOPEN,         /* a Tv request is open (spec 3.7): no ML press in any mode until a restart */
+    R6IV_CAM_CALLER,         /* Start / Test not called by ML's menu key handling (a module, Lua; spec 3.10) */
     R6IV_NCAMS
 };
 
@@ -161,6 +177,12 @@ struct r6_iv_shot {
     uint32_t ta_ms;          /* [0x1E5C0] the first time [0x1E5BC] was seen 1 */
     uint32_t bulb_ms;        /* [0x1E568] when phase W ended (Canon's measured bulb time) */
     uint32_t d30_ms;         /* OFFs (t3) -> [cc+0xD30] 0 or state != 12 seen, elapsed (OVERRUN / SHUTDOWN: t3 -> the stop) */
+    /* M10.2 bracket member (-1, 0, -32768, 0, -1 for other pictures) */
+    int8_t   bk;             /* member index */
+    uint8_t  bn;             /* members per event */
+    int16_t  want;           /* the member's Tv (Code768) */
+    uint16_t ev;             /* event number */
+    int16_t  wr;             /* r6_propw.c ring entry of the preceding write (_r6pw_ring_n - 1), -1 none */
 };
 
 struct r6_iv_stats {
@@ -216,7 +238,7 @@ struct r6_iv_cc {
     uint8_t  pad[3];
     uint32_t state;          /* [cc+0x294] */
     uint32_t state_prev;     /* [cc+0x298] */
-    uint32_t af;             /* [cc+0x2C0] [I] */
+    uint32_t af;             /* [cc+0x2C0]: movie variant of the sheets (0xE0711978) [I] */
     uint32_t swgate;         /* [cc+0x2E0] */
     uint32_t r3b4;           /* [cc+0x3B4] [I] */
     uint32_t remote;         /* [cc+0x580] */
@@ -254,7 +276,7 @@ struct r6_iv_cc {
     /* M8.2 */
     uint32_t p_lenr;         /* [p+0x54C] long exposure NR 0x80000048 [V id, I values] */
     uint32_t p_itimer;       /* byte [p+0x50A] 0x8004005A [I interval timer] */
-    uint32_t p_fbrk;         /* byte [p+0x634] 0x80040064 (timer setting, h:m:s at +1..+3; log key name kept) */
+    uint32_t p_fbrk;         /* byte [p+0x634] 0x80040064 (time-lapse movie setting, h:m:s at +1..+3; log key name kept) */
     uint32_t b98;            /* [cc+0xB98] */
     uint32_t c830;           /* [cc+0x830] */
     uint32_t r5f8;           /* [cc+0x5F8] (log only) */
@@ -267,6 +289,13 @@ struct r6_iv_cc {
     uint32_t bulbw;          /* [p+0x648] */
     uint32_t ta, ta_ms, tb, tb_ms;   /* [0x1E5BC] [0x1E5C0] [0x1E5C4] [0x1E5C8] */
     uint32_t bulb_ms;        /* [0x1E568] */
+    /* M10.2 (D2, ESHUT log): sheet words, only with R6IV_V_P */
+    uint32_t p_hdr;          /* byte [p+0x4EC] HDR mode */
+    uint32_t p_me;           /* byte [p+0x5F4] multiple exposure */
+    uint32_t p_wbb;          /* WB bracketing: low bytes of [p+0x654] (B/A) | [p+0x658] (G/M) << 8, 0x10000 if a word > 0xFF */
+    uint32_t p_fbkt;         /* [p+0x918] focus bracketing word 0 */
+    uint32_t p_msnr;         /* [p+0x4F4] (4 = multi-shot NR) */
+    uint32_t p_shtype;       /* [p+0xB98] shutter type (3 = electronic: ROM-supported, log only here, K36) */
 };
 
 /* M8.1: detail of the last picture (reset at every SW1 ON, kept until the next one) */
@@ -318,6 +347,27 @@ struct menu_entry;
 struct menu_display_info;
 void r6_iv_stop_warn(struct menu_entry * entry, struct menu_display_info * info);   /* the "Last series" warning */
 
+/* M10.2 Bracket (spec 4): the settings and the event state of the current / last run (read only, log iv.bkt.*) */
+#define R6IV_BKT_MAXN       9      /* 3 / 5 / 7 / 9 members */
+#define R6IV_BKT_WAIT_MS 5000      /* wait rows before a write, member pre-check (r6_propw.c _r6pw_wait_ready) */
+struct r6_iv_bkt {
+    int mode, n, step, order;      /* Mode (1 = Bracket), members, step (thirds), order (0 "0 - +", 1 "- 0 +") */
+    int k, ev;                     /* member being taken (n: restoring), event number */
+    int base;                      /* series base (Code768) */
+    int16_t list[R6IV_BKT_MAXN];
+    int need, need_nr, fit, writes;    /* event budget (ms), interval fit 0 / 1 / 2, writes per event */
+    int armed, t1, want, wr;       /* this run armed the write path; SW1 ON of member 0; the member's Tv; its write */
+    int t_mis;                     /* between events: Tv not stably the base since (0 = fine) */
+};
+const struct r6_iv_bkt * r6_iv_bkt(void);
+/* r6_propw.c only (names _[a-zA-Z]*: not in magiclantern.sym); read-only helpers of r6_interval.c */
+int _r6iv_cc_gate(const struct r6_iv_cc * s);              /* iv_cc_gate: hard Canon reasons, 0 = ok */
+int _r6iv_lvstill(const struct r6_iv_cc * s);              /* iv_cc_lvstill */
+int _r6iv_cc_same(const struct r6_iv_cc * a, const struct r6_iv_cc * b);   /* iv_cc_same (torn read) */
+void _r6iv_times(int * t_menu, int * t_lv, int * in_pic);  /* ML menu last seen, LV running since (-1 no), picture runs */
+void _r6iv_sample(int now);                                 /* iv_sample (the waits of r6_propw.c) */
+int _r6iv_bkt_armable(void);                                /* a Bracket series / test runs in M (arm BKT, spec 4.9) */
+
 /* Canon RAM read by r6_interval.c (read-only) */
 #define R6IV_RAM_JOBCNT    0x9DC0      /* live job count [0x9D9C+0x24]: CreateJob checks it (cbz 0xE07C9E5E),
                                         * TrashJob decrements it and logs "Job Done" at 0 (0xE07CCCDC..0xE07CCD2A) */
@@ -366,7 +416,7 @@ void r6_iv_stop_warn(struct menu_entry * entry, struct menu_display_info * info)
 #define R6IV_PO_RELCNT       0x1A08
 #define R6IV_PO_SIZE         0x1A0C
 #define R6IV_CC_SIZE         0x3500    /* highest field used: 0x34FC */
-#define R6IV_P_SIZE          0x930     /* highest field used: 0x92C */
+#define R6IV_P_SIZE          0xB9C     /* highest field used: 0xB98 (M10.2; records are 0xC58 apart) */
 #define R6IV_CC_EVFLAG       0x008     /* event flag handle: SetEventFlag 0xE07C7AC4 asserts on 0 / odd */
 #define R6IV_CC_TABLE        0x00C     /* current state table; LV still = R6IV_LV_STILL_TABLE (0xE02C3936 / 0xE05E0DF2) */
 #define R6IV_CC_PEND2        0x018     /* class-2 pending [cc+0x10+4*2] */
@@ -378,7 +428,7 @@ void r6_iv_stop_warn(struct menu_entry * entry, struct menu_display_info * info)
 #define R6IV_CC_SNAP2_W      0x16C     /* byte 0x16C (per-round copy of E0, 0xE02E955A / 0xE05A5F8A) */
 #define R6IV_CC_STATE        0x294     /* CC state (setter 0xE07020D8) */
 #define R6IV_CC_STATE_PREV   0x298
-#define R6IV_CC_AF           0x2C0     /* AF active [I] (MF -> 0) */
+#define R6IV_CC_AF           0x2C0     /* movie variant of the sheets (0xE0711978) [I] (M10.2 10.15; the M8.2 name "AF" kept) */
 #define R6IV_CC_LVKIND_W     0x2CC     /* word holding byte 0x2CE: 1 = LV table family */
 #define R6IV_CC_SWGATE       0x2E0     /* != 0: wrapper 0xE06D30BA drops switch events */
 #define R6IV_CC_R3B4         0x3B4     /* [I] */
@@ -402,10 +452,17 @@ void r6_iv_stop_warn(struct menu_entry * entry, struct menu_display_info * info)
                                         * start of the release sequence) set [cc+0x830] = 1 [V code, I "interval timer"] */
 #define R6IV_P_LENR          0x54C     /* CC copy of 0x80000048, long exposure NR (CC master table; ATest get / set
                                         * 0xE06569EA / 0xE065699E) [V id, I values 0 / 1 / 2] */
-#define R6IV_P_FBRK_W        0x634     /* word holding byte 0x634 (byte 0) = CC copy of 0x80040064: != 0 sets
-                                        * [cc+0xB98] = 1 (ldrb 0xE0643EBA, str 0xE0643ED2) [V code]; M9.1: it carries
-                                        * h:m:s at +1..+3 (0xE0643E78, 0xE070D602), i.e. a timer setting; the M8.2 name
-                                        * "focus bracketing" is doubtful (texts renamed, the gate is unchanged) */
+#define R6IV_P_FBRK_W        0x634     /* word holding byte 0x634 (byte 0) = CC copy of 0x80040064, the time-lapse movie
+                                        * setting (M10.2 R2 2.10): != 0 sets [cc+0xB98] = 1 (ldrb 0xE0643EBA, str
+                                        * 0xE0643ED2) [V code]; h:m:s at +1..+3 (0xE0643E78, 0xE070D602); the M8.2 name
+                                        * "focus bracketing" was wrong (texts renamed, the gate is unchanged) */
+#define R6IV_P_HDR_W         0x4EC     /* M10.2: byte 0 = HDR mode (0x80000045, R2 2.2) */
+#define R6IV_P_MSNR          0x4F4     /* M10.2: 4 = multi-shot NR (0x80000049, R2 2.5) */
+#define R6IV_P_ME_W          0x5F4     /* M10.2: byte 0 = multiple exposure (0x8000003F, R2 2.3) */
+#define R6IV_P_WBB_BA        0x654     /* M10.2: WB bracketing B/A (R2 2.1) */
+#define R6IV_P_WBB_GM        0x658     /* M10.2: WB bracketing G/M */
+#define R6IV_P_FBKT          0x918     /* M10.2: focus bracketing word 0 (0x8002006D, R2 2.4) */
+#define R6IV_P_SHTYPE        0xB98     /* M10.2: shutter type (0x80020066; 3 = electronic, R2 2.6, K36) */
 #define R6IV_P_92C           0x92C     /* CC copy of PROP_MECHALESS 0x80020061 (CC table idx 332 {0x34FC, 0x92C, 4}) [V id];
                                         * SW2 OFF in state 5 (0xE05E3498): RELEASE_STOP if 1, else deferred to state 6 [V] */
 #define R6IV_CC_B98          0xB98     /* SW1 OFF in state 5 (0xE05E3094): == 1 runs the state-6 handler 0xE05E2FE6 at once
