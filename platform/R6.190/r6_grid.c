@@ -64,6 +64,10 @@
  * magenta, light blue) are no grid colour, so the two never erase each
  * other's pixels and the grid wins where they overlap. drawn and
  * R6GD_DRAWN_GRID cover both; r6_grid_erase erases both.
+ *
+ * M11.0: R6 ETTR's LV line (Show in LV, r6_ettr.c) is drawn by the same step,
+ * last: one text line in a black box above Canon's bottom bar, LCD only, its
+ * mirror cleared; drawn / R6GD_DRAWN_GRID and r6_grid_erase cover it too.
  */
 
 #include "dryos.h"
@@ -76,6 +80,9 @@
 #include "r6_grid.h"
 #ifdef CONFIG_R6_MOTION
 #include "r6_motion.h"
+#endif
+#ifdef CONFIG_R6_ETTR
+#include "r6_ettr.h"
 #endif
 
 #ifdef CONFIG_R6_GRID
@@ -140,6 +147,9 @@ int r6_grid_wanted(void)
 {
 #ifdef CONFIG_R6_MOTION
     if (r6_md_disp_wanted()) return 1;
+#endif
+#ifdef CONFIG_R6_ETTR
+    if (r6_ettr_lv_wanted()) return 1;      /* M11.0: R6 ETTR's LV line */
 #endif
     return gr_wanted();
 }
@@ -410,6 +420,9 @@ static struct gr_md gr_md_snap;
 static uint32_t gr_md_sig = 0;
 static int gr_md_valid = 0;
 #endif
+#ifdef CONFIG_R6_ETTR
+static int gr_et_valid = 0;              /* M11.0: R6 ETTR's LV line is in ML's buffer */
+#endif
 
 /* drawn (stats, R6GD_DRAWN_GRID) from what is in ML's buffer: the grid and (M9.3) the motion display */
 static void gr_drawn(void)
@@ -417,6 +430,9 @@ static void gr_drawn(void)
     int d = gr_snap_valid;
 #ifdef CONFIG_R6_MOTION
     d |= gr_md_valid;
+#endif
+#ifdef CONFIG_R6_ETTR
+    d |= gr_et_valid;
 #endif
     st.drawn = d;
     if (d) r6_gd_st.drawn |= R6GD_DRAWN_GRID;
@@ -491,6 +507,57 @@ static int gr_md_step(uint8_t * b, uint8_t * m, const struct r6_grid_rect * ex, 
 }
 #endif
 
+#ifdef CONFIG_R6_ETTR
+/* M11.0: R6 ETTR's LV line (Show in LV, r6_ettr.c r6_ettr_lv_text): one text line in a black box at R6ETTR_LV_X /
+ * R6ETTR_LV_Y, LCD shooting screen only, drawn by this step (overlay task, BMP_LOCK held, ML menu closed, overlay gate
+ * passed), so the write-under conversion keeps Canon's elements on top, as for the grid and R6 Motion. The box's mirror
+ * is cleared (no stale zebra / false color / peaking value equals a box pixel; the grid and the motion display skip the
+ * box as foreign pixels and repair theirs once it is erased). Redrawn only when the text changed or a corner of the box
+ * is gone (someone cleared it); erased with r6_grid_erase (r6_gd_erase), on the EVF, and when it is not wanted. */
+#define GR_ET_FONT FONT(FONT_MED, COLOR_WHITE, COLOR_BLACK)
+static char gr_et_text[64];              /* the text in the box */
+static int gr_et_w = 0, gr_et_h = 0;     /* the box */
+
+static int gr_et_intact(const uint8_t * b)
+{
+    const int x0 = R6ETTR_LV_X, y0 = R6ETTR_LV_Y, x1 = x0 + gr_et_w - 1, y1 = y0 + gr_et_h - 1;
+    return b[x0 + y0 * BMPPITCH] == COLOR_BLACK && b[x1 + y0 * BMPPITCH] == COLOR_BLACK
+        && b[x0 + y1 * BMPPITCH] == COLOR_BLACK && b[x1 + y1 * BMPPITCH] == COLOR_BLACK;
+}
+
+static int gr_et_erase(uint8_t * b, uint8_t * m)
+{
+    if (!gr_et_valid) return 0;
+    bmp_fill(COLOR_EMPTY, R6ETTR_LV_X, R6ETTR_LV_Y, gr_et_w, gr_et_h);
+    gr_et_valid = 0;
+    gr_et_text[0] = 0;
+    r6_ettr_lv_count(0);
+    gr_drawn();
+    return 1;
+}
+
+static int gr_et_step(uint8_t * b, uint8_t * m)
+{
+    char t[sizeof(gr_et_text)];
+    if (r6_gd_evf || !r6_ettr_lv_text(t, sizeof(t))) return gr_et_erase(b, m);
+    if (gr_et_valid && !strcmp(t, gr_et_text) && gr_et_intact(b)) return 0;
+    int h = fontspec_height(GR_ET_FONT) + 4, n = strlen(t), w = 0;
+    while (n > 0 && (w = bmp_string_width(GR_ET_FONT, t) + 4) > R6ETTR_LV_WMAX) t[--n] = 0;   /* cut at the box */
+    if (n <= 0) return gr_et_erase(b, m);
+    int changed = gr_et_erase(b, m);
+    bmp_fill(COLOR_BLACK, R6ETTR_LV_X, R6ETTR_LV_Y, w, h);
+    bmp_printf(GR_ET_FONT, R6ETTR_LV_X + 2, R6ETTR_LV_Y + 2, "%s", t);
+    for (int y = 0; y < h; y++) memset(m + R6ETTR_LV_X + (R6ETTR_LV_Y + y) * BMPPITCH, 0, w);
+    gr_et_w = w;
+    gr_et_h = h;
+    snprintf(gr_et_text, sizeof(gr_et_text), "%s", t);
+    gr_et_valid = 1;
+    r6_ettr_lv_count(1);
+    gr_drawn();
+    return changed | 1;
+}
+#endif
+
 int r6_grid_erase(void)
 {
     uint8_t * b = bmp_vram(), * m = get_bvram_mirror();
@@ -498,6 +565,9 @@ int r6_grid_erase(void)
     int c = gr_erase_snap(b, m);
 #ifdef CONFIG_R6_MOTION
     c |= gr_md_erase(b, m);
+#endif
+#ifdef CONFIG_R6_ETTR
+    c |= gr_et_erase(b, m);
 #endif
     return c;
 }
@@ -559,6 +629,10 @@ int r6_grid_step(const struct r6_grid_rect * ex, int n)
     }
 #ifdef CONFIG_R6_MOTION
     changed |= gr_md_step(b, m, ex, n);                 /* M9.3: after the grid (the grid wins where they overlap) */
+    gr_drawn();
+#endif
+#ifdef CONFIG_R6_ETTR
+    changed |= gr_et_step(b, m);                        /* M11.0: R6 ETTR's LV line, last (over the grid / motion pixels) */
     gr_drawn();
 #endif
     if (changed) st.changed++;

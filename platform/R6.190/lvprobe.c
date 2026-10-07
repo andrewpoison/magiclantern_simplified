@@ -76,6 +76,14 @@
  * expo log (D1, read only: Canon's multi-shot settings, the raw C.Fn Tv range,
  * the CC backups, the flash predicate inputs, the CC object globals).
  *
+ * M11.0 (CONFIG_R6_ETTR, docs/m11_plan.md 6.1 / 6.2): every snapshot writes a
+ * second file ML/LOGS/ETTnnnnn.LOG with the number of its LVPnnnnn.LOG (R6
+ * ETTR: a full histogram measurement with the 4 x 256 bins, the advisor,
+ * the ALO set, the 20 RandomData slots, the Tor 0e fields of answer E2 and
+ * R6 ETTR's rings), into the same buffer after the LVP file is written; the
+ * main log gets the one line ettr.file= before the ring tail. Read only, every
+ * pointer checked; an existing ETT file is never overwritten.
+ *
  * Addresses: ROM0 1.9.0. Evidence per field: see the comments below and
  * the M7.0 report.
  */
@@ -118,6 +126,9 @@
 #ifdef CONFIG_R6_MOTION
 #include "r6_faceyuv.h"
 #include "r6_motion.h"
+#endif
+#ifdef CONFIG_R6_ETTR
+#include "r6_ettr.h"
 #endif
 
 /* CONFIG_LIVEVIEW compiles in force_liveview (fake_simple_button(BGMT_LV) in
@@ -2784,6 +2795,246 @@ static void lp_md_log(struct lp_buf * b)
 }
 #endif
 
+#ifdef CONFIG_R6_ETTR
+/* ---- M11.0: R6 ETTR's second file ETTnnnnn.LOG (docs/m11_plan.md 6.1 / 6.2) ----
+ * Written right after LVPnnnnn.LOG (same number) into the same buffer; its last LP_ETT_BINS bytes hold the bins copy.
+ * Sections: cfg, cur (a full measurement now, with the bins), the advisor, counters, bins (4 x 256), the ALO set, the
+ * 20 RandomData slots (FrameNum, rd[0x5EC]), Tor 0e (E2: GmtAeParam, rd+0x52C, AeWbRandomData, rd+0xBF8 / 0xC04,
+ * PetitYch, [0x1427F8] through [0x1778C+0x18]), then the rings fy, m, raw, bk (oldest first). Read only, every pointer
+ * checked (ram_ok); the main log gets one line ettr.file= (before the ring tail: the static budget grows by it alone). */
+#define LP_ETT_BINS      4096       /* 4 x 256 u32 */
+#define LP_ETT_RANGE_PTR (0x1778C + 0x18)   /* E2: must hold LP_ETT_RANGE_OBJ */
+#define LP_ETT_RANGE_OBJ 0x1427C4           /* + 0x34 = 0x1427F8 (property 0x80050012 copy, R_rom.md 1) */
+
+static uint32_t lp_ppm(uint32_t x, uint32_t n) { return n ? (uint32_t) (((uint64_t) x * 1000000u) / n) : 0; }
+
+/* the channel names as strings: lp_printf goes through Canon's vsnprintf, whose %c repeats the character up to the line
+ * end (QEMU m110: "ett.cur.ch[YYYY...]"; m8c_test notes the same) */
+static const char * const lp_ett_ch[4] = { "Y", "R", "G", "B" };
+
+static void lp_ett_meas(struct lp_buf * b, const char * key, const struct r6_ettr_meas * m)
+{
+    char w[24];
+    lp_printf(b, "# %s=t,valid,rr,set,bind,tries,numpix,frame,sim,ae600,m608,tv424,fr52c,us,H,s_ppm,b_ppm\n", key);
+    lp_printf(b, "%s=%d,%s,%d,%d,0x%x,%d,%d,%d,%d,%d,0x%04x,0x%04x,%d,%d,%d,%d,%d\n", key, (int) m->t,
+        lp_nosp(r6_ettr_valid_name(m->valid), w, sizeof(w)), m->rr == 0xFF ? -1 : m->rr, m->set == 0xFF ? -1 : m->set,
+        m->bind, m->tries, (int) m->numpix, (int) m->frame, m->sim, (int) m->ae600, m->m608 & 0xFFFF, m->tv424 & 0xFFFF,
+        (int) m->fr52c, (int) m->us, (int) m->H, (int) m->s, (int) m->b);
+    lp_printf(b, "%s.rd=0x%08x,0x%08x,0x%08x,0x%08x,0x%08x\n", key, (int) m->rd_b, (int) m->rd_a, (int) m->hp_b,
+        (int) m->hp_a, (int) m->p0);
+    lp_printf(b, "# %s.ch[c]=pq,p99.9,p99,p50,p5,mean_x10,ppm>=224,>=240,>=248,>=252,=255\n", key);
+    for (int c = 0; c < 4; c++)
+    {
+        const struct r6_ettr_ch * h = &m->ch[c];
+        lp_printf(b, "%s.ch[%s]=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", key, lp_ett_ch[c], h->pq, h->p999, h->p99, h->p50, h->p5,
+            h->mean10, (int) lp_ppm(h->n224, m->numpix), (int) lp_ppm(h->n240, m->numpix), (int) lp_ppm(h->n248, m->numpix),
+            (int) lp_ppm(h->n252, m->numpix), (int) lp_ppm(h->n255, m->numpix));
+    }
+}
+
+static void lp_ett_log(struct lp_buf * b, uint32_t (*bins)[256], int no)
+{
+    const struct r6_ettr_stats * s = r6_ettr_stats();
+    char k[48], w[32];
+    lp_uc_update();
+    lp_printf(b, "# ETTR M11.0 snapshot (R6 ETTR, docs/m11_plan.md 6.2), next to LVP%05d.LOG\n", no);
+    lp_printf(b, "# format: key=value; shares in ppm of numPix (rings: 0.01 %%); Tv / rd+0x424 / rd[0x608] s16 Code768 0x%%04x\n");
+    lp_printf(b, "snapshot_seq=%d\n", lp_snap_seq);
+    lp_printf(b, "boot_ms=%d\n", get_ms_clock());
+    /* cfg */
+    lp_printf(b, "# ett.cfg=mode,target,q_ppm,lo,zo,longest,shortest,show_lv\n");
+    lp_printf(b, "ett.cfg=%d,%d,%d,%d,%d,0x%04x,0x%04x,%d\n", r6_ettr_mode(), s->target, s->q_ppm, s->lo, s->zo,
+        s->longest & 0xFFFF, s->shortest & 0xFFFF, r6_ettr_lv_wanted());
+    lp_printf(b, "# ett.consts=T_ml,L_ml,AE_ml,win_n,win_ms,win_dh,win_trend,win_ds_ppm,win_dy10,idle_fps10,gap_ms,keep_ms,g_iso100,wide_aim,meas_ms,curve\n");
+    {
+        char cs[96];
+        r6_ettr_cfg_text(cs, sizeof(cs));
+        lp_printf(b, "ett.consts=%s\n", cs);
+    }
+    /* cur: a full measurement now, the bins copied for the bins section */
+    struct r6_ettr_meas m;
+    int ok = r6_ettr_read_full(bins, &m);
+    lp_ett_meas(b, "ett.cur", &m);
+    {
+        uint32_t cc, p;
+        int vm = lp_x_ptrs(&cc, &p);
+        lp_printf(b, "# ett.flags=expsim_ml,lv_dispsize,picstyle_raw,p548,htp,alo,flicker,iso (na: sheet not readable)\n");
+        if (vm & 2)
+            lp_printf(b, "ett.flags=%d,%d,0x%02x,0x%x,0x%x,0x%08x,0x%x,0x%x\n", _expsim, lv_dispsize, lens_info.raw_picstyle,
+                (int) RD(p + 0x548), (int) RD(p + 0x4FC), (int) RD(p + 0xA8), (int) RD(p + 0x4E4), (int) RD(p + 0x510));
+        else
+            lp_printf(b, "ett.flags=%d,%d,0x%02x,na\n", _expsim, lv_dispsize, lens_info.raw_picstyle);
+    }
+    /* the advisor and the task's newest measurement */
+    const struct r6_ettr_adv * a = &s->adv;
+    lp_printf(b, "# ett.adv=t,t_meas,why,why_name,st,st_name,k,k_raw,lim,rest,hint,tv,want,lo,hi,g,sv,H,s,b,ym10,n,span,hspread,"
+                 "dz,dw(sRGB D(H)-D(Z_o), D(H)-D(200), Code768, uncapped)\n");
+    lp_printf(b, "ett.adv=%d,%d,%d,%s,%d,", (int) a->t, (int) a->t_meas, a->why, lp_nosp(r6_ettr_why_name(a->why), w, sizeof(w)), a->st);
+    lp_printf(b, "%s,%d,%d,%d,%d,0x%x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+        lp_nosp(r6_ettr_st_name(a->st), w, sizeof(w)), a->k, a->k_raw, a->lim, a->rest, a->hint, a->tv & 0xFFFF,
+        a->want & 0xFFFF, a->lo & 0xFFFF, a->hi & 0xFFFF, a->g & 0xFFFF, a->sv & 0xFFFF, (int) a->H, (int) a->s, (int) a->b,
+        (int) a->ym10, a->n, a->span, a->hspread, a->dz, a->dw);
+    lp_ett_meas(b, "ett.task", &s->cur);
+    lp_printf(b, "# ett.n=ticks,meas,meas_ok,tries,torn,unbound,retries,resets,fresh,us_last,us_max,us_avg,bk_us_max,bk_n\n");
+    lp_printf(b, "ett.n=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", (int) s->ticks, (int) s->meas, (int) s->meas_ok,
+        (int) s->tries, (int) s->torn, (int) s->unbound, (int) s->retries, (int) s->resets, (int) s->fresh_n,
+        (int) s->us_last, (int) s->us_max, (int) s->us_avg, (int) s->bk_us_max, (int) s->bk_n);
+    lp_printf(b, "# ett.ref=fps10,fps_cls,t_ref,f_ref,ae_ref,ref_why(1 Tv,2 settings,3 frame rate,4 gap/no LV,5 start,6 no proposal),h_n,h_ovf,tv,tv_len,range\n");
+    lp_printf(b, "ett.ref=%d,%d,%d,%d,%d,%d,%d,%d,0x%04x,%d,0x%x\n", s->fps10, s->fps_cls, (int) s->t_ref, (int) s->f_ref,
+        (int) s->ae_ref, s->ref_why, (int) s->h_n, (int) s->h_ovf, s->tv & 0xFFFF, s->tv_len, s->range);
+    lp_printf(b, "ett.rings=%d,%d,%d,%d,%d,%d,%d,%d\n", (int) s->m_n, (int) s->raw_n, (int) s->bk_ring_n, (int) s->fy_n,
+        (int) s->fy_torn, (int) s->fy_us_max, (int) s->lv_draws, (int) s->lv_erases);
+    {
+        char t[160];
+        int j = 0;
+        for (int i = 0; i < R6ETT_NM; i++) j += snprintf(t + j, sizeof(t) - j, i ? ",%d" : "%d", (int) s->nv[i]);
+        lp_printf(b, "ett.nv=%s\n", t);                           /* per R6ETT_M_*: ok,nolv,read,torn,unbound,nosim,expsim,magnify,numpix,idle */
+        j = 0;
+        for (int i = 0; i < R6ETT_NW; i++) j += snprintf(t + j, sizeof(t) - j, i ? ",%d" : "%d", (int) s->why_n[i]);
+        lp_printf(b, "ett.whyn=%s\n", t);                         /* per R6ETT_W_* */
+    }
+    /* bins: 4 x 256, 16 per line (the copy of ett.cur) */
+    lp_printf(b, "# ett.bin[c][i]=bins i..i+15 of channel c (Y R G B) of ett.cur (read %s)\n", ok ? "ok" : "failed");
+    if (ok)
+        for (int c = 0; c < 4; c++)
+            for (int i = 0; i < 256; i += 16)
+            {
+                char t[200];
+                int j = 0;
+                for (int x = i; x < i + 16; x++) j += snprintf(t + j, sizeof(t) - j, x > i ? ",%d" : "%d", (int) bins[c][x]);
+                lp_printf(b, "ett.bin[%s][%d]=%s\n", lp_ett_ch[c], i, t);
+            }
+    /* the ALO set of Canon's histogram (E2: ctx+0x28 / 0x2C, stride 8): edges and 16-bin sums */
+    uint32_t hctx = RD(LP_HIST_STATE + 4), pp[4];
+    lp_printf(b, "ett.hist.ctx=0x%08x,%d\n", (int) hctx, lp_hist_ptrs(hctx, pp));
+    lp_printf(b, "# ett.alo[s][i]=ptr,sum,mean_x10,bin0..7,bin248..255,b16[0..15]\n");
+    if (ram_ok(hctx, LP_HIST_CTX_SIZE))
+        for (int sset = 0; sset < 2; sset++)
+            for (int i = 0; i < 4; i++)
+            {
+                struct lp_hstat hs;
+                uint32_t p = RD(hctx + (sset ? 0x2C : 0x28) + 8 * i);
+                snprintf(k, sizeof(k), "ett.alo[%d][%d]", sset, i);
+                if (!lp_hist_stats(p, &hs)) { lp_bad(b, k, p); continue; }
+                char t[300];
+                int j = snprintf(t, sizeof(t), "0x%08x,%d,%d", (int) p, (int) hs.sum, (int) hs.mean_x10);
+                for (int x = 0; x < 8; x++) j += snprintf(t + j, sizeof(t) - j, ",%d", (int) hs.lo[x]);
+                for (int x = 0; x < 8; x++) j += snprintf(t + j, sizeof(t) - j, ",%d", (int) hs.hi[x]);
+                for (int x = 0; x < 16; x++) j += snprintf(t + j, sizeof(t) - j, ",%d", (int) hs.b16[x]);
+                lp_printf(b, "%s=%s\n", k, t);
+            }
+    else lp_bad(b, "ett.alo", hctx);
+    /* the 20 RandomData slots: FrameNum and the histogram pointer rd[0x5EC] (plan 2.10 question 6) */
+    {
+        uint32_t uw = 0, ix = 0;
+        rd32(LP_DTS + 0x10, &uw);
+        rd32(LP_DTS + 0x1C, &ix);
+        lp_printf(b, "ett.rd.dts=%d,%d\n", (int) uw, (int) ix);
+        lp_printf(b, "# ett.rd20[i]=ptr,FrameNum,rd[0x5EC]\n");
+        for (int i = 0; i < LP_RD_RING_N; i++)
+        {
+            uint32_t p = RD(LP_RD_RING + 4 * i);
+            snprintf(k, sizeof(k), "ett.rd20[%d]", i);
+            if (!p || !ram_ok(p, LP_RD_SIZE)) { lp_bad(b, k, p); continue; }
+            lp_printf(b, "%s=0x%08x,%d,0x%08x\n", k, (int) p, (int) RD(p), (int) RD(p + 0x5EC));
+        }
+    }
+    /* Tor 0e (E2), newest RandomData record */
+    {
+        int src = 0;
+        uint32_t rd = lp_rd_base(&src), q = 0, v = 0;
+        lp_printf(b, "ett.tor0e.rd=0x%08x,%d\n", (int) rd, src);
+        if (rd)
+        {
+            lp_flds(b, "ett.gmt", rd, 0x41C, 0x5C / 4);              /* GmtAeParam (23 words, rd+0x424 = the LV AE's Tv) */
+            lp_fld(b, "ett.rd[0x52c]", rd, 0x52C);                   /* GmtAeRecFrameRate */
+            lp_flds(b, "ett.aewb", rd, 0x538, 0x98 / 4);             /* AeWbRandomData (38 words) */
+            lp_fld(b, "ett.rd[0xbf8]", rd, 0xBF8);                   /* fEnableFlicker */
+            lp_fld(b, "ett.rd[0xc04]", rd, 0xC04);                   /* fGmtBadFrame */
+            lp_flds(b, "ett.petit", rd, 0x624, 4);                   /* PetitYch descriptor (16 B, no pixels) */
+        }
+        if (rd32(LP_ETT_RANGE_PTR, &q) && q == LP_ETT_RANGE_OBJ && rd32(q + 0x34, &v))
+            lp_printf(b, "ett.range=0x%08x,0x%08x\n", (int) q, (int) v);   /* bit 0 sim, 1 no sim, 4 out of range */
+        else
+            lp_printf(b, "ett.range=0x%08x,na\n", (int) q);
+    }
+    /* rings, oldest first */
+    struct r6_ettr_fy f;
+    int n = r6_ettr_ring_fy(0, &f);
+    lp_printf(b, "# ett.fy[i]=t,f2,ok,us,npx,r250,g250,b250,u250,y235,y245,y250,y255,maxR,maxG,maxB,maxY (FaceYuv 2x2, Expo log ON)\n");
+    for (int i = 0; i < n; i++)
+    {
+        r6_ettr_ring_fy(i, &f);
+        lp_printf(b, "ett.fy[%d]=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", i, (int) f.t, (int) f.f2, f.ok, (int) f.us,
+            (int) f.npx, (int) f.r250, (int) f.g250, (int) f.b250, (int) f.u250, (int) f.y235, (int) f.y245, (int) f.y250,
+            (int) f.y255, f.mr, f.mg, f.mb, f.my);
+    }
+    struct r6_ettr_m e;
+    n = r6_ettr_ring_m(0, &e);
+    lp_printf(b, "# ett.m[i]=t,frame,tv,want,H,valid,rr,flags(1|2 bound,4 same rec,8 fresh,16 window,32 range bit 4),pR,pG,pB,"
+                 "sim,s,b,ym10,fps10,st,why,k,set,ae600,tv424,m608,rng([0x1427F8] low byte: 1 sim,2 no sim,16 out of range;0xff na)\n");
+    for (int i = 0; i < n; i++)
+    {
+        r6_ettr_ring_m(i, &e);
+        lp_printf(b, "ett.m[%d]=%d,%d,0x%04x,0x%04x,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,0x%04x,0x%04x,0x%02x\n", i,
+            (int) e.t, (int) e.frame, e.tv & 0xFFFF, e.want & 0xFFFF, e.H, e.valid, e.rr == 0xFF ? -1 : e.rr, e.flags, e.pr, e.pg,
+            e.pb, e.sim, e.s, e.b, e.ym10, e.fps10, e.st, e.why, e.k, e.set, e.ae600, e.tv424 & 0xFFFF, e.m608 & 0xFFFF, e.rng);
+    }
+    struct r6_ettr_raw r;
+    n = r6_ettr_ring_raw(0, &r);
+    lp_printf(b, "# ett.raw[i]=t,old,tv,src(1 ML),len,n,f0,ae0,t0,wn; ett.raw[i].k[j]=dt,dfr,flags(valid|set<<4|bound<<5|same<<6),ae,tv424,ym10,H,s,pR,pG,pB\n");
+    for (int i = 0; i < n; i++)
+    {
+        r6_ettr_ring_raw(i, &r);
+        lp_printf(b, "ett.raw[%d]=%d,0x%04x,0x%04x,%d,%d,%d,%d,%d,%d,%d\n", i, (int) r.t, r.old & 0xFFFF, r.tv & 0xFFFF, r.src,
+            r.len, r.n, (int) r.f0, r.ae0, r.t0, (int) r.wn);
+        for (int j = 0; j < r.n && j < R6ETTR_RAW_N; j++)
+        {
+            const struct r6_ettr_rt * t = &r.tk[j];
+            lp_printf(b, "ett.raw[%d].k[%d]=%d,%d,0x%02x,%d,0x%04x,%d,%d,%d,%d,%d,%d\n", i, j, t->dt, t->dfr, t->flags, t->ae,
+                t->tv424 & 0xFFFF, t->ym10, t->H, t->s, t->pr, t->pg, t->pb);
+        }
+    }
+    struct r6_ettr_bk x;
+    n = r6_ettr_ring_bk(0, &x);
+    lp_printf(b, "# ett.bk[i]=t,what(1 conf,2 SW1),ev,k,want,tv,fn,frame,valid,set,bind,sim,H,pR,pG,pB,s,b,ym10,tv424,m608,ae600,us\n");
+    for (int i = 0; i < n; i++)
+    {
+        r6_ettr_ring_bk(i, &x);
+        lp_printf(b, "ett.bk[%d]=%d,%d,%d,%d,0x%04x,0x%04x,%d,%d,%d,%d,0x%x,%d,%d,%d,%d,%d,%d,%d,%d,0x%04x,0x%04x,%d,%d\n", i,
+            (int) x.t, x.what, x.ev, x.k, x.want & 0xFFFF, x.tv & 0xFFFF, (int) x.fn, (int) x.frame, x.valid,
+            x.set == 0xFF ? -1 : x.set, x.bind, x.sim, x.H, x.pr, x.pg, x.pb, x.s, x.b, x.ym10, x.tv424 & 0xFFFF, x.m608 & 0xFFFF,
+            x.ae600, x.us);
+    }
+}
+
+/* the number lp_write_log will take (the first free LVPn after lp_file_no; nothing creates a file in between: one
+ * snapshot at a time), for the line ettr.file before the main log is written; lp_file_no is set to the number before it,
+ * so lp_write_log's own scan starts there (one is_file more, not a second scan from 1); 0 = none */
+static int lp_ett_next_no(void)
+{
+    char name[32];
+    for (int i = 0, n = lp_file_no + 1; i < 1000 && n <= LP_FILE_MAX; i++, n++)
+    {
+        snprintf(name, sizeof(name), "ML/LOGS/LVP%05d.LOG", n);
+        if (!is_file(name)) { lp_file_no = n - 1; return n; }
+    }
+    return 0;
+}
+
+/* ETTnnnnn.LOG next to the LVP file just written, a new file only (an existing one is kept: no overwrite); inlined into
+ * lp_snapshot_do, its only caller (the FIO calls stay there, canon_gate allow list) */
+static inline __attribute__((always_inline)) int lp_write_ett(struct lp_buf * b, const char * name)
+{
+    if (is_file(name)) return 0;
+    FILE * f = FIO_CreateFile(name);
+    if (!f) return 0;
+    int w = FIO_WriteFile(f, b->p, b->len);
+    FIO_CloseFile(f);
+    return w == b->len;
+}
+#endif
+
 /* each snapshot goes to a new file: no append, no seek, no overwrite */
 static int lp_write_log(struct lp_buf * b, char * name, int name_size)
 {
@@ -2816,6 +3067,9 @@ static void lp_snapshot_do(int delay_ms)
         snprintf(lp_snap_msg, sizeof(lp_snap_msg), "no memory");
         return;
     }
+#ifdef CONFIG_R6_ETTR
+    int no = lp_ett_next_no();            /* M11.0: the number lp_write_log will take (ettr.file) */
+#endif
     lp_printf(&b, "# LVPROBE M7.0 snapshot\n");
     lp_printf(&b, "# format: key=value; raw words 0x%%08x, counts decimal, 64-bit IBus 0xHI:LO;\n");
     lp_printf(&b, "# NULL = Canon pointer 0; invalid(...) / uncached_unverified(...) = not dereferenced\n");
@@ -2841,6 +3095,11 @@ static void lp_snapshot_do(int delay_ms)
     lp_md_log(&b);                        /* M9.3 */
 #endif
     lp_x_log(&b);                         /* M9.1 Tor 0 */
+#ifdef CONFIG_R6_ETTR
+    /* M11.0: one line (at most 30 B, inside the static budget before the ring tail): the second file, Mode, reason, state */
+    lp_printf(&b, "ettr.file=ETT%05d.LOG,%d,%d,%d\n", no, r6_ettr_mode(), r6_ettr_mode() ? r6_ettr_stats()->adv.why : R6ETT_W_OFF,
+        r6_ettr_mode() ? r6_ettr_stats()->adv.st : R6ETT_S_NONE);
+#endif
 #if defined(CONFIG_R6_INTERVAL) && defined(CONFIG_R6_PROPW_TV)
     lp_ring_tail(&b);                     /* M10.2b: the picture / write rings last, down to LP_TAIL_SLACK */
 #endif
@@ -2852,6 +3111,26 @@ static void lp_snapshot_do(int delay_ms)
     const char * base = name[0] ? name + 8 : "?";     /* without "ML/LOGS/" */
     if (ok) snprintf(lp_snap_msg, sizeof(lp_snap_msg), "%s, %d B", base, b.len);
     else snprintf(lp_snap_msg, sizeof(lp_snap_msg), "write FAILED (%s)", base);
+#ifdef CONFIG_R6_ETTR
+    if (ok)
+    {
+        /* M11.0: ETTnnnnn.LOG with the number of the LVP file just written, the same buffer filled again; its last
+         * LP_ETT_BINS bytes hold the bins copy */
+        char ename[32];
+        int n = lp_file_no;
+        uint32_t (*bins)[256] = (uint32_t (*)[256]) (b.p + LP_LOG_SIZE - LP_ETT_BINS);
+        b.len = 0;
+        b.trunc = 0;
+        b.cap = LP_LOG_SIZE - LP_ETT_BINS - LP_LOG_TAIL;
+        lp_ett_log(&b, bins, n);
+        trunc = b.trunc;
+        b.cap = LP_LOG_SIZE - LP_ETT_BINS;
+        lp_printf(&b, "log_truncated=%d\n", trunc);
+        lp_printf(&b, "log_bytes=%d\n# end\n", b.len);
+        snprintf(ename, sizeof(ename), "ML/LOGS/ETT%05d.LOG", n);
+        if (!lp_write_ett(&b, ename)) snprintf(lp_snap_msg, sizeof(lp_snap_msg), "%s, ETT FAILED", base);
+    }
+#endif
     free(b.p);
 }
 
@@ -3150,6 +3429,11 @@ void lvprobe_expo_enable(int on)
     lp_x_on = on ? 1 : 0;
     lvprobe_status_enable(lp_status_on);
 }
+
+#ifdef CONFIG_R6_ETTR
+/* M11.0: R6 ETTR samples FaceYuv 2 x 2 only while the Expo log is ON (docs/m11_plan.md 2.1) */
+int lvprobe_expo_on(void) { return lp_x_on; }
+#endif
 
 /* QEMU test only reads it; also shown as R<n> on the status line */
 uint32_t lvprobe_forced_refresh_count(void) { return lp_forced_refresh; }

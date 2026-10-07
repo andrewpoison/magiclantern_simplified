@@ -47,6 +47,14 @@
  * copy buffer and FrameNum state; the box here steps aside while ML's
  * histogram is enabled (R6H_MLHIST), so only one of them is drawn.
  *
+ * M11.0 (CONFIG_R6_ETTR): r6h_read_canon gives R6 ETTR (r6_ettr.c) the same
+ * reads for all four arrays through a visitor (no copy), with the RandomData
+ * binding of docs/m11_plan.md 2.1 (the newest record's rd[0x5EC] before and
+ * after the arrays) and the record's fields (FrameNum, rd[0x5FC], rd[0x600],
+ * rd[0x608], and the Tor 0e words rd[0x52C] / rd+0x424 of answer E2). R6 ETTR
+ * samples in this file's task (r6_hist_task): every R6ETTR_TICK_MS while its
+ * Mode is not Off, the box keeps its R6H_TICK_MS step.
+ *
  * Box: 128 x 64 bins area + 2 px frame at ML (572,50)..(704,118), right
  * below Canon's Q icon and top bar on the LCD shooting screen (M5 photo:
  * Canon's top row ends at about y 48, the Q icon covers x 631..710 up to
@@ -65,6 +73,9 @@
 #include "r6_overlays.h"
 #ifdef CONFIG_R6_INTERVAL
 #include "r6_interval.h"           /* M9.2: r6_iv_bulb_running */
+#endif
+#ifdef CONFIG_R6_ETTR
+#include "r6_ettr.h"               /* M11.0: R6 ETTR samples in r6_hist_task */
 #endif
 
 #ifdef FEATURE_R6_CANON_HISTOGRAM
@@ -263,6 +274,52 @@ static int r6h_read_bins(uint32_t bins[4][256], int c0, int c1, uint32_t * frame
     return R6H_SHOWN;
 }
 
+#ifdef CONFIG_R6_ETTR
+/* M11.0: the RandomData record ov_framenum reads (0 = not readable; the whole record range-checked) */
+static uint32_t ov_rd_base(int uc)
+{
+    if (!ov_ram_ok(OV_DTS + 0x10, 0x10, uc)) return 0;
+    if (RD(OV_DTS + 0x10)) return OV_RD_WORK;
+    uint32_t idx = RD(OV_DTS + 0x1C);
+    if (idx >= OV_RD_RING_N) return 0;
+    uint32_t base = RD(OV_RD_RING + 4 * idx);
+    return (base && ov_ram_ok(base, OV_RD_SIZE, uc)) ? base : 0;
+}
+
+/* M11.0 (r6_overlays.h): r6h_read_bins' reads for R6 ETTR, all four arrays through visit, with the RandomData binding */
+int r6h_read_canon(r6h_visit_fn visit, void * arg, struct r6h_canon * o)
+{
+    memset(o, 0, sizeof(*o));
+    int uc = ov_uc_ok();
+    uint32_t ctx = RD(OV_HIST_STATE + 4), p[4], q[4];
+    o->rd_b = ov_rd_base(uc);
+    if (o->rd_b) o->hp_b = RD(o->rd_b + 0x5EC);             /* HistRandomData p0 (ROM 0xE079C44E..; M11 plan 2.1) */
+    int set = ov_hist_set(ctx, p, uc);
+    o->set = set;
+    if (set < 0) return R6H_NO_SET;
+    uint32_t n = RD(ctx + 4);
+    o->p0 = p[0];
+    for (int c = 0; c < 4; c++)
+        if (!p[c] || !ov_ram_ok(p[c], 0x400, uc)) return R6H_BAD_PTR;
+    for (int c = 0; c < 4; c++)
+        if (!n || visit(arg, c, (const volatile uint32_t *) p[c], n) != n) return R6H_SUM;
+    if (ov_hist_set(ctx, q, uc) != set || RD(ctx + 4) != n) return -1;
+    for (int i = 0; i < 4; i++) if (q[i] != p[i]) return -1;
+    uint32_t ra = ov_rd_base(uc);
+    if (!ra) return R6H_NO_FRAME;
+    o->rd_a = ra;
+    o->hp_a = RD(ra + 0x5EC);
+    o->frame = RD(ra);                                      /* FrameNum */
+    o->sim = RD(ra + 0x5FC);                                /* fValidExposureSim */
+    o->ae600 = RD(ra + 0x600);                              /* MeteringRandomData: AE counter (~8 Hz) */
+    o->m608 = RD(ra + 0x608);                               /* low half: Canon's meter (s16 Code768) */
+    o->fr52c = RD(ra + 0x52C);                              /* GmtAeRecFrameRate (Tor 0e, E2) */
+    o->tv424 = RD(ra + 0x424);                              /* GmtAeParam: low half = the Tv of the LV AE (Tor 0e, E2) */
+    o->numpix = n;
+    return R6H_SHOWN;
+}
+#endif
+
 /* copy the arrays used by mode (Luma: Y = 0; RGB: 1..3); returns R6H_SHOWN,
  * a failure state, or -1 = torn (set changed during the copy: retry) */
 static int r6h_read(int mode, uint32_t * frame)
@@ -453,11 +510,30 @@ static void r6h_step(void)
 
 static void r6h_task(void * unused)
 {
+#ifdef CONFIG_R6_ETTR
+    /* M11.0: R6 ETTR (r6_ettr.c) samples in this task, every R6ETTR_TICK_MS while its Mode is not Off: a task of its
+     * own beside r6_iv_task (its read-only trace also runs during a bracket), with this task's existing sleep (no new
+     * Canon call edge). The box keeps its R6H_TICK_MS step; with ETTR Off the loop is the one before */
+    int t_box = get_ms_clock();
+    TASK_LOOP
+    {
+        int et = r6_ettr_tick_ms();
+        msleep(et ? et : R6H_TICK_MS);
+        if (et) r6_ettr_tick();
+        int now = get_ms_clock();
+        if (!et || now - t_box >= R6H_TICK_MS - R6ETTR_TICK_MS / 2 || now < t_box)
+        {
+            t_box = now;
+            r6h_step();
+        }
+    }
+#else
     TASK_LOOP
     {
         msleep(R6H_TICK_MS);
         r6h_step();
     }
+#endif
 }
 
 TASK_CREATE("r6_hist_task", r6h_task, 0, 0x1f, 0x1000);

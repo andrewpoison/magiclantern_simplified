@@ -28,6 +28,7 @@ ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_interval.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_grid.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_motion.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_propw.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_ettr.o
 
 include ../Makefile
 .DEFAULT_GOAL := $(BUILD_DIR)/cam_complete

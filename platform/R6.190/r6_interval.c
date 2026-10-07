@@ -183,6 +183,10 @@
  * "Tv back to ..." (command 5) runs r6_propw.c's offer after a cut-off bracket. Start, Test, "Tv writes" and "Tv
  * back to ..." act only when ML's menu key handling calls them (GuiMainTask, src/gui.c ml_gui_main_task).
  *
+ * M11.0 (docs/m11_plan.md 3.1, CONFIG_R6_ETTR): iv_event calls R6 ETTR's read-only r6_ettr_trace() right after each
+ * member's confirmed write and right before each member's picture (one histogram read, no sleep, no drawing, no card
+ * I/O; nothing while R6 ETTR's Mode is Off). The bracket's writes, presses, locks and timing stay as they are.
+ *
  * Canon's screen saver / eco mode (GUI mode 0xE08E / 0xE08F) ends a series:
  * ML cannot wake the camera without a new Canon input. Canon's auto power
  * off and screen off cannot be held off without a write: the user sets them
@@ -208,6 +212,9 @@
 #include "r6_motion.h"                   /* M9.3: R6 Motion's detector runs in r6_iv_task */
 #endif
 #include "r6_propw.h"                    /* M10.2: the Tv write path (Tor 1) */
+#ifdef CONFIG_R6_ETTR
+#include "r6_ettr.h"                     /* M11.0: R6 ETTR's read-only bracket trace (iv_event) */
+#endif
 
 #ifdef CONFIG_R6_INTERVAL
 
@@ -2101,10 +2108,16 @@ static void iv_event(int now)
             bk.wr = (int) _r6pw_ring_n() - 1;
             if (r == R6PW_R_TOOK_OVER && iv_took_over(&u)) { iv_end(R6IV_STOP_TVUSER, 0, u); return; }
             if (r != R6PW_R_OK) { iv_end(R6IV_STOP_TVW, 0, r << 8 | _r6pw_state()->last_lock); return; }
+#ifdef CONFIG_R6_ETTR
+            r6_ettr_trace(R6ETTR_BK_CONF, bk.ev, k, want);  /* M11.0: read only, the member's write confirmed (ring bk) */
+#endif
             cur = want;
             if (iv_settle()) return;
         }
         if (iv_member_ready(want)) return;
+#ifdef CONFIG_R6_ETTR
+        r6_ettr_trace(R6ETTR_BK_SW1, bk.ev, k, want);       /* M11.0: read only, right before the member's SW1 (ring bk) */
+#endif
         iv_shoot(&iv_s);                     /* unchanged M8.x picture; phase B checks Tv == want */
         if (!st.running) return;
     }

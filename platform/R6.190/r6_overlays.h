@@ -84,4 +84,25 @@ struct r6_mlhist_stats
 };
 const struct r6_mlhist_stats * r6_mlhist_stats(void);
 
+#ifdef CONFIG_R6_ETTR
+/* M11.0 (R6 ETTR, r6_ettr.c; docs/m11_plan.md 2.1): the reads and checks of the "Histogram (Canon)" box (DISP set 0/1,
+ * every array in range and summing to numPix, set / pointers / numPix unchanged afterwards, the RandomData record
+ * readable) for all four arrays Y, R, G, B, plus the binding of plan 2.1: the newest RandomData record and its histogram
+ * pointer rd[0x5EC] before the first and after the last array, and the record's fields read after the arrays. The arrays
+ * are not copied here: visit(arg, c, a, n) reads Canon's array c (256 u32 at a, whole 1 KB range-checked, uncached heap)
+ * and returns its sum (the caller copies or computes from it; its results count only if this returns R6H_SHOWN).
+ * Returns R6H_SHOWN, R6H_NO_SET / R6H_BAD_PTR / R6H_SUM / R6H_NO_FRAME, or -1 (torn: the set changed during the read).
+ * RAM reads only, any task. */
+struct r6h_canon {
+    int set;                 /* DISP set 0/1, -1 none */
+    uint32_t numpix;
+    uint32_t p0;             /* the set's Y array (what rd[0x5EC] points to when the record belongs to it) */
+    uint32_t rd_b, hp_b;     /* newest RandomData record before the arrays and its rd[0x5EC] (0 = not readable) */
+    uint32_t rd_a, hp_a;     /* the same after the arrays */
+    uint32_t frame, sim, ae600, m608, fr52c, tv424;   /* rd_a: FrameNum, [0x5FC], [0x600], [0x608], [0x52C], [0x424] */
+};
+typedef uint32_t (*r6h_visit_fn)(void * arg, int c, const volatile uint32_t * a, uint32_t n);
+int r6h_read_canon(r6h_visit_fn visit, void * arg, struct r6h_canon * o);
+#endif
+
 #endif

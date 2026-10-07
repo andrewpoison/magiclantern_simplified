@@ -174,6 +174,16 @@
  * write request on every focus ring turn) is compiled out. */
 #define CONFIG_R6_LENS_DATA
 
+/* R6.190 M11.0: "R6 ETTR" (r6_ettr.c, Shoot menu; docs/m11_plan.md, user answers 2026-10-07), the Auto-ETTR advisor
+ * ("Display only"): Canon's LV histogram per channel R, G, B (r6_overlays.c r6h_read_canon, with the RandomData
+ * binding), a proposed Tv in the ML menu and as one LV line (r6_grid.c, write-under, LCD only), a second log file
+ * ETTnnnnn.LOG per snapshot (lvprobe.c). Never a property write, never a press: from the Tv write path only the read-only
+ * _r6pw_state / _r6pw_ring / _r6pw_ring_n (r6_propw.c / .h unchanged). Reads only under the existing approvals and Tor 0e
+ * (E2). Samples in r6_hist_task (r6_overlays.c), beside r6_iv_task; R6 Interval's bracket calls the read-only
+ * r6_ettr_trace(). One more handler on PROP_SHUTTER (an id ML registers anyway). No new Canon call, no MMIO. Needs
+ * FEATURE_R6_CANON_HISTOGRAM, CONFIG_R6_INTERVAL, CONFIG_R6_PROPW_TV and (for the LV line) CONFIG_R6_GRID. */
+#define CONFIG_R6_ETTR
+
 #define CONFIG_TASK_STRUCT_V2_SMP
 #define CONFIG_TASK_ATTR_STRUCT_V5
 
