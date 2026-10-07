@@ -129,7 +129,10 @@ void _r6pw_disarm(int clean);
 int _r6pw_write(int want, int kind, int k, int ev);   /* STEP, RESTORE (event end: waits, then writes); R6PW_R_* */
 int _r6pw_wait_ready(int want, int kind);      /* wait rows, no call, <= R6IV_BKT_WAIT_MS; 0 = ready, else the lock */
 void _r6pw_tick(int now);                      /* consumer, boot check, open-request watch, pending restore, offer, marker */
-int _r6pw_back(void);                          /* command 5 "Tv back to ..."; R6PW_R_* (REFUSED: back_lock) */
+int _r6pw_back(void);                          /* command 5 "Tv back to ..."; R6PW_R_* (REFUSED: back_lock; NONE: dropped,
+                                                * live view lost in its wait, the notice given; M10.2b review S1) */
+void _r6pw_back_dropped(int why);              /* M10.2b: command 5 dropped before its write (1 no LV, 2 not steady): the
+                                                * notice; no call */
 void _r6pw_consume(int now);                   /* the ring consumer (3.3) */
 int _r6pw_tv_stable(int16_t * v);              /* 1 = stable-M *v (3.6a), 0 = unsettled / not in M */
 int _r6pw_user_evidence(int16_t expect, int16_t * u);   /* 1 = user evidence for *u (3.6a) */

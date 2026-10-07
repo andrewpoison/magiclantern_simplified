@@ -256,7 +256,8 @@ extern int CC_SW2_CBR(int status);   /* [cc+0xE0] = status; post 0x20001000 / 0x
 #define R6IV_PROC_NR_MS     1000   /* M8.2: Interval warning if interval < 2 Tv + this and NR may be on */
 #define R6IV_BKT_MEMBER_MS  1000   /* M10.2: per bracket member: job free <= 0.71 s + 0.3 s settle (K31) */
 #define R6IV_BKT_WRITE_MS    700   /* M10.2: per Tv write: 500 confirmation + 200 settle */
-#define R6IV_BACK_MAX_MS   60000   /* M10.2: "Tv back to ..." waits this long for the ML menu to close, then drops */
+#define R6IV_BACK_MAX_MS   60000   /* M10.2b: "Tv back to ...": once the ML menu hold is over, the wait for Canon's LV hold
+                                    * ends after this (dropped); the ML menu itself has no limit (user decision 2026-10-06) */
 #define R6IV_MENU_TASK "GuiMainTask"   /* M10.2: ML's menu key handling runs here (src/gui.c ml_gui_main_task, the
                                         * TASK_OVERRIDE of Canon's gui_main_task, stubs.S task_create("GuiMainTask")) */
 /* M9.2: bulb with Canon's bulb timer. The menu texts name the limits as Canon shows them ("0:00:31 .. 0:30:00"):
@@ -381,9 +382,15 @@ static struct r6_iv_bkt bk;              /* M10.2: Bracket settings and event st
 static int iv_refused_pw = 0;            /* M10.2: enum r6pw_lock of the last R6IV_CAM_TVW refusal */
 static int iv_refused_bk = 0;            /* M10.2: BKT_LIST: why << 8 | member index; iv_refused_tv: its Tv */
 static int iv_refused_tv = 0;
+/* M10.2b: the newest Start / Test refusals with their reason (log iv.ref). Written by the menu task and r6_iv_task, a log
+ * only: two refusals at the same moment can share a slot */
+static struct r6_iv_ref iv_ref_ring[R6IV_REF_RING];
+static uint32_t iv_ref_n = 0;
 static volatile int iv_menu_wanted_ev = 0;   /* M10.2: a Trash press was blocked by a bracket event (hold from its end) */
 static int iv_back_t = 0;                /* M10.2: command 5 taken at (ms | 1), 0 = none */
-static const char * iv_back_why = 0;     /* M10.2: why "Tv back to ..." was refused / dropped */
+static const char * iv_back_why = 0;     /* M10.2: why the select of "Tv back to ..." was refused */
+static const char * iv_back_drop = 0;    /* M10.2b: why command 5 was dropped before its write (menu line) */
+static int iv_back_lvw = 0;              /* M10.2b: command 5 waits for Canon's LV hold since (ms | 1), 0 = not yet */
 static volatile int iv_tv_prop = 0;      /* PROP_SHUTTER as delivered, int16 (lens.c drops it while ML still sees Av / P) */
 static volatile int iv_tv_seen = 0;
 static volatile int iv_tv_len = 0;
@@ -487,6 +494,28 @@ int r6_iv_in_pic(void) { return iv_in_pic; }                                    
 static int iv_md_run(void) { return st.running && st.mode != R6IV_MODE_INTERVAL; }
 int r6_iv_md_running(void) { return iv_md_run() || iv_cmd == 4; }
 int r6_iv_md_refused(void) { return iv_md_refused; }
+/* M10.2b: a refusal with its reason (the Bracket details of iv_bkt_check / iv_begin are set before), counted as before */
+static void iv_refuse(int c, int src)
+{
+    struct r6_iv_ref * e = &iv_ref_ring[iv_ref_n % R6IV_REF_RING];
+    e->t = get_ms_clock();
+    e->src = src;
+    e->cam = c;
+    e->lock = c == R6IV_CAM_TVW ? iv_refused_pw : 0;
+    e->pad = 0;
+    e->bk = c == R6IV_CAM_BKT_LIST ? iv_refused_bk : 0;
+    e->tv = c == R6IV_CAM_BKT_LIST ? iv_refused_tv : 0;
+    iv_ref_n++;
+    st.refused++;
+}
+int r6_iv_refusal(int i, struct r6_iv_ref * e)
+{
+    uint32_t n = iv_ref_n;
+    int cnt = n < R6IV_REF_RING ? (int) n : R6IV_REF_RING;
+    if (i >= 0 && i < cnt) *e = iv_ref_ring[(n - cnt + i) % R6IV_REF_RING];
+    return cnt;
+}
+uint32_t r6_iv_refusal_n(void) { return iv_ref_n; }
 #ifdef CONFIG_R6_MOTION
 int r6_iv_tick_ms(void) { return iv_md_run() ? R6MD_TICK_MS : 50; }
 #else
@@ -898,6 +927,15 @@ int _r6iv_cc_gate(const struct r6_iv_cc * s) { return iv_cc_gate(s); }
 int _r6iv_lvstill(const struct r6_iv_cc * s) { return iv_cc_lvstill(s); }
 int _r6iv_cc_same(const struct r6_iv_cc * a, const struct r6_iv_cc * b) { return iv_cc_same(a, b); }
 void _r6iv_times(int * t_menu, int * t_lv, int * in_pic) { *t_menu = iv_t_menu; *t_lv = iv_t_lv; *in_pic = iv_in_pic; }
+/* M10.2b: row 12's two holds from one place (r6_propw.c pw_gui_bad and iv_back_tick, so they cannot drift); r6_iv_task's
+ * samples (iv_sample) */
+int _r6iv_holds(int now)
+{
+    if (gui_menu_shown() || now - iv_t_menu < R6PW_HOLD_MS) return R6IV_HOLD_MENU;
+    if (iv_t_lv < 0) return R6IV_HOLD_NOLV;
+    if (now - iv_t_lv < R6PW_HOLD_MS) return R6IV_HOLD_LV;
+    return 0;
+}
 const struct r6_iv_bkt * r6_iv_bkt(void) { return &bk; }
 
 /* ---- M10.2 Bracket: member list, checks, budget (spec 4.2 .. 4.5) ---- */
@@ -1136,7 +1174,7 @@ static void iv_begin(int now, int test)
     if (c != R6IV_CAM_OK)
     {
         iv_refused_cam = c;
-        st.refused++;
+        iv_refuse(c, test ? R6IV_REF_TASK_TEST : R6IV_REF_TASK_START);   /* M10.2b: with its reason */
         return;
     }
     iv_refused_cam = R6IV_CAM_OK;
@@ -1194,7 +1232,7 @@ static void iv_begin_md(int now, int shoot)
     if (c != R6IV_CAM_OK)
     {
         iv_md_refused = c;
-        st.refused++;
+        iv_refuse(c, R6IV_REF_MD_TASK);      /* M10.2b */
         return;
     }
     iv_md_refused = R6IV_CAM_OK;
@@ -1937,7 +1975,19 @@ static void iv_shoot(const struct r6_iv_cc * pre)
     if (b && bend == IV_BEND_NOTIMER) { iv_end(R6IV_STOP_BULB_NOTIMER, 0, (int32_t) e->d30_ms); return; }
     if (b && bend == IV_BEND_EARLY) { iv_end(R6IV_STOP_BULB_EARLY, 0, (int32_t) e->d30_ms); return; }       /* before BUTTON */
     if (b && e->bbtn) { iv_end(R6IV_STOP_BUTTON, 0, e->bbtn | 0x100); return; }                             /* 0x1xx: in a bulb */
-    if (fin || (why == IV_WHY_S12 && !b)) { iv_end(R6IV_STOP_CCSTATE, 0, fin | (why == IV_WHY_S12 && !b) << 15); return; }
+    if (fin || (why == IV_WHY_S12 && !b))
+    {
+        /* M10.2b (camera M10.2 step 6, LVP00100: MENU pressed in the settle window, CC state 9 at this check): the same stop
+         * at the same point; when the only failed bit is the CC state and Canon shows a menu / playback (CC state 9, or a
+         * GUI mode other than 0, review and SR) it is reported as Canon's GUI, val = that GUI mode, or 0x10000 | CC state
+         * while the GUI mode is still 0 (e->final keeps the bits) */
+        int gm = iv_s.gui, s12 = why == IV_WHY_S12 && !b;
+        int gui = fin == IV_FIN_STATE && !s12 && (iv_s.valid & R6IV_V_CC)
+            && (iv_s.state == 9 || (gm && gm != R6IV_GUI_REVIEW && gm != R6IV_GUI_SR));
+        if (gui) iv_end((gm == R6IV_GUI_SAVER || gm == R6IV_GUI_ECO) ? R6IV_STOP_PWRSAVE : R6IV_STOP_GUI, 0, gm ? gm : 0x10000 | (int) iv_s.state);
+        else iv_end(R6IV_STOP_CCSTATE, 0, fin | s12 << 15);
+        return;
+    }
 
     iv_wait_ms = 0;
     iv_wait_mask = 0;
@@ -2090,14 +2140,41 @@ static int iv_bkt_between(int now)
     return 0;
 }
 
-/* command 5 "Tv back to ...": >= R6IV_TEST_MS after the command and with the ML menu closed >= R6PW_HOLD_MS */
+/* M10.2b: command 5 dropped before its write; notice 1 / 2: _r6pw_back_dropped's text outside the ML menu, 0: the menu
+ * line only (a run started from the ML menu, or _r6pw_back gave the notice itself: M10.2b review S1) */
+static void iv_back_drop_now(const char * why, int notice)
+{
+    iv_back_t = 0;
+    iv_back_lvw = 0;
+    iv_back_drop = why;
+    if (notice) _r6pw_back_dropped(notice);
+}
+
+/* command 5 "Tv back to ..." (M10.2b): >= R6IV_TEST_MS after the command, then the two holds of row 12 (_r6iv_holds, the
+ * helper r6_propw.c uses): the ML menu closed R6PW_HOLD_MS (no limit while it stays open), then Canon's LV running
+ * R6PW_HOLD_MS. Camera M10.2 step 8.5 (LVP00102): Canon restarts LV only after the ML menu closed and r6_iv_task saw it
+ * 93..182 ms after the PROP_LV_ACTION delivery (28 of 28 LV starts), so the menu hold alone called _r6pw_back with LV
+ * running 2.9 s: refused (row 12), no retry. User decision 2026-10-06: no LV once the menu hold is over (Canon MENU,
+ * playback, screen off), or LV gone during its hold, drops the command at once with a notice outside the ML menu (no
+ * late write); the LV hold may take R6IV_BACK_MAX_MS. _r6pw_back then waits for the other wait rows (change B); LV lost
+ * in that wait drops it as well (R6PW_R_NONE, M10.2b review S1). A run started meanwhile drops it as well (iv_tick) */
 static void iv_back_tick(int now)
 {
     int t0 = iv_back_t & ~1;             /* taken at (now | 1): on that tick now can be iv_back_t - 1 (QEMU m102 K2) */
-    if (now - t0 > R6IV_BACK_MAX_MS || now < t0) { iv_back_t = 0; iv_back_why = "ML menu not closed"; return; }
-    if (now - t0 < R6IV_TEST_MS || gui_menu_shown() || now - iv_t_menu < R6PW_HOLD_MS) return;
+    if (now < t0) { iv_back_drop_now("clock went back", 2); return; }
+    if (now - t0 < R6IV_TEST_MS) return;
+    int h = _r6iv_holds(now);
+    if (h == R6IV_HOLD_MENU) { iv_back_lvw = 0; return; }   /* the ML menu open or just closed */
+    if (h == R6IV_HOLD_NOLV) { iv_back_drop_now("no live view", 1); return; }
+    if (h == R6IV_HOLD_LV)
+    {
+        if (!iv_back_lvw) iv_back_lvw = now | 1;
+        else if (now - (iv_back_lvw & ~1) > R6IV_BACK_MAX_MS) iv_back_drop_now("live view not steady", 2);
+        return;
+    }
     iv_back_t = 0;
-    _r6pw_back();
+    iv_back_lvw = 0;
+    if (_r6pw_back() == R6PW_R_NONE) iv_back_drop_now("no live view", 0);   /* LV lost in change B's wait (review S1) */
     iv_ev_end_hold();                        /* a Trash press blocked in its window (review round 1, safety L5) */
 }
 
@@ -2149,8 +2226,12 @@ static void iv_tick(int now, int dt)
         else if (c == 4 && !st.running) iv_begin_md(now, iv_md_shoot_req);    /* M9.3 */
 #endif
         else if (c == 2 && st.running) iv_end(R6IV_STOP_USER, 0, 0);
-        else if (c == 5 && !st.running) { iv_back_t = now | 1; iv_back_why = 0; }   /* M10.2: "Tv back to ..." */
+        else if (c == 5 && !st.running) { iv_back_t = now | 1; iv_back_why = 0; iv_back_drop = 0; iv_back_lvw = 0; }   /* M10.2: "Tv back to ..." */
     }
+    /* M10.2b: a series, Test or R6 Motion run started after "Tv back to ..." was selected drops the command (no write
+     * during or after the run; the offer stays, select it again); Start is not refused for it */
+    if (iv_back_t && st.running)
+        iv_back_drop_now(st.mode != R6IV_MODE_INTERVAL ? "R6 Motion started" : st.test ? "Test started" : "series started", 0);
     if (iv_back_t && !st.running) iv_back_tick(now);
     if (!st.running) return;
 #ifdef CONFIG_R6_MOTION
@@ -2252,7 +2333,7 @@ int r6_iv_md_start(void)
     if (c != R6IV_CAM_OK)
     {
         iv_md_refused = c;
-        st.refused++;
+        iv_refuse(c, R6IV_REF_MD);           /* M10.2b */
         return c;
     }
     iv_md_refused = R6IV_CAM_OK;
@@ -2270,7 +2351,7 @@ void r6_iv_md_stop(void)
 static MENU_SELECT_FUNC(iv_start_stop)
 {
     if (iv_cmd == 2) return;                 /* Stop pressed, not taken over by the task yet */
-    if (r6_iv_md_running()) { iv_refused_cam = R6IV_CAM_BUSY; st.refused++; return; }   /* M9.3: never stops a motion run */
+    if (r6_iv_md_running()) { iv_refused_cam = R6IV_CAM_BUSY; iv_refuse(R6IV_CAM_BUSY, R6IV_REF_START); return; }   /* M9.3: never stops a motion run */
     if (st.running || iv_cmd == 1 || iv_cmd == 3) { iv_cmd = 2; return; }
     int c = iv_menu_caller() ? r6_iv_cam_check() : R6IV_CAM_CALLER;   /* M10.2: only ML's menu starts */
     if (c == R6IV_CAM_OK && iv_bkt_mode()) c = iv_bkt_check(0, 0);     /* M10.2: spec 4.3 */
@@ -2278,7 +2359,7 @@ static MENU_SELECT_FUNC(iv_start_stop)
     if (c != R6IV_CAM_OK)
     {
         iv_refused_cam = c;
-        st.refused++;
+        iv_refuse(c, R6IV_REF_START);        /* M10.2b: with its reason */
         return;
     }
     iv_refused_cam = R6IV_CAM_OK;
@@ -2371,8 +2452,10 @@ void r6_iv_stop_warn(struct menu_entry * entry, struct menu_display_info * info)
         MENU_SET_WARNING(MENU_WARN_INFO, "Stopped: %s.", r6_iv_cam_name(st.stop_cam));
     if (b & (IV_B(R6IV_STOP_CANON) | IV_B(R6IV_STOP_WAIT)))
         MENU_SET_WARNING(MENU_WARN_INFO, "Stopped: %s (%s).", r6_iv_stop_name(s), r6_iv_canon_name(st.stop_canon));
-    if (b & IV_B(R6IV_STOP_GUI))
-        MENU_SET_WARNING(MENU_WARN_INFO, "Stopped: Canon GUI mode 0x%x.", (int) st.stop_val);
+    if ((b & IV_B(R6IV_STOP_GUI)) && (st.stop_val & 0x10000))           /* M10.2b: CC state 9 at a picture's final check */
+        MENU_SET_WARNING(MENU_WARN_INFO, "Stopped: Canon menu / playback (CC state %d) right after a picture.", (int) st.stop_val & 0xFFFF);
+    else if (b & IV_B(R6IV_STOP_GUI))
+        MENU_SET_WARNING(MENU_WARN_INFO, "Stopped: Canon GUI mode 0x%x (menu, playback, Q).", (int) st.stop_val);
     if (b & IV_B(R6IV_STOP_PWRSAVE))
         MENU_SET_WARNING(MENU_WARN_INFO, "Stopped: Canon screen off / eco mode. Set Screen off to the longest time.");
     if (b & IV_B(R6IV_STOP_ABORT))
@@ -2426,14 +2509,14 @@ void r6_iv_stop_warn(struct menu_entry * entry, struct menu_display_info * info)
 
 static MENU_SELECT_FUNC(iv_test_select)
 {
-    if (r6_iv_md_running()) { iv_refused_cam = R6IV_CAM_BUSY; st.refused++; return; }   /* M9.3 */
+    if (r6_iv_md_running()) { iv_refused_cam = R6IV_CAM_BUSY; iv_refuse(R6IV_CAM_BUSY, R6IV_REF_TEST); return; }   /* M9.3 */
     if (st.running || iv_cmd != 0) return;
     int c = iv_menu_caller() ? r6_iv_cam_check() : R6IV_CAM_CALLER;   /* M10.2: only ML's menu starts */
     if (c == R6IV_CAM_OK && iv_bkt_mode()) c = iv_bkt_check(1, 0);     /* M10.2: spec 4.3 */
     if (c != R6IV_CAM_OK)
     {
         iv_refused_cam = c;
-        st.refused++;
+        iv_refuse(c, R6IV_REF_TEST);         /* M10.2b: with its reason */
         return;
     }
     iv_refused_cam = R6IV_CAM_OK;
@@ -2699,8 +2782,13 @@ static MENU_UPDATE_FUNC(iv_back_update)
     char a[12], b2[12];
     if (p->offer) MENU_SET_VALUE("%s (now %s)", _r6pw_tvs(a, p->base), _r6pw_tvs(b2, p->boot_rec));
     else MENU_SET_VALUE("-");
-    if (iv_back_t) MENU_SET_RINFO("in 3 s");
+    if (iv_back_t)                           /* M10.2b: it runs only once this menu is closed */
+    {
+        MENU_SET_RINFO("pending");
+        MENU_SET_WARNING(MENU_WARN_INFO, "Close this menu: Tv back runs 3 s later, once live view ran 3 s (no live view: dropped).");
+    }
     else if (iv_back_why) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Tv back refused: %s.", iv_back_why);
+    else if (iv_back_drop) MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "Tv back dropped: %s. Select it again in live view.", iv_back_drop);
     else if (p->back_res == R6PW_R_OK || p->back_res == R6PW_R_DONE) MENU_SET_RINFO("Tv back: ok");
     else if (p->back_res) MENU_SET_WARNING(MENU_WARN_INFO, "Tv back: %s (%s).", _r6pw_res_name(p->back_res), _r6pw_lock_name(p->back_lock));
 }
@@ -2805,8 +2893,8 @@ static struct menu_entry iv_menu[] = {
                 .select = iv_back_select,
                 .update = iv_back_update,
                 .icon_type = IT_ACTION,
-                .help   = "After a cut-off bracket: puts your Tv back (one write, all checks), 3 s after",
-                .help2  = "the ML menu closed. Or turn the main dial yourself.",
+                .help   = "After a cut-off bracket: puts your Tv back (one write, all checks) once this",
+                .help2  = "menu is closed 3 s and live view ran 3 s; no live view: dropped. Or turn the dial.",
             },
             {
                 .name   = "Camera",

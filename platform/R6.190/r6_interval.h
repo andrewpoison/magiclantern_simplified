@@ -360,11 +360,32 @@ struct r6_iv_bkt {
     int t_mis;                     /* between events: Tv not stably the base since (0 = fine) */
 };
 const struct r6_iv_bkt * r6_iv_bkt(void);
+/* M10.2b: the newest Start / Test refusals with their reason (log iv.ref; the M10.2 camera log had only iv.refused) */
+#define R6IV_REF_RING 6
+enum { R6IV_REF_START = 1, R6IV_REF_TEST, R6IV_REF_TASK_START, R6IV_REF_TASK_TEST, R6IV_REF_MD, R6IV_REF_MD_TASK };
+struct r6_iv_ref {
+    uint32_t t;              /* ms */
+    uint8_t src;             /* R6IV_REF_*: the menu's Start / Test, the task's checks of a Start / Test, R6 Motion's Start / task */
+    uint8_t cam;             /* enum r6_iv_cam */
+    uint8_t lock;            /* R6IV_CAM_TVW: enum r6pw_lock, else 0 */
+    uint8_t pad;
+    uint16_t bk;             /* R6IV_CAM_BKT_LIST: why << 8 | member index, else 0 */
+    int16_t tv;              /* R6IV_CAM_BKT_LIST: that member's Tv, else 0 */
+};
+int r6_iv_refusal(int i, struct r6_iv_ref * e);   /* i = 0 oldest; returns the count (<= R6IV_REF_RING) */
+uint32_t r6_iv_refusal_n(void);                   /* refusals recorded since boot */
 /* r6_propw.c only (names _[a-zA-Z]*: not in magiclantern.sym); read-only helpers of r6_interval.c */
 int _r6iv_cc_gate(const struct r6_iv_cc * s);              /* iv_cc_gate: hard Canon reasons, 0 = ok */
 int _r6iv_lvstill(const struct r6_iv_cc * s);              /* iv_cc_lvstill */
 int _r6iv_cc_same(const struct r6_iv_cc * a, const struct r6_iv_cc * b);   /* iv_cc_same (torn read) */
 void _r6iv_times(int * t_menu, int * t_lv, int * in_pic);  /* ML menu last seen, LV running since (-1 no), picture runs */
+/* M10.2b: row 12's two holds from one place, for r6_propw.c (pw_gui_bad) and "Tv back to ..." (iv_back_tick): 0 = the ML
+ * menu has been closed and Canon's LV has been running for R6PW_HOLD_MS each (r6_iv_task's samples), else the first that
+ * does not hold */
+#define R6IV_HOLD_MENU  1                                   /* ML menu shown, or closed < R6PW_HOLD_MS ago */
+#define R6IV_HOLD_NOLV  2                                   /* Canon's LV not running (Canon MENU, playback, screen off) */
+#define R6IV_HOLD_LV    3                                   /* Canon's LV running < R6PW_HOLD_MS */
+int _r6iv_holds(int now);
 void _r6iv_sample(int now);                                 /* iv_sample (the waits of r6_propw.c) */
 int _r6iv_bkt_armable(void);                                /* a Bracket series / test runs in M (arm BKT, spec 4.9) */
 

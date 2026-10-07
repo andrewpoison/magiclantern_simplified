@@ -94,6 +94,7 @@ static char pw_msg[100] = "";            /* the newest notice (menu); NotifyBox 
 static int pw_mk_len;                    /* length of the marker line this arm wrote */
 static int pw_mk_ev = -1;                /* event whose first write checked the marker file (row 7) */
 static int pw_bk_read;                   /* boot check: marker read */
+static int pw_back_nolv;                 /* M10.2b review (S1): "Tv back" saw a hold of row 12 in its wait (LV lost) */
 
 /* ---- handlers (PropMgr task: copy only) ---- */
 struct r6pw_h { uint32_t t; int16_t v; uint8_t len, pad; };
@@ -135,7 +136,6 @@ PROP_HANDLER(PROP_SHUTDOWN_REASON)
 
 static int r6pw_sig(void) { return ml_shutdown_requested || pw_sig; }
 static int pw_task(void) { return strcmp(get_current_task_name(), "r6_iv_task") == 0; }
-static int pw_menu_shown(void) { return gui_menu_shown(); }
 
 /* same rule as r6_interval.c iv_ram_ok: cached RAM, page 0 unmapped, 4-aligned, no wrap */
 static int pw_ram_ok(uint32_t a, uint32_t n)
@@ -780,13 +780,14 @@ static int pw_ctx_admits(int k, int want)
     return 0;
 }
 
-/* row 12: Canon GUI idle, ML menu closed >= R6PW_HOLD_MS, LV running >= R6PW_HOLD_MS, no ML picture */
+/* row 12: Canon GUI idle, ML menu closed >= R6PW_HOLD_MS, LV running >= R6PW_HOLD_MS, no ML picture. M10.2b: the two
+ * holds from _r6iv_holds (r6_interval.c), the helper "Tv back to ..." waits on as well */
 static int pw_gui_bad(int now)
 {
     int t_menu = 0, t_lv = -1, in_pic = 0;
     _r6iv_times(&t_menu, &t_lv, &in_pic);
-    return CURRENT_GUI_MODE != 0 || gui_state != GUISTATE_IDLE || pw_menu_shown() || now - t_menu < R6PW_HOLD_MS
-        || t_lv < 0 || now - t_lv < R6PW_HOLD_MS || in_pic || (icu_uilock & 0xFF) || sensor_cleaning;
+    return CURRENT_GUI_MODE != 0 || gui_state != GUISTATE_IDLE || _r6iv_holds(now) || in_pic || (icu_uilock & 0xFF)
+        || sensor_cleaning;
 }
 
 /* row 36: a handler delivery newer than R6PW_RECENT_MS that differs from v (or is not 2 bytes) */
@@ -986,6 +987,11 @@ int _r6pw_wait_ready(int want, int kind)
     {
         int now = get_ms_clock();
         _r6iv_sample(now);
+        /* M10.2b review (S1, user decision 2026-10-06: no live view, then dropped with a notice, no late write): both holds
+         * of row 12 were 0 when iv_back_tick called _r6pw_back, so for the BACK any hold now means Canon's LV stopped or
+         * restarted (Canon MENU, playback, screen off) or the ML-menu hold came back during the arm's marker I/O: the wait
+         * ends at once, before any ring entry or call, and _r6pw_back drops the command (it does not wait for LV again) */
+        if (kind == R6PW_K_BACK && _r6iv_holds(now)) { pw_back_nolv = 1; return R6PW_L_GUI; }
         struct pw_ev e;
         memset(&e, 0, sizeof(e));
         e.want = want; e.kind = kind; e.nolast = 1;   /* row 44 of the restore kinds: in r6pw_write (TOOK_OVER / offer /
@@ -1161,7 +1167,8 @@ static int pw_resolve(struct r6pw_rec * e, int res, int want, const struct pw_wi
 
 /* one write: locks, the call, the window, the classification (3.6); r6_iv_task only (r6pw_post checks it again).
  * Its only callers: _r6pw_write (STEP, RESTORE), _r6pw_event_stop (RESTORE_STOP, CLAMPFIX), _r6pw_tick
- * (RESTORE_PEND), _r6pw_back (BACK); each runs it at most once per invocation (no loop, no retry) */
+ * (RESTORE_PEND), _r6pw_back (BACK); each runs it at most once per invocation (no loop, no retry); all but the per-tick
+ * RESTORE_PEND first wait in _r6pw_wait_ready (M10.2b: BACK too) */
 static int __attribute__((noinline, noipa)) r6pw_write(int want, int kind, int k, int ev)
 {
     struct r6pw_rec * e = pw_rec_new(want, kind, k, ev);
@@ -1582,17 +1589,34 @@ int __attribute__((noinline)) _r6pw_back(void)
     if (l) r = pw_refused(S.base, R6PW_K_BACK, l);
     else
     {
-        S.busy = 1;                      /* the ML menu waits for the window (review round 1, safety L5) */
-        r = r6pw_write(S.base, R6PW_K_BACK, 0xFF, 0);
+        S.busy = 1;                      /* the ML menu waits for the wait and the window (review round 1, safety L5) */
+        /* M10.2b (change B, camera M10.2 LVP00102): the wait rows first (row 12's holds, CC state, a press, Canon's job, an
+         * unsettled Tv), bounded like the event-end and event-stop restores (_r6pw_wait_ready: no call, <= R6IV_BKT_WAIT_MS;
+         * row 44 stays in r6pw_write); a hard row or the timeout refuses with that row (its ring entry), no call.
+         * M10.2b review (S1): live view lost in the wait (pw_back_nolv): dropped, R6PW_R_NONE (no call, no ring entry) */
+        pw_back_nolv = 0;
+        l = _r6pw_wait_ready(S.base, R6PW_K_BACK);
+        r = pw_back_nolv ? R6PW_R_NONE : l ? R6PW_R_REFUSED : r6pw_write(S.base, R6PW_K_BACK, 0xFF, 0);
+        pw_back_nolv = 0;
     }
-    S.back_res = r;
-    S.back_lock = S.last_lock;
+    S.back_res = r;                          /* NONE (dropped): 0, no stale "refused" menu line */
+    S.back_lock = r ? S.last_lock : 0;
     if (r == R6PW_R_OK || r == R6PW_R_DONE)
     {
         char a[12];
         S.offer = 0;
         pw_note(1, "Tv back: ok (%s).", _r6pw_tvs(a, S.base));
     }
+    else if (r == R6PW_R_REFUSED && pw_wait_row(S.back_lock))
+    {
+        /* M10.2b: the bounded wait ran out on a wait row (transient: GUI / ML menu / LV, CC state, a press, Canon's job, an
+         * unsettled Tv, spacing, a torn read), so far only visible in the menu line: the notice outside the ML menu. A hard
+         * row keeps the menu line only (a setting the user sees, or the user's own Tv: the offer is gone) */
+        char a[12], t[48];
+        _r6pw_lock_text(S.back_lock, t, sizeof(t));
+        pw_note(1, "Tv back refused: %s.\nSet %s by dial or select it again.", t, _r6pw_tvs(a, S.base));
+    }
+    else if (r == R6PW_R_NONE) _r6pw_back_dropped(1);   /* M10.2b review (S1): the drop notice; iv_back_tick the menu line */
     if (r == R6PW_R_LANDED) pw_mk_landed();   /* the marker records the mode and value (3.9, review round 1 F3) */
     /* LANDED_OTHER / CLAMP set pw_lim, but ctx BACK admits nothing after it (no pending, no CLAMPFIX): the limited
      * state ends here, writes off until restart (3.7; review round 2, L2-2) */
@@ -1600,6 +1624,18 @@ int __attribute__((noinline)) _r6pw_back(void)
     S.busy = 0;
     _r6pw_disarm(1);                     /* every attempt (RR2-10): the offer watcher and the marker rule run again */
     return r;
+}
+
+/* M10.2b: command 5 dropped before its write (r6_interval.c iv_back_tick, user decision 2026-10-06): the notice outside the
+ * ML menu; no call, nothing armed, the offer and the marker stay. why 1: no live view once the ML menu hold was over (or
+ * gone during the LV hold, or during change B's wait in _r6pw_back: M10.2b review S1); 2: live view not steady within
+ * R6IV_BACK_MAX_MS, or the clock went back */
+void _r6pw_back_dropped(int why)
+{
+    char a[12];
+    if (!pw_task()) return;
+    if (why == 1) pw_note(1, "Tv back dropped: no live view.\nIn live view select R6 Interval >\nTv back to %s again.", _r6pw_tvs(a, S.base));
+    else pw_note(1, "Tv back dropped: live view not steady.\nSelect R6 Interval > Tv back to %s\nagain.", _r6pw_tvs(a, S.base));
 }
 
 /* ---- the tick (3.10 order: consumer, boot check, open-request watch, pending restore, offer, marker rule) ---- */

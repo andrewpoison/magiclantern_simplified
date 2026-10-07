@@ -1667,10 +1667,40 @@ static void lp_iv_faneo(struct lp_buf * b)
     lp_printf(b, "iv.job.fa.stable=%d\n", memcmp(&f, &f2, sizeof(f)) == 0);
 }
 
-#define LP_IV_SHOTS_LOG 24        /* M9.2 review: picture-ring entries in the log (~190 B each); the worst case
-                                   * (Expo log on with full rings, 64 pictures) stays below LP_LOG_SIZE. M10.2 (spec 6.3):
-                                   * 32 -> 24, the write ring and the Tor 0d fields left < 2 KB of the 96 KB (QEMU m102) */
-static void lp_iv_log(struct lp_buf * b)
+#define LP_IV_SHOTS_LOG 12        /* M9.2 review: picture-ring entries in the log (~170..220 B each). M10.2 (spec 6.3): 32 ->
+                                   * 24. M10.2b: 12, and printed last in the ring tail (lp_ring_tail): camera LVP00101 was
+                                   * 96,621 of 98,176 B, the M10.2 budget had undercounted (spec 6.3) */
+#define LP_PW_LOG       16        /* M10.2b: the newest write-ring entries in the log (of R6PW_RING 32; ~130..190 B each) */
+#define LP_TAIL_SLACK   512       /* M10.2b review (S2, L1): the ring tail fills the buffer down to this; it covers a picture
+                                   * line (<= 224 B) and a write line (<= 187 B) that land between measuring and printing.
+                                   * The 4 KB rule is a static budget of everything before the tail (spec 6.3) */
+static const char lp_shot_hdr[] = "# iv.shot[i]=t,ret,dur,d_cnt,d_fn,pic_ms,job_ms,jobs_after,js_before,js_after,wait_ms,wait_mask,"
+                 "sw1_ms,acc_ms,off_ms,seq_ms,off_why,off_state,states,d_rel,d_jid,sm_before,sm_after,late,second,final,"
+                 "tv,tv_cc,busy,s5_ms,exp_ms,slot_late,r92c,nr,cflag,"
+                 "bulb,bend,bbtn,bwarn,drive,r5e8,bt,sec_max,bulbw,bulbw_after,ta_ms,bulb_ms,d30_ms,clk_back,"
+                 "bk,bn,want,ev,wr\n";
+
+/* one picture-ring line (entry idx since boot) into t, as printed before M10.2b; returns its length (with the newline) */
+static int lp_shot_line(char * t, int n, const struct r6_iv_stats * s, uint32_t idx)
+{
+    const struct r6_iv_shot * e = &s->ring[idx % R6IV_RING];
+    snprintf(t, n, "iv.shot[%d]=%d,%d,%d,%d,%d,%d,%d,%d,0x%x,0x%x,%d,0x%x,%d,%d,%d,%d,%d,%d,0x%x,%d,%d,%d,%d,0x%x,%d,0x%x,"
+                 "%d,%d,%d,%d,%d,%d,%d,%d,%d,"
+                 "%d,%d,0x%x,0x%x,%d,%d,%d,%d,0x%x,0x%x,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+        (int) idx,
+        (int) e->t, (int) e->ret, (int) e->dur, (int) e->d_cnt, (int) e->d_fn, (int) e->pic_ms,
+        (int) e->job_ms, (int) e->jobs_after, (int) e->js_before, (int) e->js_after,
+        (int) e->wait_ms, (int) e->wait_mask,
+        e->sw1_ms, e->acc_ms, e->off_ms, (int) e->seq_ms, e->off_why, e->off_state, e->states, e->d_rel, e->d_jid,
+        e->sm_before, e->sm_after, e->late, e->second, e->final,
+        e->tv, e->tv_cc, (int) e->busy, (int) e->s5_ms, (int) e->exp_ms, (int) e->slot_late, e->r92c, e->nr, e->cflag,
+        e->bulb, e->bend, e->bbtn, e->bwarn, e->drive, e->r5e8, e->bt, e->sec_max, (int) e->bulbw, (int) e->bulbw_after,
+        (int) e->ta_ms, (int) e->bulb_ms, (int) e->d30_ms, e->clk_back,
+        e->bk, e->bn, e->want, e->ev, e->wr);                                         /* M10.2 */
+    return strlen(t);
+}
+
+static void __attribute__((noinline)) lp_iv_log(struct lp_buf * b)   /* M10.2b: out of line as before (canon_gate layout) */
 {
     const struct r6_iv_stats * s = r6_iv_stats();
     char w[40];
@@ -1691,6 +1721,20 @@ static void lp_iv_log(struct lp_buf * b)
     lp_printf(b, "iv.calls=%d\n", (int) s->calls);
     lp_printf(b, "iv.shots=%d\n", (int) s->shots);
     lp_printf(b, "iv.refused=%d\n", (int) s->refused);
+    {
+        struct r6_iv_ref r;                                              /* M10.2b: the newest Start / Test refusals */
+        char wn[48];
+        int nref = r6_iv_refusal(0, &r);
+        lp_printf(b, "iv.ref.n=%d\n", (int) r6_iv_refusal_n());
+        lp_printf(b, "# iv.ref[i]=t,src(1 Start,2 Test,3/4 the task,5/6 Motion),cam,lock,bk,tv,name (oldest first)\n");
+        for (int i = 0; i < nref; i++)
+        {
+            r6_iv_refusal(i, &r);
+            lp_nosp(r.cam == R6IV_CAM_TVW ? _r6pw_lock_name(r.lock) : r6_iv_cam_name(r.cam), wn, sizeof(wn));
+            for (char * c = wn; *c; c++) if (*c == ',') *c = ';';     /* one field */
+            lp_printf(b, "iv.ref[%d]=%d,%d,%d,%d,0x%x,0x%04x,%s\n", i, (int) r.t, r.src, r.cam, r.lock, r.bk, r.tv & 0xFFFF, wn);
+        }
+    }
     lp_printf(b, "iv.test=%d\n", s->test);
     lp_printf(b, "iv.cnt_last=%d\n", s->cnt_last);
     lp_printf(b, "iv.fn_last=%d\n", s->fn_last);
@@ -1895,29 +1939,7 @@ static void lp_iv_log(struct lp_buf * b)
     lp_glob(b, "iv.job.class_s", 0x9DA4);
     lp_iv_faneo(b);
 
-    int n = MIN((int) s->shots, LP_IV_SHOTS_LOG);   /* M9.2 review: the newest LP_IV_SHOTS_LOG of the 64 (log < 96 KB) */
-    lp_printf(b, "# iv.shot[i]=t,ret,dur,d_cnt,d_fn,pic_ms,job_ms,jobs_after,js_before,js_after,wait_ms,wait_mask,"
-                 "sw1_ms,acc_ms,off_ms,seq_ms,off_why,off_state,states,d_rel,d_jid,sm_before,sm_after,late,second,final,"
-                 "tv,tv_cc,busy,s5_ms,exp_ms,slot_late,r92c,nr,cflag,"
-                 "bulb,bend,bbtn,bwarn,drive,r5e8,bt,sec_max,bulbw,bulbw_after,ta_ms,bulb_ms,d30_ms,clk_back,"
-                 "bk,bn,want,ev,wr\n");
-    for (int i = 0; i < n; i++)
-    {
-        const struct r6_iv_shot * e = &s->ring[(s->shots - n + i) % R6IV_RING];
-        lp_printf(b, "iv.shot[%d]=%d,%d,%d,%d,%d,%d,%d,%d,0x%x,0x%x,%d,0x%x,%d,%d,%d,%d,%d,%d,0x%x,%d,%d,%d,%d,0x%x,%d,0x%x,"
-                     "%d,%d,%d,%d,%d,%d,%d,%d,%d,"
-                     "%d,%d,0x%x,0x%x,%d,%d,%d,%d,0x%x,0x%x,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
-            (int) (s->shots - n + i),
-            (int) e->t, (int) e->ret, (int) e->dur, (int) e->d_cnt, (int) e->d_fn, (int) e->pic_ms,
-            (int) e->job_ms, (int) e->jobs_after, (int) e->js_before, (int) e->js_after,
-            (int) e->wait_ms, (int) e->wait_mask,
-            e->sw1_ms, e->acc_ms, e->off_ms, (int) e->seq_ms, e->off_why, e->off_state, e->states, e->d_rel, e->d_jid,
-            e->sm_before, e->sm_after, e->late, e->second, e->final,
-            e->tv, e->tv_cc, (int) e->busy, (int) e->s5_ms, (int) e->exp_ms, (int) e->slot_late, e->r92c, e->nr, e->cflag,
-            e->bulb, e->bend, e->bbtn, e->bwarn, e->drive, e->r5e8, e->bt, e->sec_max, (int) e->bulbw, (int) e->bulbw_after,
-            (int) e->ta_ms, (int) e->bulb_ms, (int) e->d30_ms, e->clk_back,
-            e->bk, e->bn, e->want, e->ev, e->wr);                                         /* M10.2 */
-    }
+    /* the picture ring: M10.2b in the ring tail (lp_ring_tail), after everything else */
 
     /* last picture: snapshots and trace (codes: r6_interval.c iv_tr_codes, 1..4 the switch calls, X the reason) */
     const struct r6_iv_last * l = r6_iv_last();
@@ -2642,20 +2664,71 @@ static void lp_pw_log(struct lp_buf * b)
     else lp_bad(b, "pw.fpub", cc);
     if (vm & 1) lp_printf(b, "pw.ccg=0x%02x\n", (int) lp_x_ccg(cc));
     else lp_bad(b, "pw.ccg", cc);
+    lp_printf(b, "pw.w.n=%d\n", (int) _r6pw_ring_n());   /* the write ring: M10.2b in the ring tail (lp_ring_tail) */
+}
+
+static const char lp_pw_hdr[] = "# pw.w[i]=t,kind,res,lock,ev,k,old,want,rep,cc,mm,ds4,d_ret,d_h,d_cc,d_mm,d_conf,ndel,nfor,fval,dep,"
+                 "sl0,sl1,c62c,state,bak,ae,fl\n";
+
+/* one write-ring line (log index i) into t, as printed before M10.2b; returns its length (with the newline) */
+static int lp_pw_line(char * t, int n, int i, const struct r6pw_rec * e)
+{
+    char w[40];
+    snprintf(t, n, "pw.w[%d]=%d,%s,%s,%d,%d,%d,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,%d,%d,%d,%d,%d,%d,%d,0x%04x,0x%x,0x%02x,"
+                 "0x%02x,%d,%d,0x%04x,%d,0x%x\n", i, (int) e->t, _r6pw_kind_name(e->kind),
+        lp_nosp(_r6pw_res_name(e->res), w, sizeof(w)), e->lock, e->ev, e->k, e->old & 0xFFFF, e->want & 0xFFFF, e->rep & 0xFFFF,
+        e->cc & 0xFFFF, e->mm & 0xFFFF, e->ds4 & 0xFFFF, e->d_ret, e->d_h, e->d_cc, e->d_mm, e->d_conf, e->ndel, e->nfor,
+        e->fval & 0xFFFF, e->dep, e->sl0, e->sl1, e->c62c, e->state, e->bak & 0xFFFF, e->ae, e->fl);
+    return strlen(t);
+}
+#endif
+
+#if defined(CONFIG_R6_INTERVAL) && defined(CONFIG_R6_PROPW_TV)
+/* M10.2b (camera M10.2: LVP00101 96,621 of 98,176 B; the M10.2 budget had undercounted, spec 6.3): the picture ring (the
+ * newest LP_IV_SHOTS_LOG) and the write ring (the newest LP_PW_LOG) come last. Newest first and by turns, the write line
+ * before the picture line in each turn (M10.2b review S2: the Tor 1 record goes last), each line taken only while it
+ * fits above LP_TAIL_SLACK, then they are printed oldest first (keys and fields as before; pw.w[i] counts from the oldest
+ * line printed). Everything before the tail is bounded by a static budget (spec 6.3, the true worst case leaves the
+ * tail >= 4 KB), so a snapshot is never cut; a fuller log gives the tail fewer lines:
+ * iv.shot.log / pw.w.log = lines printed, candidates */
+#define LP_TAIL_KEYS 40                   /* the two .log lines */
+static void __attribute__((noinline)) lp_ring_tail(struct lp_buf * b)
+{
+    char t[256];
+    const struct r6_iv_stats * s = r6_iv_stats();
     struct r6pw_rec e;
-    int n = _r6pw_ring(0, &e);
-    lp_printf(b, "pw.w.n=%d\n", (int) _r6pw_ring_n());
-    lp_printf(b, "# pw.w[i]=t,kind,res,lock,ev,k,old,want,rep,cc,mm,ds4,d_ret,d_h,d_cc,d_mm,d_conf,ndel,nfor,fval,dep,sl0,sl1,c62c,"
-                 "state,bak,ae,fl\n");
-    for (int i = 0; i < n; i++)
+    int ns = MIN((int) s->shots, LP_IV_SHOTS_LOG), nr = _r6pw_ring(0, &e), nw = MIN(nr, LP_PW_LOG), ks = 0, kw = 0;
+    lp_printf(b, "%s", lp_shot_hdr);
+    int room = b->cap - b->len - LP_TAIL_SLACK - LP_TAIL_KEYS - (int) sizeof(lp_pw_hdr);   /* down to LP_TAIL_SLACK */
+    for (int used = 0, ms = ns, mw = nw, more = 1; more; )
     {
-        _r6pw_ring(i, &e);
-        lp_printf(b, "pw.w[%d]=%d,%s,%s,%d,%d,%d,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,%d,%d,%d,%d,%d,%d,%d,0x%04x,0x%x,0x%02x,"
-                     "0x%02x,%d,%d,0x%04x,%d,0x%x\n", i, (int) e.t, _r6pw_kind_name(e.kind),
-            lp_nosp(_r6pw_res_name(e.res), w, sizeof(w)), e.lock, e.ev, e.k, e.old & 0xFFFF, e.want & 0xFFFF, e.rep & 0xFFFF,
-            e.cc & 0xFFFF, e.mm & 0xFFFF, e.ds4 & 0xFFFF, e.d_ret, e.d_h, e.d_cc, e.d_mm, e.d_conf, e.ndel, e.nfor,
-            e.fval & 0xFFFF, e.dep, e.sl0, e.sl1, e.c62c, e.state, e.bak & 0xFFFF, e.ae, e.fl);
+        more = 0;
+        if (kw < mw)                                             /* the write line first (review S2) */
+        {
+            _r6pw_ring(nr - 1 - kw, &e);
+            int l = lp_pw_line(t, sizeof(t), 99, &e);          /* the index printed later has at most 2 digits */
+            if (used + l <= room) { used += l; kw++; more = 1; } else mw = kw;
+        }
+        if (ks < ms)
+        {
+            int l = lp_shot_line(t, sizeof(t), s, s->shots - 1 - ks);
+            if (used + l <= room) { used += l; ks++; more = 1; } else ms = ks;
+        }
     }
+    for (int i = ks; i > 0; i--)
+    {
+        lp_shot_line(t, sizeof(t), s, s->shots - i);
+        lp_printf(b, "%s", t);
+    }
+    lp_printf(b, "iv.shot.log=%d,%d\n", ks, ns);
+    lp_printf(b, "%s", lp_pw_hdr);
+    for (int i = 0; i < kw; i++)
+    {
+        _r6pw_ring(nr - kw + i, &e);
+        lp_pw_line(t, sizeof(t), i, &e);
+        lp_printf(b, "%s", t);
+    }
+    lp_printf(b, "pw.w.log=%d,%d\n", kw, nr);
 }
 #endif
 
@@ -2768,6 +2841,9 @@ static void lp_snapshot_do(int delay_ms)
     lp_md_log(&b);                        /* M9.3 */
 #endif
     lp_x_log(&b);                         /* M9.1 Tor 0 */
+#if defined(CONFIG_R6_INTERVAL) && defined(CONFIG_R6_PROPW_TV)
+    lp_ring_tail(&b);                     /* M10.2b: the picture / write rings last, down to LP_TAIL_SLACK */
+#endif
     int trunc = b.trunc;
     b.cap = LP_LOG_SIZE;                  /* the trailer always fits */
     lp_printf(&b, "log_truncated=%d\n", trunc);
