@@ -1741,6 +1741,11 @@ static void __attribute__((noinline)) lp_iv_log(struct lp_buf * b)   /* M10.2b: 
         for (int i = 0; i < nref; i++)
         {
             r6_iv_refusal(i, &r);
+#ifdef CONFIG_R6_ETTR
+            if (r.src >= R6IV_REF_ETTR)                                  /* M11.1: R6 ETTR's command (7) / run (8) */
+                lp_nosp(r.cam == R6ETT_A_TVW ? _r6pw_lock_name(r.lock) : r6_ettr_a_name(r.cam), wn, sizeof(wn));
+            else
+#endif
             lp_nosp(r.cam == R6IV_CAM_TVW ? _r6pw_lock_name(r.lock) : r6_iv_cam_name(r.cam), wn, sizeof(wn));
             for (char * c = wn; *c; c++) if (*c == ',') *c = ';';     /* one field */
             lp_printf(b, "iv.ref[%d]=%d,%d,%d,%d,0x%x,0x%04x,%s\n", i, (int) r.t, r.src, r.cam, r.lock, r.bk, r.tv & 0xFFFF, wn);
@@ -2832,12 +2837,73 @@ static void lp_ett_meas(struct lp_buf * b, const char * key, const struct r6_ett
     }
 }
 
+/* M11.1 (spec m11/m111 5.2): "Apply once": the shown decision, the published decision, the run, the counters, Tor 1's
+ * ETTR fields, the run basis, the newest notice (one token) and ring w (oldest first). ETTnnnnn.LOG only (the main log
+ * gets nothing new, 5.3) */
+static void lp_ett_ap(struct lp_buf * b, const struct r6_ettr_stats * s)
+{
+    const struct r6_ettr_adv * h = &s->shown;
+    lp_printf(b, "# ett.shown=t,why,st,want,k,hyst_want\n");
+    lp_printf(b, "ett.shown=%d,%d,%d,0x%04x,%d,0x%04x\n", (int) h->t, h->why, h->st, h->want & 0xFFFF, h->k, s->hyst_want & 0xFFFF);
+    struct r6_ettr_dec d;
+    uint32_t seq = 0;
+    lp_printf(b, "# ett.dec=seq,t,t_ref,t_win0,t_meas,tv,want,why,st,k,lim,rest,beyond,lo,hi,H,s,b,ym10,n,span,hspread,cls,fps10,"
+                 "numpix,tv424,tv424_for,t_424ok\n");
+    if (_r6ettr_dec_get(&d, &seq))
+        lp_printf(b, "ett.dec=%d,%d,%d,%d,%d,0x%04x,0x%04x,%d,%d,%d,%d,%d,%d,0x%04x,0x%04x,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,0x%04x,"
+                     "0x%04x,%d\n", (int) seq, (int) d.t, (int) d.t_ref, (int) d.t_win0, (int) d.t_meas, d.tv & 0xFFFF,
+            d.want & 0xFFFF, d.why, d.st, d.k, d.lim, d.rest, d.beyond, d.lo & 0xFFFF, d.hi & 0xFFFF, d.H, (int) d.s, (int) d.b,
+            d.ym10, d.n, d.span, d.hspread, d.cls, (int) d.fps10, (int) d.numpix, d.tv424 & 0xFFFF, d.tv424_for & 0xFFFF,
+            (int) d.t_424ok);
+    else lp_printf(b, "ett.dec=na\n");
+    const struct r6_ettr_run * r = r6_ettr_run();
+    lp_printf(b, "# ett.ap=phase,no,end,a,j,back,base,last,v_ok,over_lim,lo,hi,t_cmd,t_meas0,t_call,t_conf,deadline,slow,numpix,"
+                 "t_sw1,black_n,armed,sv,nwait,stale\n");
+    lp_printf(b, "ett.ap=%d,%d,%d,%d,%d,%d,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,0x%04x,%d,%d\n",
+        r->phase, r->no, r->end, r->why, r->j, r->back, r->base & 0xFFFF, r->last & 0xFFFF, r->v_ok & 0xFFFF,
+        r->over_lim & 0xFFFF, r->lo & 0xFFFF, r->hi & 0xFFFF, (int) r->t_cmd, (int) r->t_meas0, (int) r->t_call, (int) r->t_conf,
+        (int) r->deadline, r->slow, (int) r->numpix, (int) r->t_sw1, r->black_n, r->armed, r->sv, r->nwait, r->stale);
+    const struct r6_ettr_apn * n = &s->apn;
+    lp_printf(b, "# ett.apn=cmds,refused,dropped,nowrite,kept,backkept,restored,pend,offer,user,tor1,trash,x12,a424\n");
+    lp_printf(b, "ett.apn=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", (int) n->cmds, (int) n->refused, (int) n->dropped,
+        (int) n->nowrite, (int) n->kept, (int) n->backkept, (int) n->restored, (int) n->pend, (int) n->offer, (int) n->user,
+        (int) n->tor1, (int) n->trash, (int) n->x12, (int) n->a424);
+    const struct r6pw_state * p = _r6pw_state();
+    lp_printf(b, "# ett.pw=armed,e_ctx,e_lo,e_hi,e_calls,mk_ctx,marker,notes,commits,commit_lock,e_sv,e_steps,e_back,okm0,okm1\n");
+    lp_printf(b, "ett.pw=%d,%d,0x%04x,0x%04x,%d,%d,%d,%d,%d,%d,0x%04x,%d,%d,0x%08x,0x%08x\n", p->armed, p->e_ctx, p->e_lo & 0xFFFF,
+        p->e_hi & 0xFFFF, p->e_calls, p->mk_ctx, p->marker, (int) p->notes, (int) p->commits, p->commit_lock, p->e_sv & 0xFFFF,
+        p->e_steps, p->e_back, (int) p->e_okm[0], (int) p->e_okm[1]);
+    const struct et_basis * e = &r->b0;
+    lp_printf(b, "# ett.base=av,sv,ae,drive,htp,alo,flick,shots,fn (the run basis at the command; Tv: ett.ap base)\n");
+    lp_printf(b, "ett.base=0x%04x,0x%04x,%d,0x%x,0x%x,0x%x,0x%x,%d,%d\n", e->av & 0xFFFF, (int) e->sv, (int) e->ae,
+        (int) e->drive, (int) e->htp, (int) e->alo, (int) e->flick, e->shots, e->fn);
+    {
+        char mb[100];                                                  /* the newest notice as one token */
+        const char * m = r6_ettr_msg();
+        int i = 0;
+        for (; m[i] && i < (int) sizeof(mb) - 1; i++)            /* M11.1 task B: ',' too (one token, QEMU m111 M111A) */
+            mb[i] = m[i] == ' ' ? '_' : m[i] == '\n' ? '|' : m[i] == '=' ? ':' : m[i] == ',' ? ';' : m[i];
+        mb[i] = 0;
+        lp_printf(b, "ett.msg=%s\n", i ? mb : "-");
+    }
+    struct r6_ettr_w w;
+    int nw = r6_ettr_ring_w(0, &w);
+    lp_printf(b, "# ett.w[i]=t,no,j,old,want,lo,hi,st,why,k,cls,res,lock,H0,H1,x12,dpred,dmeas,t_conf,f_conf,d_settle,n_settle,end,a\n");
+    for (int i = 0; i < nw; i++)
+    {
+        r6_ettr_ring_w(i, &w);
+        lp_printf(b, "ett.w[%d]=%d,%d,%d,0x%04x,0x%04x,0x%04x,0x%04x,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", i,
+            (int) w.t, w.no, w.j, w.old & 0xFFFF, w.want & 0xFFFF, w.lo & 0xFFFF, w.hi & 0xFFFF, w.st, w.why, w.k, w.cls, w.res,
+            w.lock, w.H0, w.H1, w.x12, w.dpred, w.dmeas, (int) w.t_conf, (int) w.f_conf, w.d_settle, w.n_settle, w.end, w.a);
+    }
+}
+
 static void lp_ett_log(struct lp_buf * b, uint32_t (*bins)[256], int no)
 {
     const struct r6_ettr_stats * s = r6_ettr_stats();
     char k[48], w[32];
     lp_uc_update();
-    lp_printf(b, "# ETTR M11.0 snapshot (R6 ETTR, docs/m11_plan.md 6.2), next to LVP%05d.LOG\n", no);
+    lp_printf(b, "# ETTR M11.1 snapshot (R6 ETTR, docs/m11_plan.md 6.2, spec m11/m111 5.2), next to LVP%05d.LOG\n", no);
     lp_printf(b, "# format: key=value; shares in ppm of numPix (rings: 0.01 %%); Tv / rd+0x424 / rd[0x608] s16 Code768 0x%%04x\n");
     lp_printf(b, "snapshot_seq=%d\n", lp_snap_seq);
     lp_printf(b, "boot_ms=%d\n", get_ms_clock());
@@ -2845,9 +2911,10 @@ static void lp_ett_log(struct lp_buf * b, uint32_t (*bins)[256], int no)
     lp_printf(b, "# ett.cfg=mode,target,q_ppm,lo,zo,longest,shortest,show_lv\n");
     lp_printf(b, "ett.cfg=%d,%d,%d,%d,%d,0x%04x,0x%04x,%d\n", r6_ettr_mode(), s->target, s->q_ppm, s->lo, s->zo,
         s->longest & 0xFFFF, s->shortest & 0xFFFF, r6_ettr_lv_wanted());
-    lp_printf(b, "# ett.consts=T_ml,L_ml,AE_ml,win_n,win_ms,win_dh,win_trend,win_ds_ppm,win_dy10,idle_fps10,gap_ms,keep_ms,g_iso100,wide_aim,meas_ms,curve\n");
+    lp_printf(b, "# ett.consts=T_ml,L_fast,L_slow,AE_ml,win_min,win_ms,win_slow_ms,win_dh,trend,trend_slow,ds_ppm,dy10,fps_slow10,"
+                 "idle_set_ms,idle_frame_ms,gap_ms,keep_ms,g_iso100,set_ms,set_slow_ms,ms_424,commit_ms,N,step,meas_ms,curve\n");
     {
-        char cs[96];
+        char cs[160];
         r6_ettr_cfg_text(cs, sizeof(cs));
         lp_printf(b, "ett.consts=%s\n", cs);
     }
@@ -2868,12 +2935,13 @@ static void lp_ett_log(struct lp_buf * b, uint32_t (*bins)[256], int no)
     /* the advisor and the task's newest measurement */
     const struct r6_ettr_adv * a = &s->adv;
     lp_printf(b, "# ett.adv=t,t_meas,why,why_name,st,st_name,k,k_raw,lim,rest,hint,tv,want,lo,hi,g,sv,H,s,b,ym10,n,span,hspread,"
-                 "dz,dw(sRGB D(H)-D(Z_o), D(H)-D(200), Code768, uncapped)\n");
+                 "dz,dw(cal D(H)-D(Z_o), D(H)-D(band lo), Code768, uncapped)\n");
     lp_printf(b, "ett.adv=%d,%d,%d,%s,%d,", (int) a->t, (int) a->t_meas, a->why, lp_nosp(r6_ettr_why_name(a->why), w, sizeof(w)), a->st);
     lp_printf(b, "%s,%d,%d,%d,%d,0x%x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,0x%04x,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
         lp_nosp(r6_ettr_st_name(a->st), w, sizeof(w)), a->k, a->k_raw, a->lim, a->rest, a->hint, a->tv & 0xFFFF,
         a->want & 0xFFFF, a->lo & 0xFFFF, a->hi & 0xFFFF, a->g & 0xFFFF, a->sv & 0xFFFF, (int) a->H, (int) a->s, (int) a->b,
         (int) a->ym10, a->n, a->span, a->hspread, a->dz, a->dw);
+    lp_ett_ap(b, s);                                                   /* M11.1: shown, dec, ap, apn, pw, base, msg, ring w */
     lp_ett_meas(b, "ett.task", &s->cur);
     lp_printf(b, "# ett.n=ticks,meas,meas_ok,tries,torn,unbound,retries,resets,fresh,us_last,us_max,us_avg,bk_us_max,bk_n\n");
     lp_printf(b, "ett.n=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", (int) s->ticks, (int) s->meas, (int) s->meas_ok,
@@ -3150,6 +3218,10 @@ static void lp_snapshot_task(int unused)
     msleep(4000);            /* menu closed; user shows the LV screen */
     if (r6_iv_running())     /* M8.0: no card write while a series runs */
         snprintf(lp_snap_msg, sizeof(lp_snap_msg), "skipped (interval)");
+#ifdef CONFIG_R6_ETTR
+    else if (r6_ettr_busy()) /* M11.1: nor while an R6 ETTR run is active or requested (spec m11/m111 3.11) */
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "skipped (ETTR)");
+#endif
     else
         lp_snapshot_do(0);
 #else
@@ -3433,6 +3505,8 @@ void lvprobe_expo_enable(int on)
 #ifdef CONFIG_R6_ETTR
 /* M11.0: R6 ETTR samples FaceYuv 2 x 2 only while the Expo log is ON (docs/m11_plan.md 2.1) */
 int lvprobe_expo_on(void) { return lp_x_on; }
+/* M11.1: "Apply once" is refused while a log snapshot runs or waits (spec m11/m111 2.2 point 6, 3.11) */
+int lvprobe_snapshot_busy(void) { return lp_snap_busy; }
 #endif
 
 /* QEMU test only reads it; also shown as R<n> on the status line */
@@ -3493,6 +3567,13 @@ static MENU_SELECT_FUNC(lp_snapshot_select)
     if (r6_iv_running())     /* M8.0: no card write while a series runs */
     {
         snprintf(lp_snap_msg, sizeof(lp_snap_msg), "interval running");
+        return;
+    }
+#endif
+#ifdef CONFIG_R6_ETTR
+    if (r6_ettr_busy())      /* M11.1 (spec m11/m111 3.11) */
+    {
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "ETTR running");
         return;
     }
 #endif

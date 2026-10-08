@@ -103,6 +103,9 @@ struct r6h_canon {
 };
 typedef uint32_t (*r6h_visit_fn)(void * arg, int c, const volatile uint32_t * a, uint32_t n);
 int r6h_read_canon(r6h_visit_fn visit, void * arg, struct r6h_canon * o);
+/* M11.1 (spec m11/m111 1.4, X6): the published DISP set (0 / 1) as r6h_read_canon finds it, without the bins; -1 = none.
+ * RAM reads only, any task (R6 ETTR watches it every tick for the LV idle rule) */
+int r6h_canon_set(void);
 #endif
 
 #endif

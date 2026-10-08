@@ -2,7 +2,8 @@
 #define _r6_propw_h_
 
 /* R6.190 M10.2 Tor 1: the Tv write path (r6_propw.c, CONFIG_R6_PROPW_TV, spec m10/m102 spec_m102.md section 3).
- * Only r6_interval.c (bracket, "Tv back to ...", the press block) and lvprobe.c (log) use this header. Every name is
+ * Only r6_interval.c (bracket, "Tv back to ...", the press block), r6_ettr.c (M11.1 "Apply once", spec m11/m111 3) and
+ * lvprobe.c (log) use this header. Every name is
  * _r6pw_* (platform/Makefile keeps names "_[a-zA-Z]*" out of magiclantern.sym, K29): nothing here is exported to
  * modules or Lua. Every function that can lead to a write checks that it runs in r6_iv_task. */
 
@@ -27,6 +28,15 @@
 #define R6PW_CTX_BKT        1      /* bracket series / "Test: 1 bracket" (Mode Bracket, M) */
 #define R6PW_CTX_BACK       2      /* "Tv back to ..." (an offer is open) */
 #define R6PW_CTX_PEND       3      /* a stopped series whose restore is pending (only RESTORE_PEND to base, 3.8) */
+#define R6PW_CTX_ETTR       4      /* M11.1: R6 ETTR "Apply once" (spec m11/m111 3) */
+
+/* M11.1 (spec m11/m111 3.1; answers E3 / E6 of 2026-10-07): one ETTR command, row 5 checks it a second time */
+#define R6PW_ETTR_N         5      /* answer E6: steps per command; with the one way back at most N + 1 calls, D3 included */
+#define R6PW_ETTR_STEP      3072   /* 4 EV: step up (member 1..5) and the way back (member 6), row 5 */
+#define R6PW_ETTR_DOWN      2304   /* 3 EV: step down, member 1..5 (E3 / E6), row 5 (Rev. 2, S1-08) */
+#define R6PW_ETTR_GSV       7680   /* G = MAX(Sv, ISO 100) - 7680: 30 s at ISO 100 (row 5, Rev. 2, S1-02) */
+#define R6PW_SV_ISO100      3840   /* Sv of ISO 100 in Code768 */
+#define R6PW_ETTR_WAIT_MS   1000   /* _r6pw_wait_ready for K_ETTR: the bound of the remaining wait rows (Rev. 2, S1-01) */
 
 /* lock classes (3.5): HARD = the rows that hold also with the ML menu open (menu task, Start / Test / display);
  * ALL = every row, the task before every write */
@@ -36,7 +46,7 @@
 
 /* kinds of one write (3.12) */
 enum { R6PW_K_NONE = 0, R6PW_K_STEP, R6PW_K_RESTORE, R6PW_K_RESTORE_STOP, R6PW_K_RESTORE_PEND, R6PW_K_CLAMPFIX,
-       R6PW_K_BACK, R6PW_NKINDS };
+       R6PW_K_BACK, R6PW_K_ETTR, R6PW_NKINDS };   /* M11.1: K_ETTR = 7, appended: pw_restore_kind (3..6) excludes it */
 
 /* results (3.7) */
 enum { R6PW_R_NONE = 0, R6PW_R_OK, R6PW_R_REFUSED, R6PW_R_DONE, R6PW_R_NOCONF, R6PW_R_SIG, R6PW_R_FOREIGN,
@@ -100,6 +110,17 @@ struct r6pw_state {
     uint32_t calls;       /* _prop_request_change calls since boot */
     int sig;              /* abort latches: 1 PROP_ABORT, 2 PROP_TERMINATE_SHUT_REQ, 4 PROP_SHUTDOWN_REASON */
     int back_res, back_lock;     /* last "Tv back" attempt */
+    /* M11.1 (appended: the M10.2 fields keep their offsets) */
+    int e_ctx;            /* ctx of the newest arm (kept through CTX_PEND); 4: the calls below count */
+    int16_t e_lo, e_hi;   /* the ETTR limits of the arm (row 5) */
+    int e_calls;          /* _prop_request_change calls since the newest arm while e_ctx == 4 (row 5: < R6PW_ETTR_N + 1) */
+    int mk_ctx;           /* ctx in the marker line this arm wrote (pw_mk_landed, texts) */
+    uint32_t notes;       /* NotifyBox notices given by pw_note */
+    uint32_t commits;     /* _r6pw_commit successes */
+    int commit_lock;      /* the newest _r6pw_commit refusal (0 = none) */
+    int16_t e_sv;         /* Sv (low 16 bits of [p+0x510]) at the arm, checked fresh against it (row 5, Rev. 2 S1-02) */
+    uint8_t e_steps, e_back;   /* posted K_ETTR calls with member 1..5 / member 6 since the arm (row 5, Rev. 2 S1-08) */
+    uint32_t e_okm[2];    /* bit i: Tv i thirds from 30 s was confirmed OK by a K_ETTR write of this arm (row 5, member 6) */
 };
 
 /* one write attempt (3.12) */
@@ -141,6 +162,10 @@ void _r6pw_series_end(int stop);               /* from iv_end: once per arm */
 void _r6pw_begin(int base);                    /* a bracket Start / Test was accepted: base / last = base (no write) */
 void _r6pw_ev_begin(int no);                   /* an event starts: ML menu blocked */
 int _r6pw_ev_on(void);                         /* an event or its restore runs (ML menu blocked, 4.7) */
+/* M11.1 (spec m11/m111 3.1): r6_iv_task, r6_ettr.c only (gate 11); neither writes */
+int _r6pw_arm_ettr(int base, int lo, int hi, int sv);   /* 0 = armed (marker R6TV.LCK ctx=4), else enum r6pw_lock */
+int _r6pw_commit(int keep);                    /* 0 = kept (marker gone, base = keep, disarmed), else the lock that holds it */
+int _r6pw_is_wait_row(int lock);               /* read only: a wait row of _r6pw_wait_ready (pw_wait_row) */
 /* any task, read only */
 int _r6pw_locks(int want, int cls, int * lock);   /* 0 = all rows of the class hold, else the first failing row */
 int _r6pw_press_ok(void);                      /* 0 while a Tv request is open: no ML press (3.7) */

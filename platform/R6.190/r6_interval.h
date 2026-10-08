@@ -94,6 +94,8 @@ enum r6_iv_cam {
     R6IV_CAM_BKT_MAX,        /* brackets x shots > R6IV_MAX_PICS */
     R6IV_CAM_TVOPEN,         /* a Tv request is open (spec 3.7): no ML press in any mode until a restart */
     R6IV_CAM_CALLER,         /* Start / Test not called by ML's menu key handling (a module, Lua; spec 3.10) */
+    /* M11.1 (spec m11/m111 3.10, X2) */
+    R6IV_CAM_ETTR,           /* an R6 ETTR "Apply once" run is active or requested (r6_ettr_busy) */
     R6IV_NCAMS
 };
 
@@ -362,18 +364,32 @@ struct r6_iv_bkt {
 const struct r6_iv_bkt * r6_iv_bkt(void);
 /* M10.2b: the newest Start / Test refusals with their reason (log iv.ref; the M10.2 camera log had only iv.refused) */
 #define R6IV_REF_RING 6
-enum { R6IV_REF_START = 1, R6IV_REF_TEST, R6IV_REF_TASK_START, R6IV_REF_TASK_TEST, R6IV_REF_MD, R6IV_REF_MD_TASK };
+enum { R6IV_REF_START = 1, R6IV_REF_TEST, R6IV_REF_TASK_START, R6IV_REF_TASK_TEST, R6IV_REF_MD, R6IV_REF_MD_TASK,
+       R6IV_REF_ETTR, R6IV_REF_ETTR_TASK };   /* M11.1: R6 ETTR "Apply once" refused in the menu (7) / dropped before write 1 (8) */
 struct r6_iv_ref {
     uint32_t t;              /* ms */
-    uint8_t src;             /* R6IV_REF_*: the menu's Start / Test, the task's checks of a Start / Test, R6 Motion's Start / task */
-    uint8_t cam;             /* enum r6_iv_cam */
-    uint8_t lock;            /* R6IV_CAM_TVW: enum r6pw_lock, else 0 */
+    uint8_t src;             /* R6IV_REF_*: the menu's Start / Test, the task's checks of a Start / Test, R6 Motion's Start / task,
+                              * M11.1: R6 ETTR's command / run */
+    uint8_t cam;             /* enum r6_iv_cam (src 7 / 8: R6ETT_A_*, r6_ettr.h) */
+    uint8_t lock;            /* R6IV_CAM_TVW / R6ETT_A_TVW: enum r6pw_lock; R6ETT_A_WRITE: R6PW_R_*; R6ETT_A_ADV: R6ETT_W_*; else 0 */
     uint8_t pad;
     uint16_t bk;             /* R6IV_CAM_BKT_LIST: why << 8 | member index, else 0 */
     int16_t tv;              /* R6IV_CAM_BKT_LIST: that member's Tv, else 0 */
 };
 int r6_iv_refusal(int i, struct r6_iv_ref * e);   /* i = 0 oldest; returns the count (<= R6IV_REF_RING) */
 uint32_t r6_iv_refusal_n(void);                   /* refusals recorded since boot */
+void r6_iv_ref_add(int src, int code, int lock);  /* M11.1: an R6 ETTR entry (src 7 / 8) in the same ring, iv.refused unchanged */
+
+/* M11.1 (spec m11/m111 2.2, 2.3, 3.10): R6 ETTR's command 6 and the wait it shares with command 5 "Tv back to ..." */
+#define R6IV_MENU_TASK "GuiMainTask"   /* M10.2: ML's menu key handling runs here (src/gui.c ml_gui_main_task, the
+                                        * TASK_OVERRIDE of Canon's gui_main_task, stubs.S task_create("GuiMainTask")):
+                                        * the menu entries' select functions (Start, Test, Tv writes, Tv back, Apply once) */
+#define R6IV_MENU_OPEN_TASK "menu_task" /* M11.1: src/menu.c menu_task (TASK_CREATE "menu_task") runs menu_open() and with it
+                                        * r6_iv_menu_block(): the Trash press that opens the ML menu */
+int _r6iv_ettr_cmd(void);                         /* menu task (R6IV_MENU_TASK) only: queues command 6; R6IV_CAM_OK, else
+                                                   * R6IV_CAM_CALLER / R6IV_CAM_BUSY */
+enum { R6IV_CW_WAIT = 0, R6IV_CW_GO, R6IV_CW_NOLV, R6IV_CW_STEADY, R6IV_CW_CLOCK };
+int _r6iv_cmd_wait(int now, int t_cmd, int * t_lvw);   /* r6_iv_task: the M10.2b wait of command 5 / 6 (R6IV_CW_*) */
 /* r6_propw.c only (names _[a-zA-Z]*: not in magiclantern.sym); read-only helpers of r6_interval.c */
 int _r6iv_cc_gate(const struct r6_iv_cc * s);              /* iv_cc_gate: hard Canon reasons, 0 = ok */
 int _r6iv_lvstill(const struct r6_iv_cc * s);              /* iv_cc_lvstill */

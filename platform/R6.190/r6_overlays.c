@@ -318,6 +318,15 @@ int r6h_read_canon(r6h_visit_fn visit, void * arg, struct r6h_canon * o)
     o->numpix = n;
     return R6H_SHOWN;
 }
+
+/* M11.1 (r6_overlays.h; spec m11/m111 1.4 X6): the set part of r6h_read_canon (ov_hist_set), no bins: the published DISP
+ * set 0 / 1, -1 = none (context unreadable or not a DISP set) */
+int r6h_canon_set(void)
+{
+    uint32_t p[4];
+    int s = ov_hist_set(RD(OV_HIST_STATE + 4), p, ov_uc_ok());
+    return s < 0 ? -1 : s;
+}
 #endif
 
 /* copy the arrays used by mode (Luma: Y = 0; RGB: 1..3); returns R6H_SHOWN,

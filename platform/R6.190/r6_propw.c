@@ -25,6 +25,16 @@
  * ever written at startup.
  *
  * The handlers (PROP_SHUTTER and the three shutdown latches) run in Canon's PropMgr task and only copy (3.3).
+ *
+ * M11.1 (spec m11/m111 spec_m111.md 3, answers E3 / E4 / E6 of 2026-10-07, Q1..Q4 of 2026-10-08): a second write context,
+ * R6PW_CTX_ETTR, for R6 ETTR's "Apply once" (r6_ettr.c, the user's menu command). Same call site, same id, same 44 rows,
+ * same window; row 5 checks every K_ETTR write a second time on its own: the arm's limits (1/3 grid, Tor 1's window,
+ * Canon's range, the user's limits, G), at most R6PW_ETTR_N steps in order (up <= 4 EV, down <= 3 EV) and one way back
+ * (<= 4 EV, only onto a value a K_ETTR write of this arm confirmed), at most R6PW_ETTR_N + 1 calls per arm with the
+ * restores (D3 included), Sv of both reads = Sv at the arm and want >= G from it. Rows 7 and 44 as for the bracket.
+ * K_ETTR does not wait for Canon's GUI, a press or Canon's job (the run stops instead), the other wait rows <= 1 s. A
+ * kept value ends the arm without a call (_r6pw_commit: the marker goes first, then base := last). With the budget
+ * spent, a stop makes no 7th call: the user's own value, else DONE, else the offer at once.
  */
 
 #include "dryos.h"
@@ -560,7 +570,7 @@ static void pw_note(int box, const char * fmt, ...)
     va_start(ap, fmt);
     vsnprintf(pw_msg, sizeof(pw_msg), fmt, ap);
     va_end(ap);
-    if (box) NotifyBox(5000, "%s", pw_msg);
+    if (box) { S.notes++; NotifyBox(5000, "%s", pw_msg); }   /* M11.1: counted (r6_ettr.c gives its own only without one) */
 }
 
 const char * _r6pw_msg(void) { return pw_msg; }
@@ -702,7 +712,7 @@ static void pw_mk_landed(void)
     if (S.marker < 1 || !S.landed_ae) { pw_mk_land_due = 0; return; }
     if (!pw_card_ok()) return;
     pw_mk_land_due = 0;
-    int n = pw_mk_line(l, sizeof(l), S.base, S.armed == R6PW_CTX_BACK ? R6PW_CTX_BACK : R6PW_CTX_BKT, 1);
+    int n = pw_mk_line(l, sizeof(l), S.base, S.mk_ctx ? S.mk_ctx : R6PW_CTX_BKT, 1);   /* M11.1: the arm's ctx (3.8) */
     if (!pw_mk_write(l, n) || !pw_mk_write(l, n)) { pw_mk_len = n; return; }
     pw_mk_len = -2;
     pw_note(1, "R6TV.LCK lost: check Tv in M\nand in mode %s.", pw_ae_name(S.landed_ae));
@@ -729,12 +739,14 @@ static int pw_kv(const char * s, const char * key, int * out)
 /* a mode a landed record may name: Tv, B, Fv (K34), 0 = none; 0xFF only as the older record (review round 2, S2-1) */
 static int pw_ae_rec(int ae, int older) { return ae == 0 || ae == 1 || ae == 4 || ae == 0x37 || (older && ae == 0xFF); }
 
-/* "R6TV 1|2 base=0x.... [ae=. v=0x....[ ae2=. v2=0x....]]": 1 = parsed (" ae=" / " v=" never match " ae2=" / " v2=") */
-static int pw_mk_parse(const char * l, int * base, int * ae, int * v, int * ae2, int * v2)
+/* "R6TV 1|2 base=0x.... [ctx=.][ ae=. v=0x....[ ae2=. v2=0x....]]": 1 = parsed (" ae=" / " v=" never match " ae2=" /
+ * " v2="); M11.1: *ctx = the arm's context (1 bracket, 2 "Tv back", 4 R6 ETTR), anything else (old lines) the bracket */
+static int pw_mk_parse(const char * l, int * base, int * ctx, int * ae, int * v, int * ae2, int * v2)
 {
     if (strncmp(l, "R6TV ", 5) || (l[5] != '1' && l[5] != '2') || l[6] != ' ') return 0;
     if (!pw_kv(l, " base=", base)) return 0;
     *base = (int16_t) *base;
+    if (!pw_kv(l, " ctx=", ctx) || (*ctx != R6PW_CTX_BKT && *ctx != R6PW_CTX_BACK && *ctx != R6PW_CTX_ETTR)) *ctx = R6PW_CTX_BKT;
     *ae = *v = *ae2 = *v2 = 0;
     if (l[5] == '2' && (!pw_kv(l, " ae=", ae) || !pw_kv(l, " v=", v))) return 0;
     if (l[5] == '2' && pw_kv(l, " ae2=", ae2) && !pw_kv(l, " v2=", v2)) return 0;
@@ -766,17 +778,43 @@ struct pw_ev {
     int stab; int16_t sv;                /* stable-M from the consumer (3.6a) */
     int16_t old, u;                      /* out: the agreed Tv; user value for row 44 */
     int sticky, evid;                    /* out: row 44 failed sticky / with user evidence */
+    int mem;                             /* M11.1: K_ETTR member index from r6pw_write (1..5 steps, 6 the way back); 0 in
+                                          * _r6pw_wait_ready (no index there: row 5 checks only the outer bounds) */
 };
 
 static int pw_restore_kind(int k) { return k >= R6PW_K_RESTORE && k <= R6PW_K_BACK; }
 
-/* row 5: the armed context admits the kind (bit tests, no switch: canon_gate tbb noise) */
-static int pw_ctx_admits(int k, int want)
+/* M11.1: the Tv values a K_ETTR write of this arm confirmed (row 5, the way back), bit i = Tv i thirds from 30 s; outside
+ * Tor 1's window or off the grid never set, never true */
+static int pw_okm_i(int v) { return (v & (R6PW_GRID - 1)) || v < R6PW_TV_MIN || v > R6PW_TV_MAX ? -1 : (v - R6PW_TV_MIN) >> 8; }
+static void pw_okm_set(int v) { int i = pw_okm_i(v); if (i >= 0) S.e_okm[i >> 5] |= 1u << (i & 31); }
+static int pw_okm_has(int v) { int i = pw_okm_i(v); return i >= 0 && ((S.e_okm[i >> 5] >> (i & 31)) & 1); }
+
+/* row 5: the armed context admits the kind (bit tests, no switch: canon_gate tbb noise). M11.1: ETTR with its limits,
+ * member, direction, step and count (spec m11/m111 3.3, Rev. 2 S1-08); the G / Sv part follows row 15 in pw_rows */
+static int pw_ctx_admits(const struct pw_ev * e)
 {
+    int k = e->kind, want = e->want;
     if (S.armed == R6PW_CTX_BKT)
         return ((1 << k) & ((1 << R6PW_K_STEP) | (1 << R6PW_K_RESTORE) | (1 << R6PW_K_RESTORE_STOP) | (1 << R6PW_K_CLAMPFIX))) != 0;
     if (S.armed == R6PW_CTX_BACK) return k == R6PW_K_BACK;
-    if (S.armed == R6PW_CTX_PEND) return k == R6PW_K_RESTORE_PEND && want == S.base;
+    if (S.armed == R6PW_CTX_ETTR)
+    {
+        if (S.e_calls >= R6PW_ETTR_N + 1) return 0;                          /* E6: 6 calls per command */
+        if (k == R6PW_K_ETTR)
+        {
+            int d = want - S.last;                                           /* > 0: shorter (down), < 0: longer (up) */
+            if (want < S.e_lo || want > S.e_hi || ABS(d) > R6PW_ETTR_STEP) return 0;
+            if (e->mem >= 1 && e->mem <= R6PW_ETTR_N)                        /* a step: in order, <= 5, down <= 3 EV */
+                return e->mem == S.e_steps + 1 && d <= R6PW_ETTR_DOWN;
+            if (e->mem == R6PW_ETTR_N + 1) return !S.e_back && pw_okm_has(want);   /* the way back: once, to a confirmed value */
+            return e->mem == 0;
+        }
+        return (k == R6PW_K_RESTORE_STOP || k == R6PW_K_CLAMPFIX) && want == S.base;
+    }
+    if (S.armed == R6PW_CTX_PEND)
+        return k == R6PW_K_RESTORE_PEND && want == S.base
+            && (S.e_ctx != R6PW_CTX_ETTR || S.e_calls < R6PW_ETTR_N + 1);   /* M11.1: D3 counts (E6) */
     return 0;
 }
 
@@ -815,6 +853,20 @@ static int pw_last_bad(struct pw_ev * e, int16_t old)
     return 1;
 }
 
+/* row 13: bytes, SW events, self-release macro, MPU switch status; row 14: Canon's job. M11.1: also K_ETTR's wait in
+ * _r6pw_wait_ready while an earlier wait row masks them (QEMU m111 W55) */
+static int pw_press_bad(const struct r6_iv_cc * c)
+{
+    return c->df || c->e0 || c->snap_df || c->snap_e0 || ((c->pend | c->work) & R6IV_SW_EVENT_MASK) || c->relcb
+        || !(c->valid & R6IV_V_STS) || c->sts[0] || c->sts[1];
+}
+
+static int pw_job_bad(const struct r6_iv_cc * c)
+{
+    return c->jobs || c->jdone != c->jid || c->relseq || c->b54 || c->faneo[0] != R6IV_RAM_FANEO
+        || c->faneo[1] != R6IV_RAM_FANEO || burst_count == 0;
+}
+
 /* rows of 3.5 in their order (1..37, 42, 43, 44, 38..41); 0 = all hold, else the first failing row */
 static int pw_rows(struct pw_ev * e)
 {
@@ -837,9 +889,10 @@ static int pw_rows(struct pw_ev * e)
     if (r6pw_sig()) return R6PW_L_SIG;
     /* 4, 5, 6, 7 (a write only; row 7's card check runs in r6pw_write once every row holds) */
     if (wr && !pw_task()) return R6PW_L_TASK;
-    if (wr && !pw_ctx_admits(k, w)) return R6PW_L_ARMED;
+    if (wr && !pw_ctx_admits(e)) return R6PW_L_ARMED;
     if (wr && all && pw_ncalls && (now - (int) pw_t_last < R6PW_SPACING_MS || now < (int) pw_t_last)) return R6PW_L_SPACING;
-    if (wr && (S.armed == R6PW_CTX_BKT ? S.marker != 1 : S.marker < 1)) return R6PW_L_MARKER;
+    /* M11.1: ETTR keeps its marker like the bracket (3.3) */
+    if (wr && ((S.armed == R6PW_CTX_BKT || S.armed == R6PW_CTX_ETTR) ? S.marker != 1 : S.marker < 1)) return R6PW_L_MARKER;
     /* 8 */
     if (_r6iv_cc_gate(c) != 0 || !(c->valid & R6IV_V_P) || c->cc != g->cc || (g->v & PW_V_ALL) != PW_V_ALL
         || g->cpy != g->ds + 4 || g->rec != g->dsrec || g->ccg != 0x1F) return R6PW_L_PTR;
@@ -854,14 +907,16 @@ static int pw_rows(struct pw_ev * e)
         /* 12 */
         if (pw_gui_bad(now)) return R6PW_L_GUI;
         /* 13: bytes, SW events, self-release macro, MPU switch status */
-        if (c->df || c->e0 || c->snap_df || c->snap_e0 || ((c->pend | c->work) & R6IV_SW_EVENT_MASK) || c->relcb
-            || !(c->valid & R6IV_V_STS) || c->sts[0] || c->sts[1]) return R6PW_L_PRESS;
+        if (pw_press_bad(c)) return R6PW_L_PRESS;
         /* 14 */
-        if (c->jobs || c->jdone != c->jid || c->relseq || c->b54 || c->faneo[0] != R6IV_RAM_FANEO
-            || c->faneo[1] != R6IV_RAM_FANEO || burst_count == 0) return R6PW_L_JOB;
+        if (pw_job_bad(c)) return R6PW_L_JOB;
     }
     /* 15 .. 35 */
     if (!g->iso) return R6PW_L_ISO;
+    /* row 5 (second part, M11.1 Rev. 2 S1-02): K_ETTR only; G and the arm's Sv from this fresh pair, independent of
+     * r6_ettr.c. After row 15 (no Auto ISO); RESTORE_STOP / RESTORE_PEND / CLAMPFIX to base go on after an ISO change (E4) */
+    if (k == R6PW_K_ETTR && ((int) (g->iso & 0xFFFF) != S.e_sv || (int) (h->iso & 0xFFFF) != S.e_sv
+        || w < MAX((int) (g->iso & 0xFFFF), R6PW_SV_ISO100) - R6PW_ETTR_GSV)) return R6PW_L_ARMED;
     int seen = 0, aebh = r6_iv_aeb(&seen);
     if ((seen && (int16_t) aebh) || (int16_t) g->aeb || (g->aeb & 0xFFFFFF)) return R6PW_L_AEB;
     if (g->wbb_ba || g->wbb_gm) return R6PW_L_WBB;
@@ -909,8 +964,9 @@ static int pw_rows(struct pw_ev * e)
     /* 44 for STEP (review round 1, F1 / L1; plan 2.5 "your dial turn wins"): Canon's Tv must still be ML's last value
      * (S.last: the base at the event start, the previous member after its write; also in the wait before the write).
      * With user evidence the user's value wins (LAST: TOOK_OVER, no call, the series stops TVUSER, nothing restored);
-     * without it the views are unsettled (wait class; a mismatch without evidence ends as a VIEWS stop, 3.6a) */
-    if (wr && k == R6PW_K_STEP && old != S.last)
+     * without it the views are unsettled (wait class; a mismatch without evidence ends as a VIEWS stop, 3.6a).
+     * M11.1: K_ETTR as STEP (3.3) */
+    if (wr && (k == R6PW_K_STEP || k == R6PW_K_ETTR) && old != S.last)
     {
         e->evid = pw_user_ev(S.last, &e->u);
         if (e->evid) return R6PW_L_LAST;
@@ -936,6 +992,8 @@ static int pw_wait_row(int l)
     return l == R6PW_L_SPACING || l == R6PW_L_CCSTATE || l == R6PW_L_GUI || l == R6PW_L_PRESS || l == R6PW_L_JOB
         || l == R6PW_L_VIEWS || l == R6PW_L_TORN;
 }
+
+int _r6pw_is_wait_row(int lock) { return pw_wait_row(lock); }   /* M11.1: read only, for r6_ettr.c (Rev. 2) */
 
 /* the task's pair (locks, window); r6_iv_task only */
 static struct pw_snap pw_s1, pw_s2;
@@ -992,6 +1050,9 @@ int _r6pw_wait_ready(int want, int kind)
          * restarted (Canon MENU, playback, screen off) or the ML-menu hold came back during the arm's marker I/O: the wait
          * ends at once, before any ring entry or call, and _r6pw_back drops the command (it does not wait for LV again) */
         if (kind == R6PW_K_BACK && _r6iv_holds(now)) { pw_back_nolv = 1; return R6PW_L_GUI; }
+        /* M11.1 (spec m11/m111 3.5, Rev. 2 S1-01): Canon GUI, ML menu, LV < 3 s or gone, a picture: an ETTR run stops now
+         * (with the ring entry below), never a write after it */
+        if (kind == R6PW_K_ETTR && pw_gui_bad(now)) { l = R6PW_L_GUI; evid = 0; break; }
         struct pw_ev e;
         memset(&e, 0, sizeof(e));
         e.want = want; e.kind = kind; e.nolast = 1;   /* row 44 of the restore kinds: in r6pw_write (TOOK_OVER / offer /
@@ -1003,8 +1064,17 @@ int _r6pw_wait_ready(int want, int kind)
          * instead of a refusal and a pending restore (QEMU m102: the event stop's DONE check ran on an unsettled pair) */
         if (l == R6PW_L_NEW && pw_restore_kind(kind) && e.old == want) { l = 0; break; }
         if (!l || !pw_wait_row(l)) break;
+        /* M11.1: K_ETTR does not wait for Canon's GUI, a press or Canon's job: the run stops instead (Rev. 2, S1-01). Rows
+         * 13 / 14 also while an earlier wait row (11 CCSTATE, SPACING, VIEWS, TORN) masks them, on both reads: a press
+         * inside a CC-state wait is never waited out (QEMU m111 W55) */
+        if (kind == R6PW_K_ETTR && l != R6PW_L_GUI && l != R6PW_L_PRESS && l != R6PW_L_JOB)
+        {
+            if (pw_press_bad(e.ca) || pw_press_bad(e.cb)) l = R6PW_L_PRESS;
+            else if (pw_job_bad(e.ca) || pw_job_bad(e.cb)) l = R6PW_L_JOB;
+        }
+        if (kind == R6PW_K_ETTR && (l == R6PW_L_GUI || l == R6PW_L_PRESS || l == R6PW_L_JOB)) break;
         now = get_ms_clock();
-        if (now - t0 >= R6IV_BKT_WAIT_MS || now < t0) break;   /* the wait row is the reason */
+        if (now - t0 >= (kind == R6PW_K_ETTR ? R6PW_ETTR_WAIT_MS : R6IV_BKT_WAIT_MS) || now < t0) break;   /* the wait row is the reason */
         msleep(R6PW_WAIT_POLL_MS);
     }
     if (evid)                            /* STEP, lock 44 with user evidence: the user's value wins, TOOK_OVER, no call */
@@ -1160,7 +1230,9 @@ static int pw_resolve(struct r6pw_rec * e, int res, int want, const struct pw_wi
     else if (res == R6PW_R_FOREIGN) pw_note(1, "Stopped: Tv changed by user (%s).", _r6pw_tvs(a, w->u));
     else if (res == R6PW_R_INVOLVED)
         pw_note(1, "Tv %s: your dial turn and ML's write\ncrossed. Tv back to %s.", _r6pw_tvs(a, want), _r6pw_tvs(b, S.base));
-    else if (res == R6PW_R_MODE && want != S.base)
+    else if (res == R6PW_R_MODE && want != S.base && !(S.armed == R6PW_CTX_ETTR && S.e_calls >= R6PW_ETTR_N + 1))
+        /* M11.1 (Rev. 2 S1-03): only while the restore is still possible (e_calls counts this post); else event_stop
+         * gives the offer */
         pw_note(1, "Tv %s set by ML stays in M; it returns\nto %s when you are back in M.", _r6pw_tvs(a, want), _r6pw_tvs(b, S.base));
     return res;
 }
@@ -1183,7 +1255,7 @@ static int __attribute__((noinline, noipa)) r6pw_write(int want, int kind, int k
     /* row 7, the card part, before the lock pair (review round 1, safety L1: nothing but the step-3 Tv check between
      * the lock pair and the post): the marker file at the first write of every event / before a pending restore;
      * pw_card_ok: no picture, Canon's job count 0 (3.9). The state part of row 7 stays in row order */
-    int mk = (S.armed == R6PW_CTX_BKT && pw_mk_ev != ev) || S.armed == R6PW_CTX_PEND;
+    int mk = ((S.armed == R6PW_CTX_BKT || S.armed == R6PW_CTX_ETTR) && pw_mk_ev != ev) || S.armed == R6PW_CTX_PEND;   /* M11.1: ETTR as BKT */
     if (mk && (!pw_card_ok() || pw_mk_read(0, 0) != pw_mk_len)) return pw_rec_end(e, R6PW_R_REFUSED, R6PW_L_MARKER);
     /* 2. n0 before the first lock read (RR2-13), then every row on fresh reads */
     uint32_t n0 = pw_hn;
@@ -1192,12 +1264,13 @@ static int __attribute__((noinline, noipa)) r6pw_write(int want, int kind, int k
     memset(&q, 0, sizeof(q));
     q.want = want;
     q.kind = kind;
+    q.mem = k;                           /* M11.1: row 5's member index (K_ETTR: 1..5 steps, 6 the way back) */
     int lock = pw_eval_all(&q);
     e->old = q.old;
     e->state = pw_c1.state;
     e->sl0 = pw_slots(&pw_s1.g);
     e->c62c = MIN(pw_s1.g.c62c, 255u);
-    if (!lock && mk && S.armed == R6PW_CTX_BKT) pw_mk_ev = ev;   /* this event's file check is done */
+    if (!lock && mk && S.armed != R6PW_CTX_PEND) pw_mk_ev = ev;   /* this event's (run's) file check is done */
     if (lock == R6PW_L_LAST && q.evid)
     {
         e->fl |= R6PW_FL_USER;
@@ -1224,6 +1297,9 @@ static int __attribute__((noinline, noipa)) r6pw_write(int want, int kind, int k
     e->t = t_call;
     e->d_ret = pw_dms(t_ret, t_call);
     S.calls++;
+    /* M11.1 (3.4): only posted calls count (DONE, TOOK_OVER, REFUSED do not); row 5 reads them */
+    if (S.e_ctx == R6PW_CTX_ETTR) S.e_calls++;
+    if (kind == R6PW_K_ETTR) { if (k == R6PW_ETTR_N + 1) S.e_back++; else S.e_steps++; }
     /* 4. the window: every R6PW_POLL_MS up to R6PW_CONFIRM_MS */
     struct pw_win w;
     memset(&w, 0, sizeof(w));
@@ -1341,7 +1417,9 @@ static int __attribute__((noinline, noipa)) r6pw_write(int want, int kind, int k
     e->dep = w.dep;
     e->fl |= (w.mode_left ? R6PW_FL_MODE : 0) | (w.ovf ? R6PW_FL_OVF : 0) | (w.movie_left ? R6PW_FL_MOVIE : 0)
            | (mlfirst ? R6PW_FL_MLFIRST : 0) | (res == R6PW_R_FOREIGN ? R6PW_FL_USER : 0);
-    return pw_resolve(e, res, want, &w, ae);
+    int rr = pw_resolve(e, res, want, &w, ae);
+    if (kind == R6PW_K_ETTR && rr == R6PW_R_OK) pw_okm_set(want);   /* M11.1: a confirmed value (row 5, the way back) */
+    return rr;
 }
 
 /* ---- states and restore paths (3.8) ---- */
@@ -1363,6 +1441,8 @@ static void pw_pend_start(int why)
     else if (S.last_res == R6PW_R_REFUSED && S.last_lock)
         pw_note(1, "Tv restore waits: %s.\nTv %s -> %s when back in LV (2 min).",
             _r6pw_lock_name(S.last_lock), _r6pw_tvs(a, S.last), _r6pw_tvs(b, S.base));
+    else if (S.e_ctx == R6PW_CTX_ETTR)            /* M11.1 (3.8) */
+        pw_note(1, "ETTR: Tv %s returns to %s\nwhen you are back in LV (2 min).", _r6pw_tvs(a, S.last), _r6pw_tvs(b, S.base));
     else pw_note(1, "R6 Interval: Tv %s returns to %s\nwhen you are back in LV (2 min).", _r6pw_tvs(a, S.last), _r6pw_tvs(b, S.base));
 }
 
@@ -1373,7 +1453,9 @@ static void pw_offer(void)
     _r6pw_consume(get_ms_clock());
     S.offer = 1;
     S.boot_rec = pw_cs[1].mrec ? pw_cs[1].rec : S.last;
-    pw_note(1, "Tv not restored. Shoot > R6 Interval >\nTv back to %s, or turn the dial.", _r6pw_tvs(a, S.base));
+    if (S.e_ctx == R6PW_CTX_ETTR)                 /* M11.1 (3.8) */
+        pw_note(1, "ETTR: Tv not restored. Shoot > R6 Interval\n> Tv back to %s, or turn the dial.", _r6pw_tvs(a, S.base));
+    else pw_note(1, "Tv not restored. Shoot > R6 Interval >\nTv back to %s, or turn the dial.", _r6pw_tvs(a, S.base));
 }
 
 static void pw_rule(void);
@@ -1433,7 +1515,7 @@ static int pw_done_now(int kind)
 int __attribute__((noinline)) _r6pw_write(int want, int kind, int k, int ev)
 {
     if (!pw_task()) return R6PW_R_REFUSED;
-    if (kind == R6PW_K_STEP) return r6pw_write(want, R6PW_K_STEP, k, ev);
+    if (kind == R6PW_K_STEP || kind == R6PW_K_ETTR) return r6pw_write(want, kind, k, ev);   /* row 5 sorts STEP / ETTR by context */
     if (kind != R6PW_K_RESTORE || want != S.base) return pw_refused(want, kind, R6PW_L_ARMED);
     /* the event's restore (4.4 step 4): wait rows, then the one call; the event is over whatever the result */
     S.busy = 1;
@@ -1451,9 +1533,9 @@ int __attribute__((noinline)) _r6pw_write(int want, int kind, int k, int ev)
 
 void __attribute__((noinline)) _r6pw_event_stop(int why)
 {
-    if (!S.ev_on) return;
+    if (!S.ev_on || !pw_task()) return;  /* M11.1 (Rev. 2 S1-04): a wrong task changes nothing (ev_on stays) */
     S.ev_on = 0;                         /* first: a second call (iv_end twice) does nothing (RR2-12) */
-    if (!pw_task() || S.armed != R6PW_CTX_BKT) return;
+    if (S.armed != R6PW_CTX_BKT && S.armed != R6PW_CTX_ETTR) return;
     int r = S.last_res;
     if (pw_inflight || r6pw_sig()) return;                       /* open: no restore, no pending (3.7); a signal: none */
     if (pw_dead || r == R6PW_R_DEP || r == R6PW_R_FOREIGN) return;   /* D5 / the user's value wins */
@@ -1462,6 +1544,28 @@ void __attribute__((noinline)) _r6pw_event_stop(int why)
     {
         char a[12];
         pw_note(1, "Tv %s is yours; ML did not restore it.", _r6pw_tvs(a, pw_ring[(pw_rn - 1) % R6PW_RING].rep));
+        return;
+    }
+    /* M11.1 (E6; Rev. 2 S1-03): the budget is spent: no 7th call, no pending restore (it could never run), no "returns
+     * ... (2 min)" text; the user's own value first (the stop needs no call then), then DONE, else the offer. Before the
+     * LANDED / MODE branches, so a full budget never starts a pending restore */
+    if (S.armed == R6PW_CTX_ETTR && S.e_calls >= R6PW_ETTR_N + 1)
+    {
+        int16_t u;
+        char a[12];
+        if (r == R6PW_R_LANDED) pw_mk_landed();                  /* the marker records the mode and value (3.9) */
+        if (!pw_gap_ok() || get_ms_clock() - pw_cs[1].t > R6PW_FRESH_MS) pw_fresh2();   /* a fresh pair, as _r6pw_user_evidence */
+        if (pw_user_ev(S.last, &u))                              /* the user turned the dial in M: it wins, nothing to offer */
+        {
+            struct r6pw_rec * e = pw_rec_new(S.base, R6PW_K_RESTORE_STOP, 0xFF, S.ev_no);
+            e->rep = u;
+            e->fl |= R6PW_FL_USER;
+            pw_rec_end(e, R6PW_R_TOOK_OVER, R6PW_L_LAST);
+            pw_note(1, "Tv %s is yours; ML did not restore it.", _r6pw_tvs(a, u));
+        }
+        else if (!pw_done_now(R6PW_K_RESTORE_STOP)) pw_offer();   /* M already base: DONE; else the offer */
+        S.pend = 0;
+        pw_lim_end();
         return;
     }
     if (pw_lim && r == R6PW_R_LANDED)
@@ -1490,7 +1594,8 @@ void __attribute__((noinline)) _r6pw_event_stop(int why)
 
 void _r6pw_series_end(int stop)
 {
-    if (S.armed != R6PW_CTX_BKT || S.se_done) return;
+    if (!pw_task()) return;                                       /* M11.1 (Rev. 2 S1-04): before any state change */
+    if ((S.armed != R6PW_CTX_BKT && S.armed != R6PW_CTX_ETTR) || S.se_done) return;   /* M11.1: an ETTR run as a series */
     S.se_done = 1;
     _r6pw_event_stop(stop);
     if (S.pend) S.armed = R6PW_CTX_PEND;   /* only RESTORE_PEND to base (row 5), the marker stays (row 7) */
@@ -1516,7 +1621,52 @@ void _r6pw_ev_begin(int no)
 
 int _r6pw_ev_on(void) { return S.ev_on || S.busy; }
 
-int _r6pw_arm(int ctx, int base)
+/* M11.1 (spec m11/m111 3.7; plan 4.1 step 8, Rev. 2 S1-01 / S1-08): R6 ETTR keeps ML's value like a dial turn. The
+ * marker goes first (synchronously, and must be gone), then base := last; no call (not a caller of r6pw_write, gate 10).
+ * 0 = kept (disarmed), else the lock that holds it back (L_JOB / L_VIEWS: the caller retries <= 5 s, then stops) */
+int __attribute__((noinline)) _r6pw_commit(int keep)
+{
+    int16_t v;
+    int l = 0;
+    if (!pw_task()) return R6PW_L_TASK;                               /* a wrong task changes nothing */
+    if (S.armed != R6PW_CTX_ETTR || !S.ev_on) l = R6PW_L_ARMED;
+    else if (pw_inflight) l = R6PW_L_OPEN;
+    else if (pw_dead) l = R6PW_L_DEAD;
+    else if (pw_lim) l = R6PW_L_LIMITED;
+    else if (S.pend) l = R6PW_L_PEND;
+    else if (S.offer) l = R6PW_L_OFFER;
+    else if (r6pw_sig()) l = R6PW_L_SIG;                               /* a shutdown signal: no commit, marker kept */
+    else if (S.last_res != R6PW_R_OK || keep != S.last || S.fgn_m || S.rec_moved || S.ovf) l = R6PW_L_LAST;
+    else if ((keep & (R6PW_GRID - 1)) || keep < S.e_lo || keep > S.e_hi) l = R6PW_L_NEW;
+    else
+    {
+        pw_fresh2();
+        if (!pw_stable_m(&v) || v != keep) l = R6PW_L_VIEWS;
+        else if (!pw_card_ok()) l = R6PW_L_JOB;
+        else if (S.marker != 1 || pw_mk_read(0, 0) != pw_mk_len) l = R6PW_L_MARKER;
+        else
+        {
+            pw_mk_delete();
+            if (pw_mk_read(0, 0) >= 0) l = R6PW_L_MARKER;              /* still there: not kept */
+        }
+    }
+    S.commit_lock = l;
+    if (l) return l;
+    S.marker = 0;
+    S.landed_ae = S.landed_ae2 = 0;
+    S.landed_v = S.landed_v2 = 0;
+    S.landed_ok = S.landed_ok2 = 0;
+    S.base = S.last;                                                    /* after the marker is gone */
+    S.armed = 0;
+    S.ev_on = 0;
+    pw_sticky_reset(get_ms_clock(), get_ms_clock());
+    S.commits++;
+    return 0;
+}
+
+/* M11.1 (spec m11/m111 3.2): the arm of both series contexts, the bracket (BKT) and R6 ETTR (lo / hi / sv: the run's
+ * limits and Sv, 0 for the other contexts), and of "Tv back" (BACK) */
+static int pw_arm(int ctx, int base, int lo, int hi, int sv)
 {
     char l[96], buf[96];
     int t_in = get_ms_clock();               /* before the marker file I/O (review round 2, L2-3) */
@@ -1527,15 +1677,27 @@ int _r6pw_arm(int ctx, int base)
     if (S.armed) return R6PW_L_ARMED;
     if (r6pw_sig()) return R6PW_L_SIG;
     if (!pw_card_ok()) return R6PW_L_JOB;
-    if (ctx == R6PW_CTX_BKT)
+    if (ctx == R6PW_CTX_BKT || ctx == R6PW_CTX_ETTR)
     {
         if (pw_lim) return R6PW_L_LIMITED;
         if (S.pend) return R6PW_L_PEND;
         if (S.offer) return R6PW_L_OFFER;
         if (S.marker == 2 || S.marker == 3) return R6PW_L_MKEPT;
-        if (!_r6iv_bkt_armable()) return R6PW_L_ARMED;
+        if (ctx == R6PW_CTX_BKT ? !_r6iv_bkt_armable() : r6_iv_running()) return R6PW_L_ARMED;
+        if (ctx == R6PW_CTX_ETTR)
+        {
+            /* M11.1: X11 again, independently of r6_ettr.c: the run's limits on the 1/3 grid inside Tor 1's window, the
+             * base inside them, a valid sheet, Sv fresh from it (no Auto ISO) and the one the run measured, lo not
+             * beyond G = MAX(Sv, ISO 100) - 7680 (Rev. 2, S1-02) */
+            struct pw_snap s;
+            pw_snap_read(&s);
+            int sv_now = (int) (s.g.iso & 0xFFFF);
+            if (((lo | hi | base) & (R6PW_GRID - 1)) || lo < R6PW_TV_MIN || hi > R6PW_TV_MAX || lo > hi
+                || base < lo || base > hi || (s.g.v & PW_V_ALL) != PW_V_ALL || !sv_now || sv_now != sv
+                || lo < MAX(sv, R6PW_SV_ISO100) - R6PW_ETTR_GSV) return R6PW_L_NEW;
+        }
         if (pw_mk_read(0, 0) >= 0) return R6PW_L_MKEPT;   /* a marker file this arm did not write (the boot check reads it) */
-        int n = pw_mk_line(l, sizeof(l), base, ctx, 0);
+        int n = pw_mk_line(l, sizeof(l), base, ctx, 0);    /* "ctx=4" for ETTR */
         /* a failed write can leave the created file (empty or short, e.g. a full card): removed, since no file existed
          * before (checked just above), so the next Start writes a new one instead of finding MARKER_KEPT (review round
          * 2, L2-5) */
@@ -1549,6 +1711,10 @@ int _r6pw_arm(int ctx, int base)
         S.landed_ae = S.landed_ae2 = 0;
         S.landed_v = S.landed_v2 = 0;
         S.landed_ok = S.landed_ok2 = 0;
+        S.mk_ctx = ctx;
+        S.e_lo = ctx == R6PW_CTX_ETTR ? lo : 0;
+        S.e_hi = ctx == R6PW_CTX_ETTR ? hi : 0;
+        S.e_sv = ctx == R6PW_CTX_ETTR ? sv : 0;
     }
     else if (ctx == R6PW_CTX_BACK)
     {
@@ -1556,17 +1722,23 @@ int _r6pw_arm(int ctx, int base)
         /* review round 2 (S2-1): ML's Tv may be set in two other modes: a third one could not be recorded, so the user
          * sets those modes first (one of them resolved admits "Tv back" again) */
         if (pw_land_open1() && pw_land_open2()) return R6PW_L_MKEPT;
-        int b = 0, ae = 0, v = 0, ae2 = 0, v2 = 0, n = pw_mk_read(buf, sizeof(buf) - 1);
-        if (n < 0 || !pw_mk_parse(buf, &b, &ae, &v, &ae2, &v2) || b != S.base)
+        int b = 0, c = 0, ae = 0, v = 0, ae2 = 0, v2 = 0, n = pw_mk_read(buf, sizeof(buf) - 1);
+        if (n < 0 || !pw_mk_parse(buf, &b, &c, &ae, &v, &ae2, &v2) || b != S.base)
         {
             n = pw_mk_line(l, sizeof(l), S.base, ctx, 1);   /* missing: re-written (with the landed records) and confirmed */
             if (pw_mk_write(l, n)) return R6PW_L_MARKER;
             S.mk_boot = 1;
+            S.mk_ctx = R6PW_CTX_BACK;                       /* M11.1: the line this arm wrote */
         }
         if (S.marker < 1) S.marker = 2;
     }
     else return R6PW_L_ARMED;
     S.armed = ctx;
+    S.e_ctx = ctx;                           /* M11.1: only the arm resets the counts (plan 4.5) */
+    S.e_calls = 0;
+    S.e_steps = 0;
+    S.e_back = 0;
+    S.e_okm[0] = S.e_okm[1] = 0;
     S.se_done = 0;
     /* evidence reference: the consumer sample the caller's decision rested on (this tick's, fresh), else the time before
      * the marker file I/O; a dial click delivered during that I/O is the user's (no request open, ML wrote nothing since)
@@ -1578,6 +1750,21 @@ int _r6pw_arm(int ctx, int base)
     if (t_in - t_ref > R6PW_FRESH_MS || t_ref - t_in > 0) t_ref = t_in;
     pw_sticky_reset(get_ms_clock(), t_ref - 1);
     return 0;
+}
+
+/* the bracket and "Tv back" (r6_interval.c); M11.1: an ETTR arm only through _r6pw_arm_ettr (its limits and Sv) */
+int _r6pw_arm(int ctx, int base)
+{
+    if (ctx == R6PW_CTX_ETTR) return R6PW_L_ARMED;
+    return pw_arm(ctx, base, 0, 0, 0);
+}
+
+/* M11.1 (spec m11/m111 3.2): r6_ettr.c, r6_iv_task, right before write 1 of an "Apply once" run: the marker R6TV.LCK
+ * ctx=4, the run's limits lo / hi and Sv for row 5, the counts reset. No write */
+int _r6pw_arm_ettr(int base, int lo, int hi, int sv)
+{
+    if (!pw_task()) return R6PW_L_TASK;
+    return pw_arm(R6PW_CTX_ETTR, base, lo, hi, sv);
 }
 
 int __attribute__((noinline)) _r6pw_back(void)
@@ -1668,14 +1855,15 @@ static void pw_boot(int now)
         pw_bk_read = 1;
         int n = pw_mk_read(l, sizeof(l) - 1);
         if (n < 0 || S.mk_boot) { S.boot_done = 1; return; }   /* no marker (or one this boot wrote) */
-        int base = 0, ae = 0, v = 0, ae2 = 0, v2 = 0;
-        if (!pw_mk_parse(l, &base, &ae, &v, &ae2, &v2))
+        int base = 0, ctx = 0, ae = 0, v = 0, ae2 = 0, v2 = 0;
+        if (!pw_mk_parse(l, &base, &ctx, &ae, &v, &ae2, &v2))
         {
             pw_note(1, "R6TV.LCK unreadable: check Tv in M.");
             pw_mk_delete();
             S.boot_done = 1;
             return;
         }
+        S.mk_ctx = S.e_ctx = ctx;            /* M11.1: whose run was cut off (texts, a re-written line) */
         S.base = base;
         S.landed_ae = ae;
         S.landed_v = v;
@@ -1700,8 +1888,8 @@ static void pw_boot(int now)
     t[0] = 0;
     int parts = !mok + !!la + !!lb;
     if (parts == 1 && !mok)
-        snprintf(t, sizeof(t), "Tv in M %s, not yours %s:\nML bracket cut off. R6 Interval >\nTv back, or turn the dial.",
-            _r6pw_tvs(a, r), _r6pw_tvs(b, S.base));
+        snprintf(t, sizeof(t), "Tv in M %s, not yours %s:\n%s cut off. R6 Interval >\nTv back, or turn the dial.",
+            _r6pw_tvs(a, r), _r6pw_tvs(b, S.base), S.mk_ctx == R6PW_CTX_ETTR ? "ETTR run" : "ML bracket");   /* M11.1 (3.8) */
     else if (parts == 1)
     {
         int ae = la ? S.landed_ae : S.landed_ae2, k = la ? la : lb;
@@ -1805,6 +1993,14 @@ static int pw_pend_due(int now)
         e->fl |= R6PW_FL_USER;
         pw_rec_end(e, R6PW_R_TOOK_OVER, R6PW_L_LAST);
         pw_note(1, "Tv %s is yours; ML did not restore it.", _r6pw_tvs(a, u));
+        pw_pend_end();
+        return 0;
+    }
+    /* M11.1 (E6; Rev. 2 S1-03): an ETTR pending restore with the budget spent can never run (row 5): the offer at once.
+     * After the fix in _r6pw_event_stop it cannot arise; this is the second barrier (L2-1 above stays untouched) */
+    if (S.e_ctx == R6PW_CTX_ETTR && S.e_calls >= R6PW_ETTR_N + 1)
+    {
+        pw_offer();
         pw_pend_end();
         return 0;
     }
@@ -1930,7 +2126,8 @@ static const char * const pw_res_names[R6PW_NRES] = {
     "-", "ok", "refused", "done", "no confirmation", "shutdown", "user", "user, ML open", "clamped", "dependent",
     "mode", "mode, open", "landed", "crossed", "took over", "late applied", "late seen",
 };
-static const char * const pw_kind_names[R6PW_NKINDS] = { "-", "step", "restore", "restore_stop", "restore_pend", "clampfix", "back" };
+static const char * const pw_kind_names[R6PW_NKINDS] = { "-", "step", "restore", "restore_stop", "restore_pend", "clampfix", "back",
+                                                         "ettr" };
 
 const char * _r6pw_lock_name(int l) { return (l >= 0 && l < R6PW_NLOCKS) ? pw_lock_names[l] : "?"; }
 const char * _r6pw_res_name(int r) { return (r >= 0 && r < R6PW_NRES) ? pw_res_names[r] : "?"; }

@@ -187,6 +187,12 @@
  * member's confirmed write and right before each member's picture (one histogram read, no sleep, no drawing, no card
  * I/O; nothing while R6 ETTR's Mode is Off). The bracket's writes, presses, locks and timing stay as they are.
  *
+ * M11.1 (spec m11/m111 spec_m111.md 2.2, 2.3, 3.10, X2): R6 ETTR's "Apply once" is command 6 of the menu (r6_ettr.c sets
+ * its request, _r6iv_ettr_cmd queues it). Its run steps in r6_iv_task (iv_tick: _r6ettr_run_tick, no sleep of its own;
+ * the writes go through r6_propw.c like the bracket's). It waits like "Tv back to ..." (_r6iv_cmd_wait, the same M10.2b
+ * rules, command 5 unchanged). While a run is active or requested, Start, Test, R6 Motion and "Tv back to ..." are
+ * refused (R6IV_CAM_ETTR); a Trash press during a run stops it (r6_iv_menu_block, answer Q1 a).
+ *
  * Canon's screen saver / eco mode (GUI mode 0xE08E / 0xE08F) ends a series:
  * ML cannot wake the camera without a new Canon input. Canon's auto power
  * off and screen off cannot be held off without a write: the user sets them
@@ -265,8 +271,7 @@ extern int CC_SW2_CBR(int status);   /* [cc+0xE0] = status; post 0x20001000 / 0x
 #define R6IV_BKT_WRITE_MS    700   /* M10.2: per Tv write: 500 confirmation + 200 settle */
 #define R6IV_BACK_MAX_MS   60000   /* M10.2b: "Tv back to ...": once the ML menu hold is over, the wait for Canon's LV hold
                                     * ends after this (dropped); the ML menu itself has no limit (user decision 2026-10-06) */
-#define R6IV_MENU_TASK "GuiMainTask"   /* M10.2: ML's menu key handling runs here (src/gui.c ml_gui_main_task, the
-                                        * TASK_OVERRIDE of Canon's gui_main_task, stubs.S task_create("GuiMainTask")) */
+/* R6IV_MENU_TASK: r6_interval.h (M11.1: r6_ettr.c checks it as well) */
 /* M9.2: bulb with Canon's bulb timer. The menu texts name the limits as Canon shows them ("0:00:31 .. 0:30:00"):
  * change them together with R6IV_BULB_MIN_S / R6IV_BULB_MAX_S (no division by 60 / 3600 in this file) */
 #define R6IV_BULB_MIN_S       31   /* M9.2: Canon bulb timer at least this (shorter: M, Tv up to 30 s) */
@@ -363,7 +368,8 @@ CONFIG_INT("r6.iv.bkt.order", r6_iv_bkt_order, 0);      /* M10.2: 0 "0 - +", 1 "
 
 static struct r6_iv_stats st;
 static struct r6_iv_last L;              /* last picture: snapshots and trace (r6_iv_task writes) */
-static volatile int iv_cmd = 0;          /* menu -> task: 1 = start, 2 = stop, 3 = test (last press wins) */
+static volatile int iv_cmd = 0;          /* menu -> task: 1 = start, 2 = stop, 3 = test (last press wins); 4 motion start,
+                                          * 5 "Tv back to ...", M11.1: 6 R6 ETTR "Apply once" (only while 0) */
 static int iv_refused_cam = R6IV_CAM_OK; /* why the last Start / Test was refused (menu) */
 static volatile int iv_t_menu = -100000; /* last time the task saw the ML menu open */
 static volatile int iv_t_menu_wanted = -100000; /* last Trash press blocked during a picture (menu task); review F3: and
@@ -474,6 +480,7 @@ static const char * const iv_cam_names[] = {
     "WB bracketing on", "Canon HDR mode on", "multiple exposure on", "focus bracketing on", "multi-shot NR on",   /* M10.2 */
     "bracket: M only", "Tv writes", "bracket Tv list", "bracket: over 50 pictures",
     "Tv write open: no ML pictures until restart", "not from the ML menu",
+    "R6 ETTR running",                                                                                  /* M11.1 */
 };
 /* every enum value has its name (a missing one would be a NULL %s) */
 typedef char iv_stop_names_complete[COUNT(iv_stop_names) == R6IV_NSTOPS ? 1 : -1];
@@ -501,6 +508,12 @@ int r6_iv_in_pic(void) { return iv_in_pic; }                                    
 static int iv_md_run(void) { return st.running && st.mode != R6IV_MODE_INTERVAL; }
 int r6_iv_md_running(void) { return iv_md_run() || iv_cmd == 4; }
 int r6_iv_md_refused(void) { return iv_md_refused; }
+/* M11.1 (X2): an R6 ETTR "Apply once" run is active or requested: Start, Test, R6 Motion and "Tv back" are refused */
+#ifdef CONFIG_R6_ETTR
+static int iv_ettr_busy(void) { return r6_ettr_busy(); }
+#else
+static int iv_ettr_busy(void) { return 0; }
+#endif
 /* M10.2b: a refusal with its reason (the Bracket details of iv_bkt_check / iv_begin are set before), counted as before */
 static void iv_refuse(int c, int src)
 {
@@ -514,6 +527,20 @@ static void iv_refuse(int c, int src)
     e->tv = c == R6IV_CAM_BKT_LIST ? iv_refused_tv : 0;
     iv_ref_n++;
     st.refused++;
+}
+/* M11.1 (spec m11/m111 3.10): R6 ETTR's refusals (src 7 menu, 8 dropped before write 1) in the same log ring, without
+ * st.refused++; code = R6ETT_A_*, lock = the Tor 1 row (A_TVW), the result (A_WRITE) or the advisor's reason (A_ADV) */
+void r6_iv_ref_add(int src, int code, int lock)
+{
+    struct r6_iv_ref * e = &iv_ref_ring[iv_ref_n % R6IV_REF_RING];
+    e->t = get_ms_clock();
+    e->src = src;
+    e->cam = code;
+    e->lock = lock;
+    e->pad = 0;
+    e->bk = 0;
+    e->tv = 0;
+    iv_ref_n++;
 }
 int r6_iv_refusal(int i, struct r6_iv_ref * e)
 {
@@ -1098,6 +1125,15 @@ static int iv_bulb_canon_running(void)
  * press), the press time stamp is kept as well */
 int r6_iv_menu_block(void)
 {
+#ifdef CONFIG_R6_ETTR
+    if (r6_ettr_menu_lock())                 /* M11.1: phase >= MEASURE: the press stops the run (spec m11/m111 2.8, Q1 a) */
+    {
+        st.menu_blocked++;
+        _r6ettr_trash();                     /* one store (volatile et_trash), the run acts in r6_iv_task (2.5, 2.8) */
+        NotifyBox(3000, "R6 ETTR: Apply stops.\nPress Trash again for the ML menu.");
+        return 1;
+    }
+#endif
     int ovr = iv_bulb_ovr && iv_bulb_canon_running();     /* M9.2: after STOP_BULB_OVERRUN while Canon's bulb still runs */
     int evb = _r6pw_ev_on();                              /* M10.2: a bracket event or its restore runs (spec 4.7) */
     if (!iv_in_pic && !ovr && !evb) return 0;
@@ -1168,7 +1204,7 @@ static int iv_bkt_check(int test, int * base)
 static void iv_begin(int now, int test)
 {
     int mode0 = shooting_mode;               /* review round 2: the mode the checks below see */
-    int c = r6_iv_cam_check();
+    int c = iv_ettr_busy() ? R6IV_CAM_ETTR : r6_iv_cam_check();   /* M11.1 (X2): the second barrier in the task */
     if (c == R6IV_CAM_OK && shooting_mode != mode0) c = R6IV_CAM_MODE;
     int bkm = iv_bkt_mode(), base = 0;
     if (c == R6IV_CAM_OK && bkm)                 /* M10.2: spec 4.3, in the task; base = the stable-M Tv (row 36) */
@@ -1233,7 +1269,7 @@ static int iv_md_check(int shoot)
 static void iv_begin_md(int now, int shoot)
 {
     int mode0 = shooting_mode;
-    int c = iv_md_check(shoot);
+    int c = iv_ettr_busy() ? R6IV_CAM_ETTR : iv_md_check(shoot);   /* M11.1 (X2): the second barrier in the task */
     if (c == R6IV_CAM_OK && shooting_mode != mode0) c = R6IV_CAM_MODE;
     if (c == R6IV_CAM_OK && r6_md_begin(now, shoot)) c = R6IV_CAM_MD_MEM;
     if (c != R6IV_CAM_OK)
@@ -2170,21 +2206,32 @@ static void iv_back_drop_now(const char * why, int notice)
  * running 2.9 s: refused (row 12), no retry. User decision 2026-10-06: no LV once the menu hold is over (Canon MENU,
  * playback, screen off), or LV gone during its hold, drops the command at once with a notice outside the ML menu (no
  * late write); the LV hold may take R6IV_BACK_MAX_MS. _r6pw_back then waits for the other wait rows (change B); LV lost
- * in that wait drops it as well (R6PW_R_NONE, M10.2b review S1). A run started meanwhile drops it as well (iv_tick) */
-static void iv_back_tick(int now)
+ * in that wait drops it as well (R6PW_R_NONE, M10.2b review S1). A run started meanwhile drops it as well (iv_tick).
+ * M11.1 (spec m11/m111 2.3): the wait is a helper shared with R6 ETTR's command 6, behaviour unchanged for command 5 */
+int _r6iv_cmd_wait(int now, int t_cmd, int * t_lvw)
 {
-    int t0 = iv_back_t & ~1;             /* taken at (now | 1): on that tick now can be iv_back_t - 1 (QEMU m102 K2) */
-    if (now < t0) { iv_back_drop_now("clock went back", 2); return; }
-    if (now - t0 < R6IV_TEST_MS) return;
+    int t0 = t_cmd & ~1;                 /* taken at (now | 1): on that tick now can be t_cmd - 1 (QEMU m102 K2) */
+    if (now < t0) return R6IV_CW_CLOCK;
+    if (now - t0 < R6IV_TEST_MS) return R6IV_CW_WAIT;
     int h = _r6iv_holds(now);
-    if (h == R6IV_HOLD_MENU) { iv_back_lvw = 0; return; }   /* the ML menu open or just closed */
-    if (h == R6IV_HOLD_NOLV) { iv_back_drop_now("no live view", 1); return; }
+    if (h == R6IV_HOLD_MENU) { *t_lvw = 0; return R6IV_CW_WAIT; }   /* the ML menu open or just closed: no limit */
+    if (h == R6IV_HOLD_NOLV) return R6IV_CW_NOLV;                    /* Canon MENU, playback, screen off */
     if (h == R6IV_HOLD_LV)
     {
-        if (!iv_back_lvw) iv_back_lvw = now | 1;
-        else if (now - (iv_back_lvw & ~1) > R6IV_BACK_MAX_MS) iv_back_drop_now("live view not steady", 2);
-        return;
+        if (!*t_lvw) *t_lvw = now | 1;
+        else if (now - (*t_lvw & ~1) > R6IV_BACK_MAX_MS) return R6IV_CW_STEADY;
+        return R6IV_CW_WAIT;
     }
+    return R6IV_CW_GO;
+}
+
+static void iv_back_tick(int now)
+{
+    int w = _r6iv_cmd_wait(now, iv_back_t, &iv_back_lvw);
+    if (w == R6IV_CW_CLOCK) { iv_back_drop_now("clock went back", 2); return; }
+    if (w == R6IV_CW_NOLV) { iv_back_drop_now("no live view", 1); return; }
+    if (w == R6IV_CW_STEADY) { iv_back_drop_now("live view not steady", 2); return; }
+    if (w == R6IV_CW_WAIT) return;
     iv_back_t = 0;
     iv_back_lvw = 0;
     if (_r6pw_back() == R6PW_R_NONE) iv_back_drop_now("no live view", 0);   /* LV lost in change B's wait (review S1) */
@@ -2240,12 +2287,26 @@ static void iv_tick(int now, int dt)
 #endif
         else if (c == 2 && st.running) iv_end(R6IV_STOP_USER, 0, 0);
         else if (c == 5 && !st.running) { iv_back_t = now | 1; iv_back_why = 0; iv_back_drop = 0; iv_back_lvw = 0; }   /* M10.2: "Tv back to ..." */
+#ifdef CONFIG_R6_ETTR
+        else if (c == 6)                                   /* M11.1: R6 ETTR "Apply once" (spec m11/m111 3.10) */
+        {
+            if (!st.running && !iv_back_t) _r6ettr_run_begin(now);
+            else _r6ettr_run_refused(now, R6ETT_A_BUSY);
+        }
+#endif
     }
     /* M10.2b: a series, Test or R6 Motion run started after "Tv back to ..." was selected drops the command (no write
      * during or after the run; the offer stays, select it again); Start is not refused for it */
     if (iv_back_t && st.running)
         iv_back_drop_now(st.mode != R6IV_MODE_INTERVAL ? "R6 Motion started" : st.test ? "Test started" : "series started", 0);
     if (iv_back_t && !st.running) iv_back_tick(now);
+#ifdef CONFIG_R6_ETTR
+    if (r6_ettr_run_active())                              /* M11.1: one step of the run per tick (r6_ettr.c, no sleep) */
+    {
+        if (st.running) _r6ettr_run_stop(now, R6ETT_A_SERIES);   /* never expected (X2 refuses Start / Test / Motion) */
+        else _r6ettr_run_tick(now);
+    }
+#endif
     if (!st.running) return;
 #ifdef CONFIG_R6_MOTION
     if (st.mode != R6IV_MODE_INTERVAL) { iv_tick_md(now); return; }
@@ -2336,13 +2397,26 @@ int _r6iv_bkt_armable(void) { return st.running && st.mode == R6IV_MODE_INTERVAL
  * handling calls them, never from a module or Lua's menu API */
 static int __attribute__((noinline)) iv_menu_caller(void) { return streq(get_current_task_name(), R6IV_MENU_TASK); }
 
+#ifdef CONFIG_R6_ETTR
+/* M11.1 (spec m11/m111 2.2 point 12, 3.10; Rev. 2 S1-04 / S1-07): R6 ETTR's "Apply once" queues command 6 for r6_iv_task.
+ * Menu task only; nothing running, no other command queued, no "Tv back" waiting. The caller set its request (ap_req)
+ * before, so a command 6 r6_iv_task takes always finds it */
+int _r6iv_ettr_cmd(void)
+{
+    if (!iv_menu_caller()) return R6IV_CAM_CALLER;
+    if (st.running || iv_cmd || iv_back_t) return R6IV_CAM_BUSY;
+    iv_cmd = 6;
+    return R6IV_CAM_OK;
+}
+#endif
+
 /* ---- menu ---- */
 #ifdef CONFIG_R6_MOTION
 /* M9.3: R6 Motion's Start / Stop (menu task); every Start while the other series runs is refused */
 int r6_iv_md_start(void)
 {
     int shoot = r6_md_shoot_setting();
-    int c = (st.running || iv_cmd) ? R6IV_CAM_BUSY : iv_md_check(shoot);
+    int c = (st.running || iv_cmd) ? R6IV_CAM_BUSY : iv_ettr_busy() ? R6IV_CAM_ETTR : iv_md_check(shoot);   /* M11.1: X2 */
     if (c != R6IV_CAM_OK)
     {
         iv_md_refused = c;
@@ -2366,7 +2440,8 @@ static MENU_SELECT_FUNC(iv_start_stop)
     if (iv_cmd == 2) return;                 /* Stop pressed, not taken over by the task yet */
     if (r6_iv_md_running()) { iv_refused_cam = R6IV_CAM_BUSY; iv_refuse(R6IV_CAM_BUSY, R6IV_REF_START); return; }   /* M9.3: never stops a motion run */
     if (st.running || iv_cmd == 1 || iv_cmd == 3) { iv_cmd = 2; return; }
-    int c = iv_menu_caller() ? r6_iv_cam_check() : R6IV_CAM_CALLER;   /* M10.2: only ML's menu starts */
+    int c = !iv_menu_caller() ? R6IV_CAM_CALLER : iv_ettr_busy() ? R6IV_CAM_ETTR : r6_iv_cam_check();   /* M10.2: only ML's
+                                                                                                          * menu starts; M11.1: X2 */
     if (c == R6IV_CAM_OK && iv_bkt_mode()) c = iv_bkt_check(0, 0);     /* M10.2: spec 4.3 */
     else if (c == R6IV_CAM_OK && iv_interval_fit(iv_interval_s(), 0, 0) == 2) c = R6IV_CAM_INTERVAL;   /* M8.2: < Tv + 2 s */
     if (c != R6IV_CAM_OK)
@@ -2524,7 +2599,8 @@ static MENU_SELECT_FUNC(iv_test_select)
 {
     if (r6_iv_md_running()) { iv_refused_cam = R6IV_CAM_BUSY; iv_refuse(R6IV_CAM_BUSY, R6IV_REF_TEST); return; }   /* M9.3 */
     if (st.running || iv_cmd != 0) return;
-    int c = iv_menu_caller() ? r6_iv_cam_check() : R6IV_CAM_CALLER;   /* M10.2: only ML's menu starts */
+    int c = !iv_menu_caller() ? R6IV_CAM_CALLER : iv_ettr_busy() ? R6IV_CAM_ETTR : r6_iv_cam_check();   /* M10.2: only ML's
+                                                                                                          * menu starts; M11.1: X2 */
     if (c == R6IV_CAM_OK && iv_bkt_mode()) c = iv_bkt_check(1, 0);     /* M10.2: spec 4.3 */
     if (c != R6IV_CAM_OK)
     {
@@ -2784,7 +2860,8 @@ static MENU_SELECT_FUNC(iv_back_select)
         : p->open ? "write open"
         : (p->landed_ae && !p->landed_ok && p->landed_ae2 && !p->landed_ok2) ? "ML's Tv in 2 modes: set them first"
         : shooting_mode != SHOOTMODE_M ? "set M first" : p->armed ? "busy"
-        : (st.running || iv_cmd) ? "series running" : 0;   /* M10.2 review round 2 (S2-1): two open landed records */
+        : (st.running || iv_cmd) ? "series running"         /* M10.2 review round 2 (S2-1): two open landed records */
+        : iv_ettr_busy() ? "R6 ETTR running" : 0;           /* M11.1: X2 */
     iv_back_why = why;
     if (!why) iv_cmd = 5;
 }
