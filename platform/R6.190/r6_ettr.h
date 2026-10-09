@@ -119,7 +119,7 @@ enum {
 #define R6ETT_H_FLICK   0x08   /* anti-flicker on and Tv (now or proposed) shorter than 1/100 */
 #define R6ETT_H_STYLE   0x10   /* M11.1: a picture style other than Standard (raw 0x81), known: the curve is Standard's */
 #define R6ETT_H_RANGE   0x20   /* bit 4 of [0x1427F8] (simulation out of range); M11.1: also R6ETT_M_RANGE, log bit */
-#define R6ETT_H_ISO     0x40   /* M11.1: Sv >= ISO 12800 (F3): LV "[ISO]" */
+#define R6ETT_H_ISO     0x40   /* Sv >= ISO 12800: log bit and menu info (M11.1b: not in the LV line) */
 #define R6ETT_H_STYLE_NA 0x80  /* M11.1: picture style not delivered (raw 0): menu info only */
 #define R6ETT_H_TV      0x100  /* M11.1 (Q3 a): Tv now or proposed shorter than 1/500, LV vs picture not measured: "[Tv]" */
 
@@ -310,6 +310,12 @@ struct r6_ettr_run {
     uint32_t t_hold;                   /* start (| 1) of a half press held before the arm (X14), 0 = none */
     int cls_last;                      /* frame-rate class of the newest decision since t_conf (2.6 point 6) */
     int lock;                          /* the end's Tor 1 row (A_TVW) / result (A_WRITE) / advisor reason (A_ADV) */
+    /* M11.1b (B2): the Tv deliveries since the command (et_h ring), r6_iv_task only */
+    uint32_t hn0, hn;                  /* et_hn at the command; the next delivery not yet looked at */
+    uint32_t mv_t;                     /* time of the first foreign delivery (0 none) */
+    int16_t mv_v;                      /* its value (0x7FFF none) */
+    uint8_t mv;                        /* 0 none, 1 a delivery with another value / length, 2 ET_HRING or more since the last look */
+    uint8_t sh_n;                      /* AP_WAIT ticks in a row whose only Tv difference is the sheet (K11) */
 };
 
 /* M11.1: "Apply once" counters since boot (log ett.apn) */

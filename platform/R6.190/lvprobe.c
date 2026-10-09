@@ -84,6 +84,11 @@
  * main log gets the one line ettr.file= before the ring tail. Read only, every
  * pointer checked; an existing ETT file is never overwritten.
  *
+ * M11.1b: census B prints lv_action_ring / guard.starve only for entries added
+ * after census A (same keys; new guard.starve episodes continue census A's
+ * numbering); the counters are in both. The ETT file has the line ett.mv (R6
+ * ETTR's Tv deliveries since the "Apply once" command).
+ *
  * Addresses: ROM0 1.9.0. Evidence per field: see the comments below and
  * the M7.0 report.
  */
@@ -310,6 +315,13 @@ static volatile uint32_t lp_ring_t[LP_RING];
 static volatile uint32_t lp_ring_v[LP_RING];
 static volatile uint32_t lp_ring_len[LP_RING];
 static volatile uint32_t lp_ring_count = 0;    /* deliveries since boot */
+/* M11.1b (B1): census B prints only the ring entries that came after census A of the same snapshot (the counters stay in
+ * both); lp_a_valid: census A of this snapshot ran (else B prints the full rings, as M11.1) */
+static uint32_t lp_ring_a_n;                   /* lv_action deliveries when census A printed its ring */
+#ifdef CONFIG_R6_REFRESH_GUARD
+static uint32_t lp_starve_a_n;                 /* guard.starve episodes when census A printed its ring */
+#endif
+static int lp_census_b, lp_a_valid;
 
 PROP_HANDLER(PROP_LV_ACTION)
 {
@@ -790,11 +802,19 @@ static void lp_guard_log(struct lp_buf * b)
     LG("starve_max_t", g->starve_max_t);
     LG("starve_n", g->starve_n);
     /* ring, oldest first; mask bits R6G_R_* (refresh_guard.h), end 1 XimrExe 2 piggyback 3 idle */
-    uint32_t n = g->starve_n, cnt = n < R6G_RING ? n : R6G_RING;
-    for (uint32_t i = 0; i < cnt; i++)
+    uint32_t n = g->starve_n, cnt = n < R6G_RING ? n : R6G_RING, i0 = 0, k0 = 0;
+    if (lp_census_b)                                              /* M11.1b (B1): only the episodes after census A */
+    {
+        uint32_t a = lp_starve_a_n, ka = a < R6G_RING ? a : R6G_RING;   /* A printed episodes a - ka .. a - 1 as keys 0 .. ka - 1 */
+        uint32_t e0 = MAX(a, n - cnt);                            /* the first episode B prints (since boot) */
+        i0 = MIN(e0 - (n - cnt), cnt);
+        k0 = e0 - (a - ka);                                       /* its key in A's numbering (>= ka; = i0 while n <= 16) */
+    }
+    else lp_starve_a_n = n;
+    for (uint32_t i = i0; i < cnt; i++)
     {
         const struct r6g_episode * ep = &g->ring[(n - cnt + i) % R6G_RING];
-        snprintf(k, sizeof(k), "guard.starve[%d]", (int) i);
+        snprintf(k, sizeof(k), "guard.starve[%d]", (int) (lp_census_b ? k0 + (i - i0) : i));
         lp_printf(b, "%s.t=%d\n", k, ep->t_start);
         lp_printf(b, "%s.dur_ms=%d\n", k, (int) ep->dur_ms);
         lp_printf(b, "%s.mask=0x%x\n", k, (int) ep->mask);
@@ -1229,6 +1249,7 @@ static void lp_census(struct lp_buf * b, const char * tag)
     uint32_t v;
     int len;
 
+    lp_census_b = tag[0] == 'B' && lp_a_valid;                   /* M11.1b (B1) */
     lp_uc_update();
 
     /* Buffer addresses that M7.1 compares with each other: read back to back
@@ -1271,7 +1292,10 @@ static void lp_census(struct lp_buf * b, const char * tag)
     else lp_printf(b, "lv_action_raw=none\n");
     uint32_t n = lp_ring_count;
     lp_printf(b, "lv_action_ring_count=%d\n", (int) n);
-    for (uint32_t i = (n > LP_RING ? n - LP_RING : 0); i < n; i++)
+    uint32_t i0 = n > LP_RING ? n - LP_RING : 0;
+    if (lp_census_b) i0 = MAX(i0, lp_ring_a_n);                  /* M11.1b (B1): census A printed the others */
+    else lp_ring_a_n = n;
+    for (uint32_t i = i0; i < n; i++)
     {
         lp_printf(b, "lv_action_ring[%d].t=%d\n", (int) i, (int) lp_ring_t[i % LP_RING]);
         lp_printf(b, "lv_action_ring[%d].v=0x%x\n", (int) i, (int) lp_ring_v[i % LP_RING]);
@@ -1509,6 +1533,7 @@ static void lp_census(struct lp_buf * b, const char * tag)
     lp_printf(b, "refresh_wait_us_avg=%d\n", rn ? (int) (lp_ref_wait_sum / rn) : 0);
     lp_printf(b, "refresh_ximr_us_avg=%d\n", rn ? (int) (lp_ref_ximr_sum / rn) : 0);
     lp_census_m72a(b);
+    lp_a_valid = tag[0] == 'A';                                 /* M11.1b (B1): B consumes it; a B without its A prints full rings */
     lp_printf(b, "end_sample=%s\n", tag);
 }
 
@@ -2877,6 +2902,9 @@ static void lp_ett_ap(struct lp_buf * b, const struct r6_ettr_stats * s)
     lp_printf(b, "# ett.base=av,sv,ae,drive,htp,alo,flick,shots,fn (the run basis at the command; Tv: ett.ap base)\n");
     lp_printf(b, "ett.base=0x%04x,0x%04x,%d,0x%x,0x%x,0x%x,0x%x,%d,%d\n", e->av & 0xFFFF, (int) e->sv, (int) e->ae,
         (int) e->drive, (int) e->htp, (int) e->alo, (int) e->flick, e->shots, e->fn);
+    lp_printf(b, "# ett.mv=hn0,hn,mv,v,t (M11.1b: Tv deliveries since the command; mv 1 another value, 2 more than the ring held; "
+                 "v / t the first, only with mv 1; all 0 before the first command: ett.ap no 0)\n");   /* review R1 L1 / R2 L2 */
+    lp_printf(b, "ett.mv=%d,%d,%d,0x%04x,%d\n", (int) r->hn0, (int) r->hn, (int) r->mv, r->mv_v & 0xFFFF, (int) r->mv_t);
     {
         char mb[100];                                                  /* the newest notice as one token */
         const char * m = r6_ettr_msg();

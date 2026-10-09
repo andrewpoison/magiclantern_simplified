@@ -52,7 +52,8 @@
  * is not 0, and the simulation limit G = Tv - Sv (30 s at ISO 100), Sv = max(Sv, ISO 100); 1/3 grid, never B; a
  * clamp shows the rest, a Tv already beyond a limit in the step's direction "beyond limit" (no counter step). Hints
  * only (E9 b, Q3 a): HTP, ALO, ISO L, anti-flicker below 1/100, ISO >= 12800, Tv shorter than 1/500, a picture style
- * other than Standard. The menu and the LV line show the decision with a hysteresis (a new proposal twice in a row).
+ * other than Standard (M11.1b: ISO >= 12800 only as a log bit and a neutral menu info, not in the LV line). The menu and
+ * the LV line show the decision with a hysteresis (a new proposal twice in a row).
  *
  * Read-only traces (plan 6.2): ring raw = 32 ticks of 50 ms after every Tv delivery (dial or ML), also during an R6
  * Interval bracket; ring bk = r6_ettr_trace() from r6_interval.c iv_event; ring m = every second advisor measurement;
@@ -124,7 +125,7 @@ extern int lvprobe_snapshot_busy(void);                      /* lvprobe.c: M11.1
 #define ET_FY_READ_US   40000      /* FaceYuv read longer than this: discarded (K_code 1.4) */
 #define ET_G_ISO100     (-3840)    /* simulation limit Tv - Sv at ISO 100: 30 s (M11.1, Eval 4.3; M11.0: 2 s) */
 #define ET_SV_ISO100     3840      /* Sv of ISO 100 in Code768 (5 x 768) */
-#define ET_SV_ISO12800 0x2400      /* hint [ISO] from ISO 12800 (F3) */
+#define ET_SV_ISO12800 0x2400      /* menu info (log bit) from ISO 12800 (F3; M11.1b: not in the LV line) */
 #define ET_TV_1_100      5120      /* 1/100 s (0x1400) */
 #define ET_TV_500      0x1B00      /* hint [Tv] for Tv shorter than 1/500 (Q3 a, S2-L01) */
 #define ET_TV_4096     0x2400      /* X12 off above 1/4096: Canon's LV clamp (0xE09759C6) */
@@ -278,6 +279,7 @@ static volatile int et_trash = 0;               /* a Trash press during the run 
 static volatile int et_ap_fast = 0;             /* phase >= MEASURE: the advisor steps every tick (1.7) */
 static struct r6_ettr_run ap = { .phase = R6ETTR_AP_IDLE };
 static struct et_basis ap_cmd_b0;               /* the run basis at the command (2.2 point 11) */
+static uint32_t ap_cmd_hn;                      /* M11.1b (B2): et_hn of the command's newest delivery (with ap_cmd_b0) */
 static int et_run_no = 0;
 static struct r6_ettr_w et_ring_w[R6ETTR_W_RING];
 static uint32_t et_w_n = 0;
@@ -347,8 +349,8 @@ PROP_HANDLER(PROP_SHUTTER)
     et_hn = n + 1;
 }
 
-/* M11.1: the newest delivery (any task): 0 = none yet */
-static int et_h_newest(int16_t * v, int * len)
+/* M11.1: the newest delivery (any task); M11.1b: returns the count it belongs to (0 = none yet) */
+static uint32_t et_h_newest(int16_t * v, int * len)
 {
     uint32_t n = et_hn;
     __sync_synchronize();
@@ -356,7 +358,7 @@ static int et_h_newest(int16_t * v, int * len)
     const volatile struct et_h * s = &et_h[(n - 1) & (ET_HRING - 1)];
     *v = s->v;
     *len = s->len;
-    return 1;
+    return n;
 }
 
 /* ---- formatting ---- */
@@ -1318,29 +1320,66 @@ static void ap_halt(int a, int lock)
     else ap_drop(a, lock);
 }
 
-/* the checks of every tick and right before every call (2.8; 0 = none, else R6ETT_A_*); *sw: SW1 / SW2 byte set */
-static int ap_checks(int now, int armed, int * sw)
+/* M11.1b (B2): every Tv delivery since the command, from the handler's ring (not only the newest): one with another value or
+ * length than the base means the dial moved, also if a later one brings the base back; Canon's unchanged re-deliveries (K15:
+ * mode change, Standby at X-sync) pass. ET_HRING or more deliveries since the last look, or the oldest entry overwritten
+ * while read, count as moved. Reads only (r6_iv_task, before the arm); 1 = moved (ap.mv) */
+static int ap_tv_moved(void)
 {
-    struct et_sheet sh;
+    if (ap.mv) return 1;
+    uint32_t n = et_hn, k = ap.hn;
+    __sync_synchronize();                                        /* the entries before the count (the handler's order) */
+    if (n - k > ET_HRING) { ap.mv = 2; ap.hn = n; return 1; }
+    for (; k != n; k++)
+    {
+        const volatile struct et_h * e = &et_h[k & (ET_HRING - 1)];
+        int16_t v = e->v;
+        int len = e->len;
+        if (v != ap.b0.tv || len != ap.b0.len) { ap.mv = 1; ap.mv_v = v; ap.mv_t = e->t; break; }
+    }
+    __sync_synchronize();
+    if (!ap.mv && et_hn - ap.hn >= ET_HRING) ap.mv = 2;          /* delivery ap.hn + 8 may have overwritten a slot we read */
+    ap.hn = n;
+    return ap.mv != 0;
+}
+
+/* M11.1b (B2): the base items of the checks (2.8 points 1-7): every tick from the command's AP_WAIT on, and first in
+ * ap_checks. Nothing of half press, Canon GUI / LV or series (points 8-10: AP_MEASURE and after). wait: AP_WAIT, where a
+ * difference of the sheet's Tv alone must hold two ticks in a row (K11: Canon's Standby entry at X-sync shows another
+ * value there for microseconds; a real change always has a delivery). 0 or R6ETT_A_* */
+static int ap_basis_checks(struct et_sheet * sh, int armed, int wait)
+{
     struct et_basis b;
-    struct r6_iv_cc c;
-    *sw = 0;
     if (_r6pw_sig() || ml_shutdown_requested) return R6ETT_A_SHUTDOWN;
     if (et_trash) return R6ETT_A_TRASH;
     if (et_mode != 2) return R6ETT_A_MODE;
     if (is_movie_mode() || shooting_mode != SHOOTMODE_M || shooting_mode_custom != SHOOTMODE_M) return R6ETT_A_NOTM;
-    if (!et_sheet_read(&sh)) return R6ETT_A_SETCHG;
-    if (sh.ae != 3) return R6ETT_A_NOTM;
-    et_basis(&b, &sh, 0);                                        /* Rev. 2 (S1-10): the full basis */
+    if (!et_sheet_read(sh)) return R6ETT_A_SETCHG;
+    if (sh->ae != 3) return R6ETT_A_NOTM;
+    et_basis(&b, sh, 0);                                         /* Rev. 2 (S1-10): the full basis */
     if (b.av != ap.b0.av || b.sv != ap.b0.sv || b.ae != ap.b0.ae || b.drive != ap.b0.drive || b.htp != ap.b0.htp
         || b.alo != ap.b0.alo || b.flick != ap.b0.flick) return R6ETT_A_SETCHG;
     if (b.shots != ap.b0.shots || b.fn != ap.b0.fn) return R6ETT_A_PIC;
-    if (!armed)                                                  /* X16: Tv until the arm (the newest delivery and the sheet) */
+    if (!armed)                                                  /* X16: Tv until the arm (every delivery, newest, sheet) */
     {
         int16_t v = 0;
         int len = 0;
-        if (!et_h_newest(&v, &len) || v != ap.b0.tv || len != ap.b0.len || sh.tv != ap.b0.tv) return R6ETT_A_TVCHG;
+        /* the ring first, so ap.mv records every foreign delivery (also a plain turn) */
+        if (ap_tv_moved() || !et_h_newest(&v, &len) || v != ap.b0.tv || len != ap.b0.len) return R6ETT_A_TVCHG;
+        if (sh->tv != ap.b0.tv) { if (!wait || ++ap.sh_n >= 2) return R6ETT_A_TVCHG; }   /* AP_WAIT: K11 */
+        else ap.sh_n = 0;
     }
+    return 0;
+}
+
+/* the checks of every tick and right before every call (2.8; 0 = none, else R6ETT_A_*); *sw: SW1 / SW2 byte set */
+static int ap_checks(int now, int armed, int * sw)
+{
+    struct et_sheet sh;
+    struct r6_iv_cc c;
+    *sw = 0;
+    int a = ap_basis_checks(&sh, armed, 0);                      /* M11.1b: points 1-7 (single sheet read, as M11.1) */
+    if (a) return a;
     r6_iv_cc_read(&c);
     *sw = c.df || c.e0;
     if (*sw && armed) return R6ETT_A_HALF;
@@ -1409,6 +1448,7 @@ static void ap_write(int now, int want, const struct r6_ettr_dec * d, int back)
         if (l) { ap_drop(R6ETT_A_TVW, l); return; }
         int16_t v;
         if (!_r6pw_tv_stable(&v) || v != d->tv || v != ap.b0.tv) { ap_drop(R6ETT_A_TVCHG, 0); return; }   /* row 36's rule */
+        if (ap_tv_moved()) { ap_drop(R6ETT_A_TVCHG, 0); return; }   /* M11.1b (B2): the ring once more, right before the arm */
         l = _r6pw_arm_ettr(d->tv, d->lo, d->hi, d->sv);         /* marker R6TV.LCK ctx=4; lo / hi / sv / counts (3.2) */
         if (l) { ap_drop(R6ETT_A_TVW, l); return; }
         ap.armed = 1;
@@ -1573,12 +1613,16 @@ static void ap_kept(void)
     ap_end(end, 0);
 }
 
-/* AP_WAIT (2.3): as "Tv back to ..." (_r6iv_cmd_wait), with the Rev. 2 bounds: the ML menu opened again, 60 s */
+/* AP_WAIT (2.3): as "Tv back to ..." (_r6iv_cmd_wait), with the Rev. 2 bounds: the ML menu opened again, 60 s; M11.1b (B2):
+ * the base checks (2.8 points 1-7) every tick, after these two bounds */
 static void ap_wait_tick(int now)
 {
     if (!gui_menu_shown()) ap.closed = 1;
     else if (ap.closed) { ap_drop(R6ETT_A_REOPEN, 0); return; }
     if (now - (int) (ap.t_cmd & ~1) > R6ETTR_WAIT_MAX_MS) { ap_drop(R6ETT_A_LATE, 0); return; }
+    struct et_sheet sh;
+    int a = ap_basis_checks(&sh, 0, 1);                          /* M11.1b (B2): spec m11/m111b 2.9 (2.3 aligned with X16) */
+    if (a) { ap_drop(a, 0); return; }
     int lw = ap.t_lvw;
     int w = _r6iv_cmd_wait(now, ap.t_cmd, &lw);
     ap.t_lvw = lw;
@@ -1742,6 +1786,8 @@ void _r6ettr_run_begin(int now)
      * bound is never longer; the 3-s wait at most R6ETTR_SKEW_MS shorter while the ML menu holds anyway) */
     ap.t_cmd = t0 - now > 0 ? (uint32_t) (now | 1) : r;
     ap.b0 = ap_cmd_b0;
+    ap.hn0 = ap.hn = ap_cmd_hn;                                  /* M11.1b (B2): every delivery after the command's newest */
+    ap.mv_v = 0x7FFF;
     ap.tv0 = ap.b0.tv;
     ap_ui = AP_UI_NONE;
     et_msg[0] = 0;
@@ -1816,13 +1862,12 @@ static void et_text(char * s, int n, const struct r6_ettr_adv * a, int lv)
         if (a->st == R6ETT_S_HARD) { et_pct(t3, sizeof(t3), a->s); snprintf(s, n, "%sOVER %s: %s (%s)", px, t3, t1, t2); }
         else snprintf(s, n, "%s%s (%s)", px, t1, t2);
     }
-    /* the LV line's hints, order Tv ISO HTP ALO L FL (1.6) */
-    if (lv && (a->hint & (R6ETT_H_TV | R6ETT_H_ISO | R6ETT_H_HTP | R6ETT_H_ALO | R6ETT_H_ISOL | R6ETT_H_FLICK)))
+    /* the LV line's hints, order Tv HTP ALO L FL (1.6; M11.1b B3: no [ISO], the bit stays in the log and the menu's info) */
+    if (lv && (a->hint & (R6ETT_H_TV | R6ETT_H_HTP | R6ETT_H_ALO | R6ETT_H_ISOL | R6ETT_H_FLICK)))
     {
         int l = strlen(s);
-        snprintf(s + l, n - l, " [%s%s%s%s%s%s", a->hint & R6ETT_H_TV ? "Tv " : "", a->hint & R6ETT_H_ISO ? "ISO " : "",
-            a->hint & R6ETT_H_HTP ? "HTP " : "", a->hint & R6ETT_H_ALO ? "ALO " : "", a->hint & R6ETT_H_ISOL ? "L " : "",
-            a->hint & R6ETT_H_FLICK ? "FL " : "");
+        snprintf(s + l, n - l, " [%s%s%s%s%s", a->hint & R6ETT_H_TV ? "Tv " : "", a->hint & R6ETT_H_HTP ? "HTP " : "",
+            a->hint & R6ETT_H_ALO ? "ALO " : "", a->hint & R6ETT_H_ISOL ? "L " : "", a->hint & R6ETT_H_FLICK ? "FL " : "");
         l = strlen(s);
         if (l && s[l - 1] == ' ') s[l - 1] = ']';                /* "[HTP ALO " -> "[HTP ALO]" */
     }
@@ -1893,7 +1938,8 @@ static MENU_SELECT_FUNC(et_apply_select)
     if (is_movie_mode() || lv_movie_select == LVMS_ENABLE_MOVIE || shooting_mode != SHOOTMODE_M
         || shooting_mode_custom != SHOOTMODE_M || !et_sheet_read(&sh) || sh.ae != 3) { et_apply_refuse(R6ETT_A_NOTM, 0); return; }
     if (_r6pw_locks(R6PW_WANT_NONE, R6PW_CLASS_HARD, &l)) { et_apply_refuse(R6ETT_A_TVW, l); return; }
-    if (!et_h_newest(&tv, &len) || len != 2 || (tv & (ET_GRID - 1)) || tv != sh.tv) { et_apply_refuse(R6ETT_A_TV, 0); return; }
+    uint32_t hn = et_h_newest(&tv, &len);
+    if (!hn || len != 2 || (tv & (ET_GRID - 1)) || tv != sh.tv) { et_apply_refuse(R6ETT_A_TV, 0); return; }
     memset(&lim, 0, sizeof(lim));
     et_limits(&lim, &sh, &lw, &hw);                               /* X11, fresh (beyond implies Tv outside lo .. hi) */
     if (lim.lo > lim.hi || tv < lim.lo || tv > lim.hi) { et_apply_refuse(R6ETT_A_LIMITS, 0); return; }
@@ -1903,6 +1949,7 @@ static MENU_SELECT_FUNC(et_apply_select)
     b.len = len;
     b.numpix = 0;
     ap_cmd_b0 = b;
+    ap_cmd_hn = hn;                                               /* M11.1b (B2): with ap_cmd_b0, before ap_req */
     __sync_synchronize();
     ap_req = get_ms_clock() | 1;                                  /* Rev. 2 (S1-07): the request before the command */
     __sync_synchronize();
@@ -1950,13 +1997,16 @@ static MENU_UPDATE_FUNC(et_prop_update)
         char tv[16];
         r6_ettr_tvs(tv, sizeof(tv), a.tv);
         int h = a.hint & ~R6ETT_H_RANGE;
-        if (h & ~(R6ETT_H_STYLE | R6ETT_H_STYLE_NA))              /* 1.6: all six in <= 99 characters */
-            MENU_SET_WARNING(MENU_WARN_ADVICE, "Inexact:%s%s%s%s%s%s. Measured at %s, H %d.", h & R6ETT_H_TV ? " Tv<1/500" : "",
-                h & R6ETT_H_ISO ? " ISO>=12800" : "", h & R6ETT_H_HTP ? " HTP (less RAW)" : "", h & R6ETT_H_ALO ? " ALO on" : "",
-                h & R6ETT_H_ISOL ? " ISO L" : "", h & R6ETT_H_FLICK ? " flicker" : "", tv, (int) a.H);
+        if (h & (R6ETT_H_TV | R6ETT_H_HTP | R6ETT_H_ALO | R6ETT_H_ISOL | R6ETT_H_FLICK))   /* M11.1b: ISO is no warning */
+            MENU_SET_WARNING(MENU_WARN_ADVICE, "Inexact:%s%s%s%s%s. Measured at %s, H %d.", h & R6ETT_H_TV ? " Tv<1/500" : "",
+                h & R6ETT_H_HTP ? " HTP (more RAW)" : "", h & R6ETT_H_ALO ? " ALO on" : "", h & R6ETT_H_ISOL ? " ISO L" : "",
+                h & R6ETT_H_FLICK ? " flicker" : "", tv, (int) a.H);
         else if (h & R6ETT_H_STYLE)
             MENU_SET_WARNING(MENU_WARN_INFO, "Measured at %s: H %d (%s); the curve is for picture style Standard.", tv,
                 (int) a.H, r6_ettr_st_name(a.st));
+        else if (h & R6ETT_H_ISO)                                 /* M11.1b (B3): a neutral info, measured in the M11.1 test */
+            MENU_SET_WARNING(MENU_WARN_INFO, "Measured at %s: H %d (%s). ISO>=12800: measured, no extra error.", tv, (int) a.H,
+                r6_ettr_st_name(a.st));
         else if (h & R6ETT_H_STYLE_NA)
             MENU_SET_WARNING(MENU_WARN_INFO, "Measured at %s: H %d (%s); picture style not readable: curve for Standard.", tv,
                 (int) a.H, r6_ettr_st_name(a.st));
