@@ -369,6 +369,7 @@ int r6_ettr_ring_raw(int i, struct r6_ettr_raw * e);      /* the count (<= R6ETT
 int r6_ettr_ring_bk(int i, struct r6_ettr_bk * e);        /* the count (<= R6ETTR_BK_RING) */
 int r6_ettr_ring_fy(int i, struct r6_ettr_fy * e);        /* the count (<= R6ETTR_FY_RING) */
 const char * r6_ettr_why_name(int w);
+int r6_ettr_pm_text(char * s, int n);    /* M12.0: ett.pm (the pre-menu proposal copy: ok,t_meas,want,saves,shows,drops) */
 const char * r6_ettr_st_name(int s);
 const char * r6_ettr_valid_name(int v);
 void r6_ettr_tvs(char * buf, int n, int tv);              /* Code768 -> "1/125" ("Tv+x.y" off the 1/3 grid) */

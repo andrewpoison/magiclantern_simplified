@@ -184,6 +184,19 @@
  * FEATURE_R6_CANON_HISTOGRAM, CONFIG_R6_INTERVAL, CONFIG_R6_PROPW_TV and (for the LV line) CONFIG_R6_GRID. */
 #define CONFIG_R6_ETTR
 
+/* R6.190 M12.0: "Astro red" (r6_astro.c, Display menu; docs/m12_plan.md Rev. 2, spec m12/m120 spec_m120.md Rev. 2, user
+ * answers of 2026-10-11 E1 a, E2, E5, E6, E8 c, E9, E13 a). Mode "ML only": ML's own palette by meaning in pure red, a level
+ * per output (LCD / EVF 100/50/25/12/150/200 %), mapped in r6_layer.c r6l_build_lut once per conversion; black stays
+ * 0xFF010101 and transparent entries stay exact; saved and on again at boot (no Canon access). The transparent ML menu view
+ * is switched off while it is on. Tor 0f (E2, read only): Debug > LV probe "Display regs" (not saved) reads the status
+ * word of the LCD / EVF output (0xD2823000 / 0xD2833000) about 4 / s and its 13 colour registers only while that output is
+ * on and shown, Canon's display tasks were found on CPU0 and the reading task runs on CPU0, inside one IRQ lock
+ * (r6as_mmio_rd, the only MMIO access; never +0x3010, +0x3020..0x3034, HDMI or Hrady0; nothing after
+ * ml_shutdown_requested), a transition trace 50 / s for 2 s. ML/LOGS/ASTnnnnn.LOG per log snapshot, "Log snapshot in
+ * 10 s" and "Key test" (lvprobe.c). No MMIO write, no Canon RAM write, no property write, no new Canon call. Needs
+ * CONFIG_R6_LAYER_OWNERSHIP, CONFIG_R6_GLOBAL_DRAW, FEATURE_LV_BUFFER_PROBE and CONFIG_R6_ETTR (one file number). */
+#define CONFIG_R6_ASTRO
+
 #define CONFIG_TASK_STRUCT_V2_SMP
 #define CONFIG_TASK_ATTR_STRUCT_V5
 

@@ -802,10 +802,73 @@ static void et_restart(int why, int now)
     if (et_wn || et_ref_have) et_reset(why, now);
 }
 
+/* M12.0 (spec m12/m120 5): the proposal the LV line showed when the ML menu paused live view, for the menu line only.
+ * Written by r6_hist_task (et_shown_update), read by the menu task (seqlock); Apply, et_dec and Tor 1 never read it. */
+#define ET_PM_MS 30000                 /* a copy older than this is not shown (QEMU: variable) */
+struct et_pm { struct r6_ettr_adv a; struct et_basis b; uint32_t hn; int target, q, lng, sht, ok; };
+static struct et_pm et_pm;
+static volatile uint32_t et_pm_seq = 0;            /* odd while r6_hist_task writes */
+static uint32_t et_pm_saves = 0, et_pm_drops = 0;  /* log only (ett.pm) */
+static volatile uint32_t et_pm_shows = 0, et_pm_old = 0;
+
+static void et_pm_track(const struct r6_ettr_adv * a)
+{
+    int save = a->why == R6ETT_W_NOLV && st.shown.why == R6ETT_W_OK && et_b0_have && gui_menu_shown();
+    int drop = !save && et_pm.ok && (a->why != R6ETT_W_NOLV || !gui_menu_shown());
+    if (!save && !drop) return;
+    et_pm_seq++;
+    __sync_synchronize();
+    if (save)
+    {
+        et_pm.a = st.shown; et_pm.b = et_b0; et_pm.hn = et_hn;
+        et_pm.target = et_target; et_pm.q = et_q; et_pm.lng = et_long; et_pm.sht = et_short; et_pm.ok = 1;
+        et_pm_saves++;
+    }
+    else { et_pm.ok = 0; et_pm_drops++; }
+    __sync_synchronize();
+    et_pm_seq++;
+}
+
+/* 1 = the pre-menu copy may be shown now (menu task) */
+static int et_pm_get(struct r6_ettr_adv * a)
+{
+    struct et_pm p = { .ok = 0 };
+    int ok = 0;
+    for (int i = 0; i < 3 && !ok; i++)
+    {
+        uint32_t s1 = et_pm_seq;
+        __sync_synchronize();
+        if (s1 & 1) continue;
+        p = et_pm;
+        __sync_synchronize();
+        ok = et_pm_seq == s1;
+    }
+    if (!ok || !p.ok || !gui_menu_shown()) return 0;
+    if (get_ms_clock() - (int) p.a.t_meas > ET_PM_MS) { et_pm_old++; return 0; }
+    struct et_sheet sh;
+    struct et_basis b;
+    if (et_hn != p.hn || et_target != p.target || et_q != p.q || et_long != p.lng || et_short != p.sht || !et_sheet_read(&sh)) return 0;
+    et_basis(&b, &sh, 0);                 /* the sheet now: av, sv, ae, drive, htp, alo, flick, picture count, file number */
+    b.tv = sh.tv;                         /* the sheet's Tv (X-Sync in standby, M11.1b K11: no copy) */
+    b.len = p.b.len; b.numpix = p.b.numpix;   /* not compared */
+    if (memcmp(&b, &p.b, sizeof(b))) return 0;
+    *a = p.a;
+    et_pm_shows++;
+    return 1;
+}
+
+/* M12.0 (spec 5.2): the ETT line ett.pm = ok,t_meas,want,saves,shows,drops (drops + old) */
+int r6_ettr_pm_text(char * s, int n)
+{
+    return snprintf(s, n, "%d,%d,%d,%d,%d,%d", et_pm.ok, (int) et_pm.a.t_meas, et_pm.a.want, (int) et_pm_saves, (int) et_pm_shows,
+        (int) (et_pm_drops + et_pm_old));
+}
+
 /* M11.1 (1.6): the display's decision. A reason at once; the same proposal as shown, or none shown before, at once;
  * another proposal only when it comes twice in a row */
 static void et_shown_update(const struct r6_ettr_adv * a)
 {
+    et_pm_track(a);
     if (a->why != R6ETT_W_OK || st.shown.why != R6ETT_W_OK || a->want == st.shown.want || a->want == st.hyst_want)
     {
         st.shown = *a;
@@ -1987,13 +2050,21 @@ static MENU_UPDATE_FUNC(et_prop_update)
     char s[64];
     if (!et_mode) { MENU_SET_VALUE("Mode Off"); return; }
     struct r6_ettr_adv a = st.shown;                              /* M11.1: with the hysteresis (1.6) */
+    int pre = a.why == R6ETT_W_NOLV && et_pm_get(&a);         /* M12.0 (spec m12/m120 5.2) */
+    if (a.why == R6ETT_W_NOLV && gui_menu_shown())             /* LV paused by this menu, no valid copy */
+    {
+        MENU_SET_VALUE("paused in menu");
+        MENU_SET_WARNING(MENU_WARN_INFO, "Live view pauses while this menu is open; the proposal returns a few seconds after closing.");
+        return;
+    }
     et_text(s, sizeof(s), &a, 0);
     MENU_SET_VALUE("%s", s);
     if (a.why == R6ETT_W_OK)
     {
         int age = MAX(get_ms_clock() - (int) a.t_meas, 0);
         uint32_t t10 = et_div(age + 50, 100);
-        MENU_SET_RINFO("%d.%ds", (int) et_div(t10, 10), (int) (t10 - 10 * et_div(t10, 10)));
+        if (pre) MENU_SET_RINFO("pre-menu %ds", (int) et_div(age, 1000));   /* M12.0: the copy from before the ML menu */
+        else MENU_SET_RINFO("%d.%ds", (int) et_div(t10, 10), (int) (t10 - 10 * et_div(t10, 10)));
         char tv[16];
         r6_ettr_tvs(tv, sizeof(tv), a.tv);
         int h = a.hint & ~R6ETT_H_RANGE;

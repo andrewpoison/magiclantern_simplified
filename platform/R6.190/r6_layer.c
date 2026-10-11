@@ -127,6 +127,9 @@
 #include "mem.h"
 #include "r6_layer.h"
 #include "refresh_guard.h"        /* M7.5: r6g_canon_activity */
+#ifdef CONFIG_R6_ASTRO
+#include "r6_astro.h"             /* M12.0: r6_astro_pal / r6_astro_map (Astro red, ML only) */
+#endif
 
 #ifdef CONFIG_R6_LAYER_OWNERSHIP
 
@@ -228,9 +231,15 @@ static int r6l_table(uint32_t * layer)
 static int r6l_build_lut(void)
 {
     int fast = 1;
+#ifdef CONFIG_R6_ASTRO
+    uint32_t pal = r6_astro_pal();                /* M12.0: one read per conversion (spec m12/m120 2.3); 0 = colours as today */
+#endif
     for (int i = 0; i < 256; i++)
     {
         uint32_t v = indexed2rgb(i);
+#ifdef CONFIG_R6_ASTRO
+        if (pal) v = r6_astro_map(pal, i, v);
+#endif
         r6l_lut[i] = v;
         int transparent = !(v & 0xFF000000);
         if (transparent != (i == 0 || i == 3)) fast = 0;

@@ -89,6 +89,18 @@
  * numbering); the counters are in both. The ETT file has the line ett.mv (R6
  * ETTR's Tv deliveries since the "Apply once" command).
  *
+ * M12.0 (CONFIG_R6_ASTRO, spec m12/m120 spec_m120.md Rev. 2, 4): every snapshot
+ * writes a third file ML/LOGS/ASTnnnnn.LOG (Astro red and the Tor 0f display
+ * probe of r6_astro.c, read only; MMIO only through its probe read and only
+ * while "Display regs" is ON) and the main log line astro= after ettr.file=.
+ * The capture (lp_capture) only reads; the file numbers are placeholders set
+ * when the files are written (lp_snapshot_do keeps every FIO call). "Log
+ * snapshot in 10 s" captures 10 s after SET (Canon MENU, Q, playback ...) and
+ * writes only after the shooting screen with live view held 1 s within 60 s
+ * (lp_shooting), else it discards the capture. "Display regs" and "Key test"
+ * switch r6_astro.c's probe and colour-key test. The ETT file has ett.pm (R6
+ * ETTR's proposal copy from before the ML menu, display only).
+ *
  * Addresses: ROM0 1.9.0. Evidence per field: see the comments below and
  * the M7.0 report.
  */
@@ -134,6 +146,9 @@
 #endif
 #ifdef CONFIG_R6_ETTR
 #include "r6_ettr.h"
+#endif
+#ifdef CONFIG_R6_ASTRO
+#include "r6_astro.h"
 #endif
 
 /* CONFIG_LIVEVIEW compiles in force_liveview (fake_simple_button(BGMT_LV) in
@@ -2906,6 +2921,12 @@ static void lp_ett_ap(struct lp_buf * b, const struct r6_ettr_stats * s)
                  "v / t the first, only with mv 1; all 0 before the first command: ett.ap no 0)\n");   /* review R1 L1 / R2 L2 */
     lp_printf(b, "ett.mv=%d,%d,%d,0x%04x,%d\n", (int) r->hn0, (int) r->hn, (int) r->mv, r->mv_v & 0xFFFF, (int) r->mv_t);
     {
+        char pm[64];                                                   /* M12.0 (spec m12/m120 5.2): display only */
+        r6_ettr_pm_text(pm, sizeof(pm));
+        lp_printf(b, "# ett.pm=ok,t_meas,want,saves,shows,drops\n");
+        lp_printf(b, "ett.pm=%s\n", pm);
+    }
+    {
         char mb[100];                                                  /* the newest notice as one token */
         const char * m = r6_ettr_msg();
         int i = 0;
@@ -3131,6 +3152,124 @@ static inline __attribute__((always_inline)) int lp_write_ett(struct lp_buf * b,
 }
 #endif
 
+#ifdef CONFIG_R6_ASTRO
+#ifndef CONFIG_R6_ETTR
+#error "lvprobe.c: CONFIG_R6_ASTRO needs CONFIG_R6_ETTR (one file number for LVP / ETT / AST)"
+#endif
+#define LP_AST_SIZE     16384     /* M12.0 (spec m12/m120 4.2): ASTnnnnn.LOG, malloc per snapshot, freed after the write */
+#define LP_DELAY_MS     10000     /* M12.0 (4.3): "Log snapshot in 10 s" captures 10 s after SET ... */
+#define LP_DELAY_MAX_MS 60000     /* ... writes only if the shooting screen is back within 60 s of the capture (else discarded) */
+#define LP_DELAY_LV_MS  1000      /* ... and has held for 1 s */
+static int lp_t_sel = 0, lp_t_cap = 0;
+static int lp_ph_ett = -1, lp_ph_ast = -1;   /* the "?????" of ettr.file= / astro= in the captured text (-1: cut) */
+
+extern int lv_action_raw_get(uint32_t * value, int * len);   /* propvalues.c */
+
+/* M12.0 (spec 4.3, Rev. 2 F5): Canon's shooting screen with live view running - as et_in_lv, also without "LV flag follows
+ * Canon" (OFF after an unclean shutdown) - not in movie mode, no Canon GUI, no ML menu, display on, not magnified, LCD or
+ * EVF (dm_want != 0: exactly that display mask). RAM reads only (no statistics side effect, unlike r6_gd_screen_ok) */
+int lp_shooting(uint32_t dm_want)
+{
+    uint32_t v = 1, m;
+    int len = 0;
+    if (!(lv || (lv_action_raw_get(&v, &len) && len == 4 && v == 0))) return 0;
+    if (is_movie_mode() || CURRENT_GUI_MODE != 0 || gui_state != 0 || gui_menu_shown() || !DISPLAY_IS_ON || lv_dispsize != 1) return 0;
+    m = r6_gd_disp_mask();
+    return dm_want ? m == dm_want : (m == 0x01 || m == 0x10);
+}
+
+/* the 5 digits of n over a "?????" placeholder (same length: log_bytes stays right) */
+static void lp_put5(struct lp_buf * b, int off, int n)
+{
+    char d[8];
+    if (off < 0 || off + 5 > b->len || memcmp(b->p + off, "?????", 5)) return;
+    snprintf(d, sizeof(d), "%05d", n);
+    memcpy(b->p + off, d, 5);
+}
+
+/* ASTnnnnn.LOG next to the LVP file just written, a new file only (as lp_write_ett); inlined into lp_snapshot_do, its
+ * only caller (the FIO calls stay there, canon_gate allow list) */
+static inline __attribute__((always_inline)) int lp_write_ast(struct lp_buf * b, const char * name)
+{
+    if (is_file(name)) return 0;
+    FILE * f = FIO_CreateFile(name);
+    if (!f) return 0;
+    int w = FIO_WriteFile(f, b->p, b->len);
+    FIO_CloseFile(f);
+    return w == b->len;
+}
+#endif
+
+/* M12.0 (spec m12/m120 4.3 step 2, Rev. 2 F9): the capture of a snapshot, both modes. Reads only: no card access, no
+ * notice, no beep, no redraw, no XimrExe, no winsys_sem (gate_m120_ro.sh checks its call tree in the ELF); MMIO only
+ * through r6_astro_ast's probe read and only while "Display regs" is ON. ettr.file / astro carry "?????" placeholders,
+ * set by lp_snapshot_do when the files are written. a = the AST buffer */
+static void __attribute__((noinline)) lp_capture(struct lp_buf * b, struct lp_buf * a, int mode)
+{
+#ifdef CONFIG_R6_ASTRO
+    lp_t_cap = get_ms_clock();
+#else
+    (void) a; (void) mode;
+#endif
+    lp_printf(b, "# LVPROBE M7.0 snapshot\n");
+    lp_printf(b, "# format: key=value; raw words 0x%%08x, counts decimal, 64-bit IBus 0xHI:LO;\n");
+    lp_printf(b, "# NULL = Canon pointer 0; invalid(...) / uncached_unverified(...) = not dereferenced\n");
+    lp_printf(b, "probe_stage=M7.3\n");
+    lp_printf(b, "snapshot_seq=%d\n", ++lp_snap_seq);
+    lp_printf(b, "boot_ms=%d\n", get_ms_clock());
+    lp_printf(b, "ml_build_version=%s\n", build_version);
+    char id[24];
+    snprintf(id, sizeof(id), "%s", build_id);
+    for (char * c = id; *c; c++) if (*c == ' ' || *c == '=') *c = 0;   /* build_id ends with a space */
+    lp_printf(b, "ml_build_id=%s\n", id);
+    lp_census(b, "A");
+    msleep(500);
+    lp_census(b, "B");
+    lp_vmix_poll(b);
+#ifdef CONFIG_R6_INTERVAL
+    lp_iv_log(b);
+#endif
+#ifdef CONFIG_R6_PROPW_TV
+    lp_pw_log(b);                         /* M10.2 */
+#endif
+#ifdef CONFIG_R6_MOTION
+    lp_md_log(b);                         /* M9.3 */
+#endif
+    lp_x_log(b);                          /* M9.1 Tor 0 */
+#ifdef CONFIG_R6_ETTR
+    /* M11.0: one line (at most 30 B, inside the static budget before the ring tail): the second file, Mode, reason, state;
+     * M12.0: the number is set when the files are written */
+    {
+        int off = b->len + 13;            /* "ettr.file=ETT" */
+        lp_printf(b, "ettr.file=ETT?????.LOG,%d,%d,%d\n", r6_ettr_mode(), r6_ettr_mode() ? r6_ettr_stats()->adv.why : R6ETT_W_OFF,
+            r6_ettr_mode() ? r6_ettr_stats()->adv.st : R6ETT_S_NONE);
+        lp_ph_ett = b->trunc ? -1 : off;
+    }
+#endif
+#ifdef CONFIG_R6_ASTRO
+    /* M12.0 (spec 4.1 / 4.2): the AST text (its fresh probe read) and the main log line from the same read */
+    {
+        char t[64];
+        int tr = 0;
+        a->len = r6_astro_ast(a->p, a->cap, &tr);
+        a->trunc = tr;
+        lp_printf(a, "ast.delay=%d,%d,%d,0x%x,%d,%d,%d,%d\n", mode, mode ? lp_t_sel : lp_t_cap, lp_t_cap, CURRENT_GUI_MODE, gui_state, lv,
+            lv_dispsize, gui_menu_shown());
+        r6_astro_main(t, sizeof(t));
+        int off = b->len + 9;             /* "astro=AST" */
+        lp_printf(b, "astro=AST?????.LOG,%s\n", t);
+        lp_ph_ast = b->trunc ? -1 : off;
+    }
+#endif
+#if defined(CONFIG_R6_INTERVAL) && defined(CONFIG_R6_PROPW_TV)
+    lp_ring_tail(b);                      /* M10.2b: the picture / write rings last, down to LP_TAIL_SLACK */
+#endif
+    int trunc = b->trunc;
+    b->cap = LP_LOG_SIZE;                 /* the trailer always fits */
+    lp_printf(b, "log_truncated=%d\n", trunc);
+    lp_printf(b, "log_bytes=%d\n# end\n", b->len);
+}
+
 /* each snapshot goes to a new file: no append, no seek, no overwrite */
 static int lp_write_log(struct lp_buf * b, char * name, int name_size)
 {
@@ -3152,57 +3291,67 @@ static int lp_write_log(struct lp_buf * b, char * name, int name_size)
 }
 
 /* caller holds lp_snap_busy */
-static void lp_snapshot_do(int delay_ms)
+/* M12.0 (spec m12/m120 4.3): mode 0 = now (after delay_ms), 1 = delayed ("Log snapshot in 10 s": captured now, written
+ * when the shooting screen is back). Every FIO call of a snapshot stays in this function (canon_gate layout) */
+static void lp_snapshot_do(int mode, int delay_ms)
 {
     char name[32];
     snprintf(lp_snap_msg, sizeof(lp_snap_msg), "running");
     if (delay_ms) msleep(delay_ms);
     struct lp_buf b = { .p = malloc(LP_LOG_SIZE), .len = 0, .cap = LP_LOG_SIZE - LP_LOG_TAIL, .trunc = 0 };
+#ifdef CONFIG_R6_ASTRO
+    struct lp_buf a = { .p = malloc(LP_AST_SIZE), .len = 0, .cap = LP_AST_SIZE - LP_LOG_TAIL, .trunc = 0 };
+    if (!b.p || !a.p)
+    {
+        if (b.p) free(b.p);
+        if (a.p) free(a.p);
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "no memory");
+        return;
+    }
+#else
     if (!b.p)
     {
         snprintf(lp_snap_msg, sizeof(lp_snap_msg), "no memory");
         return;
     }
+    struct lp_buf a = { 0 };
+#endif
+    lp_capture(&b, &a, mode);             /* M12.0: reads only (spec 4.3 step 2) */
+#ifdef CONFIG_R6_ASTRO
+    int waited = 0;
+    if (mode)
+    {
+        /* step 3: written only after the shooting screen with live view held LP_DELAY_LV_MS, no series, no R6 ETTR run */
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "captured");
+        int t_ok = 0, go = 0;
+        while (get_ms_clock() - lp_t_cap < LP_DELAY_MAX_MS)
+        {
+            msleep(200);
+            int now = get_ms_clock();
+            if (lp_shooting(0) && !r6_iv_running() && !r6_ettr_busy())
+            {
+                if (!t_ok) t_ok = now;
+                if (now - t_ok >= LP_DELAY_LV_MS) { go = 1; break; }
+            }
+            else t_ok = 0;
+        }
+        if (!go)
+        {
+            free(b.p);
+            free(a.p);
+            snprintf(lp_snap_msg, sizeof(lp_snap_msg), "discarded (no LV)");
+            return;
+        }
+        waited = get_ms_clock() - lp_t_cap;
+    }
+#endif
 #ifdef CONFIG_R6_ETTR
-    int no = lp_ett_next_no();            /* M11.0: the number lp_write_log will take (ettr.file) */
+    int no = lp_ett_next_no();            /* M11.0: the number lp_write_log will take (ettr.file; M12.0: astro too) */
+    lp_put5(&b, lp_ph_ett, no);
+#ifdef CONFIG_R6_ASTRO
+    lp_put5(&b, lp_ph_ast, no);
 #endif
-    lp_printf(&b, "# LVPROBE M7.0 snapshot\n");
-    lp_printf(&b, "# format: key=value; raw words 0x%%08x, counts decimal, 64-bit IBus 0xHI:LO;\n");
-    lp_printf(&b, "# NULL = Canon pointer 0; invalid(...) / uncached_unverified(...) = not dereferenced\n");
-    lp_printf(&b, "probe_stage=M7.3\n");
-    lp_printf(&b, "snapshot_seq=%d\n", ++lp_snap_seq);
-    lp_printf(&b, "boot_ms=%d\n", get_ms_clock());
-    lp_printf(&b, "ml_build_version=%s\n", build_version);
-    char id[24];
-    snprintf(id, sizeof(id), "%s", build_id);
-    for (char * c = id; *c; c++) if (*c == ' ' || *c == '=') *c = 0;   /* build_id ends with a space */
-    lp_printf(&b, "ml_build_id=%s\n", id);
-    lp_census(&b, "A");
-    msleep(500);
-    lp_census(&b, "B");
-    lp_vmix_poll(&b);
-#ifdef CONFIG_R6_INTERVAL
-    lp_iv_log(&b);
 #endif
-#ifdef CONFIG_R6_PROPW_TV
-    lp_pw_log(&b);                        /* M10.2 */
-#endif
-#ifdef CONFIG_R6_MOTION
-    lp_md_log(&b);                        /* M9.3 */
-#endif
-    lp_x_log(&b);                         /* M9.1 Tor 0 */
-#ifdef CONFIG_R6_ETTR
-    /* M11.0: one line (at most 30 B, inside the static budget before the ring tail): the second file, Mode, reason, state */
-    lp_printf(&b, "ettr.file=ETT%05d.LOG,%d,%d,%d\n", no, r6_ettr_mode(), r6_ettr_mode() ? r6_ettr_stats()->adv.why : R6ETT_W_OFF,
-        r6_ettr_mode() ? r6_ettr_stats()->adv.st : R6ETT_S_NONE);
-#endif
-#if defined(CONFIG_R6_INTERVAL) && defined(CONFIG_R6_PROPW_TV)
-    lp_ring_tail(&b);                     /* M10.2b: the picture / write rings last, down to LP_TAIL_SLACK */
-#endif
-    int trunc = b.trunc;
-    b.cap = LP_LOG_SIZE;                  /* the trailer always fits */
-    lp_printf(&b, "log_truncated=%d\n", trunc);
-    lp_printf(&b, "log_bytes=%d\n# end\n", b.len);
     int ok = lp_write_log(&b, name, sizeof(name));
     const char * base = name[0] ? name + 8 : "?";     /* without "ML/LOGS/" */
     if (ok) snprintf(lp_snap_msg, sizeof(lp_snap_msg), "%s, %d B", base, b.len);
@@ -3211,21 +3360,39 @@ static void lp_snapshot_do(int delay_ms)
     if (ok)
     {
         /* M11.0: ETTnnnnn.LOG with the number of the LVP file just written, the same buffer filled again; its last
-         * LP_ETT_BINS bytes hold the bins copy */
+         * LP_ETT_BINS bytes hold the bins copy. M12.0: built now (delayed: after the capture, line ett.delayed first) */
         char ename[32];
         int n = lp_file_no;
         uint32_t (*bins)[256] = (uint32_t (*)[256]) (b.p + LP_LOG_SIZE - LP_ETT_BINS);
         b.len = 0;
         b.trunc = 0;
         b.cap = LP_LOG_SIZE - LP_ETT_BINS - LP_LOG_TAIL;
+#ifdef CONFIG_R6_ASTRO
+        if (mode) lp_printf(&b, "ett.delayed=1,%d\n", lp_t_cap);
+#endif
         lp_ett_log(&b, bins, n);
-        trunc = b.trunc;
+        int trunc = b.trunc;
         b.cap = LP_LOG_SIZE - LP_ETT_BINS;
         lp_printf(&b, "log_truncated=%d\n", trunc);
         lp_printf(&b, "log_bytes=%d\n# end\n", b.len);
         snprintf(ename, sizeof(ename), "ML/LOGS/ETT%05d.LOG", n);
         if (!lp_write_ett(&b, ename)) snprintf(lp_snap_msg, sizeof(lp_snap_msg), "%s, ETT FAILED", base);
     }
+#endif
+#ifdef CONFIG_R6_ASTRO
+    if (ok)
+    {
+        /* M12.0 (spec 4.2): ASTnnnnn.LOG with the same number, the closing lines added now */
+        char aname[32];
+        int at = a.trunc;
+        a.cap = LP_AST_SIZE;              /* the closing lines always fit */
+        lp_printf(&a, "ast.write=%d,%d\n", get_ms_clock(), waited);
+        lp_printf(&a, "log_truncated=%d\n", at);
+        lp_printf(&a, "log_bytes=%d\n# end\n", a.len);
+        snprintf(aname, sizeof(aname), "ML/LOGS/AST%05d.LOG", lp_file_no);
+        if (!lp_write_ast(&a, aname)) snprintf(lp_snap_msg, sizeof(lp_snap_msg), "%s, AST FAILED", base);
+    }
+    free(a.p);
 #endif
     free(b.p);
 }
@@ -3235,7 +3402,7 @@ int lvprobe_snapshot_run(int delay_ms)
 {
     if (lp_snap_busy) return 0;
     lp_snap_busy = 1;
-    lp_snapshot_do(delay_ms);
+    lp_snapshot_do(0, delay_ms);
     lp_snap_busy = 0;
     return 1;
 }
@@ -3251,12 +3418,29 @@ static void lp_snapshot_task(int unused)
         snprintf(lp_snap_msg, sizeof(lp_snap_msg), "skipped (ETTR)");
 #endif
     else
-        lp_snapshot_do(0);
+        lp_snapshot_do(0, 0);
 #else
-    lp_snapshot_do(4000);    /* menu closed; user shows the LV screen */
+    lp_snapshot_do(0, 4000); /* menu closed; user shows the LV screen */
 #endif
     lp_snap_busy = 0;
 }
+
+#ifdef CONFIG_R6_ASTRO
+/* M12.0 (spec 4.3): "Log snapshot in 10 s": capture LP_DELAY_MS after SET (any screen: Canon MENU, Q, playback ...),
+ * then the same series / R6 ETTR checks as lp_snapshot_task */
+static void lp_snapdelay_task(int unused)
+{
+    int d = LP_DELAY_MS - (get_ms_clock() - lp_t_sel);
+    if (d > 0) msleep(d);
+    if (r6_iv_running())
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "skipped (interval)");
+    else if (r6_ettr_busy())
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "skipped (ETTR)");
+    else
+        lp_snapshot_do(1, 0);
+    lp_snap_busy = 0;
+}
+#endif
 
 /* ---- status line --------------------------------------------------------- */
 static int lp_status_on = 0;              /* 0 = OFF, 1 = ON, 2 = ON + refresh while DISPLAY_IS_ON == 0 and EVF active */
@@ -3615,6 +3799,57 @@ static MENU_UPDATE_FUNC(lp_snapshot_update)
     if (lp_snap_msg[0]) MENU_SET_VALUE("%s", lp_snap_msg);
 }
 
+#ifdef CONFIG_R6_ASTRO
+/* M12.0 (spec 4.3): the same refusals as "Log snapshot" (menu task, the busy flag set here) */
+static MENU_SELECT_FUNC(lp_snapdelay_select)
+{
+    if (lp_snap_busy)
+    {
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "busy");
+        return;
+    }
+    if (r6_iv_running())
+    {
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "interval running");
+        return;
+    }
+    if (r6_ettr_busy())
+    {
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "ETTR running");
+        return;
+    }
+    lp_snap_busy = 1;
+    lp_t_sel = get_ms_clock();
+    snprintf(lp_snap_msg, sizeof(lp_snap_msg), "starting (10 s)");
+    run_in_separate_task(lp_snapdelay_task, 0);
+}
+
+static int lp_ast_on = 0;                 /* menu mirror of r6_astro_probe_on() */
+static MENU_SELECT_FUNC(lp_ast_toggle)
+{
+    r6_astro_probe_enable(!r6_astro_probe_on());
+    lp_ast_on = r6_astro_probe_on();
+}
+
+static MENU_UPDATE_FUNC(lp_ast_update)
+{
+    lp_ast_on = r6_astro_probe_on();
+    const char * m = r6_astro_probe_msg();
+    if (!lp_ast_on && m[0] == 'n') MENU_SET_VALUE("%s", m);   /* "no memory" */
+}
+
+static MENU_SELECT_FUNC(lp_key_select)
+{
+    r6_astro_key_start();
+}
+
+static MENU_UPDATE_FUNC(lp_key_update)
+{
+    const char * m = r6_astro_key_msg();
+    if (m[0]) MENU_SET_VALUE("%s", m);
+}
+#endif
+
 /* RAM reads only (sparse grid, uncached alias, every pointer checked) */
 static MENU_SELECT_FUNC(lp_fy_select)
 {
@@ -3670,6 +3905,31 @@ static struct menu_entry lp_menu[] = {
                 .help   = "Menu closes; show the LV screen within 4 s -> ML/LOGS/LVP*.LOG",
                 .help2  = "Read-only: Canon RAM values, key=value per line.",
             },
+            #ifdef CONFIG_R6_ASTRO
+            {
+                .name   = "Log snapshot in 10 s",
+                .select = lp_snapdelay_select,
+                .update = lp_snapshot_update,
+                .help   = "Captures 10 s after SET: open MENU, Q, playback... File when LV is back (60 s).",
+                .help2  = "Read-only capture: no notice, no file until LV runs. R6 ETTR Apply is refused until then.",
+            },
+            {
+                .name   = "Display regs",
+                .priv   = &lp_ast_on,
+                .max    = 1,
+                .select = lp_ast_toggle,
+                .update = lp_ast_update,
+                .help   = "Tor 0f: display status 4x/s; the 13 colour registers only while that output is shown.",
+                .help2  = "Read only. Not saved: OFF at boot. Registers in ASTnnnnn.LOG only while ON.",
+            },
+            {
+                .name   = "Key test",
+                .select = lp_key_select,
+                .update = lp_key_update,
+                .help   = "10 s: two 40x40 squares 0xFF010000 (left), 0xFF020000 (right) in ML's pixels.",
+                .help2  = "Close the menu, LCD shooting screen. Note per square: dark, or live view visible.",
+            },
+            #endif
             {
                 .name   = "FaceYuv sample",
                 .select = lp_fy_select,
