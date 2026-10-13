@@ -101,6 +101,11 @@
  * switch r6_astro.c's probe and colour-key test. The ETT file has ett.pm (R6
  * ETTR's proposal copy from before the ML menu, display only).
  *
+ * M12.1 (spec m12/m121 spec_m121.md Rev. 2, 6 / 7): the AST buffer is 32 KB (the
+ * Tor 2 lines and the trace ring of 10); lp_shooting is 0 also in movie mode by
+ * lv_movie_select (the delayed snapshot and the colour-key / red test do not
+ * run in movie standby).
+ *
  * Addresses: ROM0 1.9.0. Evidence per field: see the comments below and
  * the M7.0 report.
  */
@@ -3156,7 +3161,7 @@ static inline __attribute__((always_inline)) int lp_write_ett(struct lp_buf * b,
 #ifndef CONFIG_R6_ETTR
 #error "lvprobe.c: CONFIG_R6_ASTRO needs CONFIG_R6_ETTR (one file number for LVP / ETT / AST)"
 #endif
-#define LP_AST_SIZE     16384     /* M12.0 (spec m12/m120 4.2): ASTnnnnn.LOG, malloc per snapshot, freed after the write */
+#define LP_AST_SIZE     32768     /* M12.0 (spec m12/m120 4.2), M12.1 (m12/m121 6.2): ASTnnnnn.LOG, malloc per snapshot, freed after the write */
 #define LP_DELAY_MS     10000     /* M12.0 (4.3): "Log snapshot in 10 s" captures 10 s after SET ... */
 #define LP_DELAY_MAX_MS 60000     /* ... writes only if the shooting screen is back within 60 s of the capture (else discarded) */
 #define LP_DELAY_LV_MS  1000      /* ... and has held for 1 s */
@@ -3166,14 +3171,15 @@ static int lp_ph_ett = -1, lp_ph_ast = -1;   /* the "?????" of ettr.file= / astr
 extern int lv_action_raw_get(uint32_t * value, int * len);   /* propvalues.c */
 
 /* M12.0 (spec 4.3, Rev. 2 F5): Canon's shooting screen with live view running - as et_in_lv, also without "LV flag follows
- * Canon" (OFF after an unclean shutdown) - not in movie mode, no Canon GUI, no ML menu, display on, not magnified, LCD or
- * EVF (dm_want != 0: exactly that display mask). RAM reads only (no statistics side effect, unlike r6_gd_screen_ok) */
+ * Canon" (OFF after an unclean shutdown) - not in movie mode (M12.1, eval 6.2: also by lv_movie_select, as r6_gdraw.c), no
+ * Canon GUI, no ML menu, display on, not magnified, LCD or EVF (dm_want != 0: exactly that display mask). RAM reads only
+ * (no statistics side effect, unlike r6_gd_screen_ok) */
 int lp_shooting(uint32_t dm_want)
 {
     uint32_t v = 1, m;
     int len = 0;
     if (!(lv || (lv_action_raw_get(&v, &len) && len == 4 && v == 0))) return 0;
-    if (is_movie_mode() || CURRENT_GUI_MODE != 0 || gui_state != 0 || gui_menu_shown() || !DISPLAY_IS_ON || lv_dispsize != 1) return 0;
+    if (is_movie_mode() || lv_movie_select == LVMS_ENABLE_MOVIE || CURRENT_GUI_MODE != 0 || gui_state != 0 || gui_menu_shown() || !DISPLAY_IS_ON || lv_dispsize != 1) return 0;
     m = r6_gd_disp_mask();
     return dm_want ? m == dm_want : (m == 0x01 || m == 0x10);
 }

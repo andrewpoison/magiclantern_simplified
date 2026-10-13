@@ -4,7 +4,9 @@
  * read-only display probe "Tor 0f" (status word of the LCD / EVF output always, its 13 colour registers only while that
  * output is on and shown, on Canon's display core, inside one IRQ lock). Used by r6_layer.c (the palette, once per
  * conversion) and lvprobe.c (menu entries, ASTnnnnn.LOG, the main log line, the shooting-screen test).
- * Nothing here writes MMIO, Canon RAM or a property.
+ * Nothing here writes MMIO, Canon RAM or a property. M12.1 (spec m12/m121 Rev. 2): mode "Full" over Tor 2 (E3 a), the
+ * display matrix of the LCD / EVF in red, written by r6_astro.c's astro task only; the prototypes are unchanged (the main
+ * log line has one field more, "<t2>:<stores>").
  */
 #ifndef _r6_astro_h_
 #define _r6_astro_h_
