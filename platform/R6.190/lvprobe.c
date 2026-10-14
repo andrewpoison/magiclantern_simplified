@@ -3765,6 +3765,8 @@ void r6_autostart(int clean)
     if (clean < 0)
         NotifyBox(10000, "Last shutdown not seen as clean:\nLV flag and Global Draw OFF.");
 }
+/* M12.2 (spec m12/m122 1): the decision above, read only (r6_astro.c, Astro red "Full" at start) */
+int r6_autostart_get(void) { return lp_autostart; }
 #endif
 
 static MENU_SELECT_FUNC(lp_status_toggle)

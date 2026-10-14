@@ -38,4 +38,8 @@ int r6_astro_main(char * s, int n);
  * that display mask. RAM reads only. Also the colour-key test's screen check (LCD: 0x01) */
 int lp_shooting(uint32_t dm_want);
 
+/* lvprobe.c (M12.2, spec m12/m122 1, CONFIG_R6_AUTOSTART): the M7.6 start decision, read only: -2 = r6_autostart not called
+ * yet, 1 = clean shutdown before this boot, 0 / -1 = not clean or unknown. Used by r6_astro.c's start path only */
+int r6_autostart_get(void);
+
 #endif /* _r6_astro_h_ */

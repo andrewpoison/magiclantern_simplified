@@ -18,7 +18,9 @@
  *    read >= 50 ms after it, at most 5 stores per second and output, 3 stores without effect or Canon resets without a
  *    device change within 10 s (or 3 in a row): error off (back to ML only, the standard set, a notice). When Full ends:
  *    Canon's standard set again, by the status bits of each output, also for the output not shown, also later. A saved
- *    Full is not restored at start (M12.1): the astro task sets it to ML only. "Test: 10 s": the LCD in red for 10 s.
+ *    Full comes back at start (M12.2, spec m12/m122, E8 c) only after a clean shutdown (the M7.6 rule, lvprobe.c
+ *    r6_autostart_get): the start path arms it like the menu command once the photo live view ran 3 s; else ML only (also
+ *    saved), with a notice. "Test: 10 s": the LCD in red for 10 s.
  *  - LCD level / EVF level (saved, default 50 %): the level of the output shown (display mask 0x10: EVF).
  *  - The transparent ML menu view (src/menu.c, lv only) is switched off within one task step while the mode is on
  *    (ML functions only; src/menu.c stays unchanged).
@@ -73,9 +75,12 @@
 #if !defined(CONFIG_R6_LAYER_OWNERSHIP) || !defined(CONFIG_R6_GLOBAL_DRAW) || !defined(FEATURE_LV_BUFFER_PROBE)
 #error "r6_astro.c: needs the R6 layer ownership, CONFIG_R6_GLOBAL_DRAW and the LV probe"
 #endif
+#ifndef CONFIG_R6_AUTOSTART
+#error "r6_astro.c (M12.2): Full at start needs the M7.6 clean-shutdown decision (CONFIG_R6_AUTOSTART)"
+#endif
 
 /* ---- settings (E8 c: saved; "ML only" needs no Canon access, so it is on again right at boot) ---- */
-static CONFIG_INT("r6.astro.mode", r6as_mode, 0);    /* 0 Off, 1 ML only, 2 Full (saved; M12.1: a Full without command -> 1) */
+static CONFIG_INT("r6.astro.mode", r6as_mode, 0);    /* 0 Off, 1 ML only, 2 Full (saved; M12.2: a Full without command -> 1, but the start path, 2.2) */
 static CONFIG_INT("r6.astro.lcd",  r6as_lcd, 1);     /* index into r6as_lvl_pct: 1 = 50 % (E6) */
 static CONFIG_INT("r6.astro.evf",  r6as_evf, 1);
 static const uint8_t __attribute__((section(".data"))) r6as_lvl_pct[6] = { 100, 50, 25, 12, 150, 200 };   /* .data, see r6as_addr */
@@ -345,6 +350,20 @@ static uint32_t r6as_dm2 = 0;
 static const char * volatile r6as_test_txt = "idle";
 static const char * volatile r6as_t_why = 0;
 static const char * volatile r6as_t2_msg = 0;
+
+/* ---- M12.2 (spec m12/m122 2, E8 c approved 2026-10-11): Full at start after a clean shutdown. The start path is the only
+ * arming without a menu command: at most once per session, the same effect as the command (armed, cmd_any), then every
+ * M12.1 rule of r6as_mmio_wr / r6as_t2_step unchanged. Only the astro task writes r6as_bst (r6as_t2_state) ---- */
+#define R6AS_BOOT_HOLD_MS 3000   /* E8 c: Full 3 s after the first photo live view (plan 5.3) */
+#define R6AS_BOOT_NOTE_MS 12000  /* "not restored" notice not before 12 s after the seen decision (the M7.6 box: 10 s) */
+enum { R6AS_B_NONE = 0, R6AS_B_DEC, R6AS_B_LV, R6AS_B_ON, R6AS_B_UNCL, R6AS_B_UNKN, R6AS_B_MENU, R6AS_B_SHUT, R6AS_B_NOGO,
+       R6AS_B_INIT };            /* 2.1: DEC / LV wait, every other state but INIT is final */
+static volatile uint8_t r6as_bst = R6AS_B_INIT;
+static int8_t r6as_b_cl = -2, r6as_b_n1 = -1;    /* the seen decision; the output of the first red store after the arming */
+static uint8_t r6as_b_note = 0;
+static int r6as_b_t0 = 0, r6as_b_tdec = 0, r6as_b_hold = 0, r6as_b_tarm = 0, r6as_b_tst1 = 0, r6as_b_tver1 = 0;
+static uint32_t r6as_b_s0 = 0;
+static int r6as_wl_alloc(void);
 
 static int r6as_rd32(uint32_t a, uint32_t * v)
 {
@@ -802,6 +821,13 @@ static void r6as_peek(int n, int r, const struct r6as_wr * o, int now)
     }
 }
 
+/* M12.2 (spec m12/m122 4): the reasons of a start without Full; the notices A / B (NotifyBox as r6as_note) */
+static const char * r6as_bwhy(int bs) { return bs == R6AS_B_UNCL ? "last shutdown not clean" : bs == R6AS_B_UNKN ? "shutdown not seen as clean" : "no command"; }
+static void __attribute__((noinline)) r6as_bnote(int ms, char * fmt, const char * a)
+{
+    if (r6as_tst == R6AS_T_IDLE && !gui_menu_shown()) NotifyBox(ms, fmt, a);
+}
+
 /* the states (4.1, 4.8, 5.4): every task step, no MMIO; 1 = Tor 2 needs its step (Full, the test red / restoring, a
  * restore pending) */
 static int r6as_t2_state(int now)
@@ -824,6 +850,37 @@ static int r6as_t2_state(int now)
         r6as_t_dm2 = now;
         r6as_t2_init = 1;
     }
+    /* M12.2 (spec m12/m122 2.2): the start path, before the command block (fs / ts not yet seen). The first step only: a
+     * saved Full waits for the M7.6 decision (DEC), a clean one for 3 s photo live view (LV); every other state is final */
+    int bs = r6as_bst, cl = r6_autostart_get();
+    if (bs == R6AS_B_INIT) { bs = m == 2 ? R6AS_B_DEC : R6AS_B_NONE; r6as_b_t0 = now; }
+    if (bs == R6AS_B_DEC || bs == R6AS_B_LV)
+    {
+        if (fs != r6as_seen_fs || ts != r6as_seen_ts || m != 2) bs = R6AS_B_MENU;     /* the menu decides */
+        else if (ml_shutdown_requested) bs = R6AS_B_SHUT;                             /* mode stays 2: Full saved (M1) */
+        else if (cl != -2 && bs == R6AS_B_DEC)                                        /* r6_autostart: once per session */
+        {
+            bs = cl == 1 ? R6AS_B_LV : cl ? R6AS_B_UNKN : R6AS_B_UNCL;
+            r6as_b_cl = cl; r6as_b_tdec = now;
+        }
+    }
+    if (bs == R6AS_B_DEC || bs == R6AS_B_LV || ((bs == R6AS_B_UNCL || bs == R6AS_B_UNKN) && !r6as_b_note))
+        r6as_b_hold = !lp_shooting(0) ? 0 : r6as_b_hold ? r6as_b_hold : now;   /* 3 s photo live view without a break (2.3) */
+    r6as_bst = bs;
+    if (r6as_bst == R6AS_B_LV && r6as_b_hold && now - r6as_b_hold >= R6AS_BOOT_HOLD_MS && r6_autostart_get() == 1)
+    {
+        if (r6as_t2_block || r6as_t2_tab || r6as_tst != R6AS_T_IDLE || !r6as_wl_alloc())
+        {
+            r6as_bst = R6AS_B_NOGO;                          /* mode 1 below (saved ML only, 3) */
+            r6as_t2_msg = r6as_wl ? r6as_hn[R6AS_H5] : "Astro red: no memory.";
+        }
+        else
+        {
+            r6as_armed = 1; r6as_cmd_any = 1; r6as_boot_dn = 0;   /* exactly the effect of the menu command (4.1 2) */
+            r6as_bst = R6AS_B_ON; r6as_b_tarm = now; r6as_b_s0 = C2.stores;
+            r6as_bnote(2000, "%s", "Astro red: Full on (clean start).");   /* review R1 B1: NotifyBox only, no menu text */
+        }
+    }
     /* review R1 F4: a command seen with the old mode (the menu between the task's two reads) stays for the next step */
     if (fs != r6as_seen_fs && m == 2)                        /* a Full command (Mode.select), taken with mode 2 only (4.1 2) */
     {
@@ -831,11 +888,21 @@ static int r6as_t2_state(int now)
         if (!r6as_t2_block) { r6as_armed = 1; r6as_cmd_any = 1; r6as_boot_dn = 0; }
     }
     if (m != 2 || r6as_t2_block) r6as_armed = 0;             /* Off / ML only: the restore follows (want_red 0) */
-    if (m == 2 && !r6as_armed)                               /* invariant (S1 F7): no Full without a command (config load, start) */
+    /* invariant (S1 F7): no Full without a command (config load, start); M12.2: but while the start path waits (DEC, LV) and
+     * after it saw ML shut down (SHUT: config_save_at_shutdown saves Full, spec m12/m122 M1) */
+    if (m == 2 && !r6as_armed && r6as_bst != R6AS_B_DEC && r6as_bst != R6AS_B_LV && r6as_bst != R6AS_B_SHUT)
     {
         r6as_mode = m = 1;
         if (!r6as_cmd_any) r6as_boot_dn = 1;
     }
+    if ((bs == R6AS_B_UNCL || bs == R6AS_B_UNKN) && !r6as_b_note && m == 1 && r6as_b_hold && now - r6as_b_hold >= R6AS_BOOT_HOLD_MS
+        && now - r6as_b_tdec >= R6AS_BOOT_NOTE_MS)
+    {
+        r6as_b_note = 1;                                     /* notice B once, after the M7.6 box (spec m12/m122 4, M4) */
+        r6as_bnote(5000, "Astro red: %s. Full not restored, ML only.", r6as_bwhy(bs));
+    }
+    if (r6as_bst == R6AS_B_ON && r6as_b_n1 < 0 && C2.stores != r6as_b_s0 && r6as_tn >= 0) { r6as_b_n1 = r6as_tn; r6as_b_tst1 = K[r6as_tn].t_st; }
+    if (r6as_b_n1 >= 0 && !r6as_b_tver1 && K[r6as_b_n1].ver) r6as_b_tver1 = K[r6as_b_n1].t_ver;   /* ast.boot (7) */
     r6as_full_on = r6as_armed;
     if (ts != r6as_seen_ts)                                  /* a "Test: 10 s" command */
     {
@@ -1267,6 +1334,10 @@ static void r6as_t2_text(struct r6as_out * o)
                        r6as_ky(r6as_cfg(r6as_lcd, 5)), r6as_ky(r6as_cfg(r6as_evf, 5)), K[0].pend, K[1].pend, K[0].ver, K[1].ver, r6as_err_n,
                        r6as_last_err, r6as_core_ok };
     r6as_arr(o, "ast.t2", v, 16, 0x180);
+    /* M12.2 (spec m12/m122 7): state, decision, ms of the task start, the decision, the hold that fired, the arming, the
+     * first red store after it, its output, its first verification */
+    r6as_pf(o, "ast.boot=%d,%d,%d,%d,%d,%d,%d,%d,%d\n", r6as_bst, r6as_b_cl, r6as_b_t0, r6as_b_tdec, r6as_b_hold, r6as_b_tarm, r6as_b_tst1,
+        r6as_b_n1, r6as_b_tver1);
     r6as_arr(o, "ast.t2cnt", &C2.calls, sizeof(C2) / 4, 0);
     for (int n = 0; n < 2; n++)
     {
@@ -1480,8 +1551,11 @@ static MENU_UPDATE_FUNC(r6as_status_update)
     if (r6as_t2_block) MENU_SET_VALUE("blocked until restart");
     else if (now - K[0].bnc_until < 0 || now - K[1].bnc_until < 0) MENU_SET_VALUE("eye sensor busy");
     else MENU_SET_VALUE("LCD %s | EVF %s", a, b);
+    int bs = r6as_bst;
     if (r6as_t2_msg) MENU_SET_WARNING(MENU_WARN_ADVICE, "%s", r6as_t2_msg);
-    else if (r6as_boot_dn) MENU_SET_WARNING(MENU_WARN_INFO, "Full is not restored at start (M12.1).");
+    else if (bs == R6AS_B_DEC || bs == R6AS_B_LV)            /* M12.2: the start path waits (the ML menu stops the live view) */
+        MENU_SET_WARNING(MENU_WARN_INFO, "Full at start: after 3 s live view, if shut down cleanly.");
+    else if (r6as_boot_dn) MENU_SET_WARNING(MENU_WARN_INFO, "Full not restored: %s.", r6as_bwhy(bs));
     else MENU_SET_WARNING(MENU_WARN_INFO, "Writes %d, Canon resets %d / %d, waits %d.", (int) C2.stores, (int) C2.rs_dev, (int) C2.rs_nodev, (int) w);
 }
 
@@ -1500,7 +1574,7 @@ static struct menu_entry r6as_menu[] = {
     {
         .name   = "Astro red",
         .select = menu_open_submenu,
-        .help   = "M12.1: the display in red for night vision. Recordings stay in colour.",
+        .help   = "M12.2: the display in red for night vision. Recordings stay in colour.",
         .children = (struct menu_entry[]) {
             {
                 .name    = "Mode",
@@ -1509,7 +1583,7 @@ static struct menu_entry r6as_menu[] = {
                 .select  = r6as_mode_select,
                 .choices = CHOICES("Off", "ML only", "Full"),
                 .help    = "Full: the whole display red (LCD / EVF matrix). ML only: ML's pixels only. Recordings stay in colour.",
-                .help2   = "Saved; Full returns as ML only at start (M12.1). Colour flash on eye sensor / display wake.",
+                .help2   = "Saved. Full again 3 s after live view, if shut down cleanly. Colour flash: eye sensor / wake.",
             },
             {
                 .name    = "LCD level",
