@@ -197,6 +197,15 @@
  * CONFIG_R6_LAYER_OWNERSHIP, CONFIG_R6_GLOBAL_DRAW, FEATURE_LV_BUFFER_PROBE and CONFIG_R6_ETTR (one file number). */
 #define CONFIG_R6_ASTRO
 
+/* R6.190 M14.0: the Tor 0g read-only log (r6_tlog.c; docs/m14_plan.md, spec m14/m140 spec_m140.md Rev. 2, approved
+ * 2026-10-15, read only, every pointer checked): Canon's TempSvc table 0xFD9EC (8 sensors, t16 and pv), its copy
+ * 0xFDA80, error counters 0xFDAB0, period [0x4824], over-temperature status [0x484C], the EXIF byte [[0x5480] + 0x50C4]
+ * and the time-zone struct [0x6F38] (+0x20..+0x30, the zone table) as a tp / tz section of ASTnnnnn.LOG (lp_capture);
+ * the task r6_tlog_task polls every second, a ring of 32 samples (one per 10 s) and once a minute one RTC pair
+ * (LoadCalendarFromRTC, ML's wrapper the core uses already). No GPS, no property handler, no new Canon call, no write.
+ * Needs CONFIG_R6_ASTRO. */
+#define CONFIG_R6_TLOG
+
 #define CONFIG_TASK_STRUCT_V2_SMP
 #define CONFIG_TASK_ATTR_STRUCT_V5
 

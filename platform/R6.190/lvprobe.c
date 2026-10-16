@@ -155,6 +155,9 @@
 #ifdef CONFIG_R6_ASTRO
 #include "r6_astro.h"
 #endif
+#ifdef CONFIG_R6_TLOG
+#include "r6_tlog.h"
+#endif
 
 /* CONFIG_LIVEVIEW compiles in force_liveview (fake_simple_button(BGMT_LV) in
  * a loop while lv == 0) and the LV AF frame code. With lv pinned to 0 by
@@ -3161,7 +3164,11 @@ static inline __attribute__((always_inline)) int lp_write_ett(struct lp_buf * b,
 #ifndef CONFIG_R6_ETTR
 #error "lvprobe.c: CONFIG_R6_ASTRO needs CONFIG_R6_ETTR (one file number for LVP / ETT / AST)"
 #endif
+#ifdef CONFIG_R6_TLOG
+#define LP_AST_SIZE     40960     /* M14.0 (spec m14/m140 3): + the tp / tz section of r6_tlog.c (worst case 4870 B) */
+#else
 #define LP_AST_SIZE     32768     /* M12.0 (spec m12/m120 4.2), M12.1 (m12/m121 6.2): ASTnnnnn.LOG, malloc per snapshot, freed after the write */
+#endif
 #define LP_DELAY_MS     10000     /* M12.0 (4.3): "Log snapshot in 10 s" captures 10 s after SET ... */
 #define LP_DELAY_MAX_MS 60000     /* ... writes only if the shooting screen is back within 60 s of the capture (else discarded) */
 #define LP_DELAY_LV_MS  1000      /* ... and has held for 1 s */
@@ -3259,6 +3266,10 @@ static void __attribute__((noinline)) lp_capture(struct lp_buf * b, struct lp_bu
         int tr = 0;
         a->len = r6_astro_ast(a->p, a->cap, &tr);
         a->trunc = tr;
+#ifdef CONFIG_R6_TLOG
+        /* M14.0 Tor 0g (spec m14/m140 4, Rev. 2 S1): the tp / tz section, after the trunc flag of the AST text */
+        { int t3 = 0; a->len += r6tl_ast(a->p + a->len, a->cap - a->len, &t3); a->trunc |= t3; }
+#endif
         lp_printf(a, "ast.delay=%d,%d,%d,0x%x,%d,%d,%d,%d\n", mode, mode ? lp_t_sel : lp_t_cap, lp_t_cap, CURRENT_GUI_MODE, gui_state, lv,
             lv_dispsize, gui_menu_shown());
         r6_astro_main(t, sizeof(t));
