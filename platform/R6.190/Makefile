@@ -31,6 +31,9 @@ ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_propw.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_ettr.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_astro.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_tlog.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_acore.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_aclock.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_temp.o
 
 include ../Makefile
 .DEFAULT_GOAL := $(BUILD_DIR)/cam_complete

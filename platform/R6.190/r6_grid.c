@@ -68,6 +68,13 @@
  * M11.0: R6 ETTR's LV line (Show in LV, r6_ettr.c) is drawn by the same step,
  * last: one text line in a black box above Canon's bottom bar, LCD only, its
  * mirror cleared; drawn / R6GD_DRAWN_GRID and r6_grid_erase cover it too.
+ *
+ * M14.1 (spec m14/m141 5): the temperature box (r6_temp.c, "A 37 degC", right
+ * under the histogram place, black or, warning, yellow) by the same rules
+ * before the ETTR line; the astro clock's line (r6_aclock.c) in the ETTR
+ * line's place when R6 ETTR has no text (ETTR first), the owner flag
+ * gr_et_own counts each erase for the one who drew. drawn and r6_grid_erase
+ * cover both.
  */
 
 #include "dryos.h"
@@ -83,6 +90,12 @@
 #endif
 #ifdef CONFIG_R6_ETTR
 #include "r6_ettr.h"
+#endif
+#ifdef CONFIG_R6_TEMP
+#include "r6_temp.h"
+#endif
+#ifdef CONFIG_R6_ACLOCK
+#include "r6_aclock.h"
 #endif
 
 #ifdef CONFIG_R6_GRID
@@ -150,6 +163,12 @@ int r6_grid_wanted(void)
 #endif
 #ifdef CONFIG_R6_ETTR
     if (r6_ettr_lv_wanted()) return 1;      /* M11.0: R6 ETTR's LV line */
+#endif
+#ifdef CONFIG_R6_TEMP
+    if (r6_temp_lv_wanted()) return 1;      /* M14.1: the temperature box */
+#endif
+#ifdef CONFIG_R6_ACLOCK
+    if (r6_ac_lv_wanted()) return 1;        /* M14.1: the astro clock's line */
 #endif
     return gr_wanted();
 }
@@ -423,6 +442,9 @@ static int gr_md_valid = 0;
 #ifdef CONFIG_R6_ETTR
 static int gr_et_valid = 0;              /* M11.0: R6 ETTR's LV line is in ML's buffer */
 #endif
+#ifdef CONFIG_R6_TEMP
+static int gr_tb_valid = 0;              /* M14.1: the temperature box is in ML's buffer */
+#endif
 
 /* drawn (stats, R6GD_DRAWN_GRID) from what is in ML's buffer: the grid and (M9.3) the motion display */
 static void gr_drawn(void)
@@ -433,6 +455,9 @@ static void gr_drawn(void)
 #endif
 #ifdef CONFIG_R6_ETTR
     d |= gr_et_valid;
+#endif
+#ifdef CONFIG_R6_TEMP
+    d |= gr_tb_valid;
 #endif
     st.drawn = d;
     if (d) r6_gd_st.drawn |= R6GD_DRAWN_GRID;
@@ -517,6 +542,9 @@ static int gr_md_step(uint8_t * b, uint8_t * m, const struct r6_grid_rect * ex, 
 #define GR_ET_FONT FONT(FONT_MED, COLOR_WHITE, COLOR_BLACK)
 static char gr_et_text[64];              /* the text in the box */
 static int gr_et_w = 0, gr_et_h = 0;     /* the box */
+#ifdef CONFIG_R6_ACLOCK
+static int gr_et_own = 0;                /* M14.1: whose text the box holds: 1 R6 ETTR, 2 the astro clock */
+#endif
 
 static int gr_et_intact(const uint8_t * b)
 {
@@ -531,7 +559,12 @@ static int gr_et_erase(uint8_t * b, uint8_t * m)
     bmp_fill(COLOR_EMPTY, R6ETTR_LV_X, R6ETTR_LV_Y, gr_et_w, gr_et_h);
     gr_et_valid = 0;
     gr_et_text[0] = 0;
+#ifdef CONFIG_R6_ACLOCK
+    if (gr_et_own == 2) r6_ac_lv_count(0);  /* M14.1: the erase counts for the one who drew */
+    else r6_ettr_lv_count(0);
+#else
     r6_ettr_lv_count(0);
+#endif
     gr_drawn();
     return 1;
 }
@@ -539,8 +572,21 @@ static int gr_et_erase(uint8_t * b, uint8_t * m)
 static int gr_et_step(uint8_t * b, uint8_t * m)
 {
     char t[sizeof(gr_et_text)];
+#ifdef CONFIG_R6_ACLOCK
+    /* M14.1: R6 ETTR's text first (E13); only without it the astro clock's (its short form if the long one is too wide) */
+    int own = 1;
+    if (r6_gd_evf) return gr_et_erase(b, m);
+    if (!r6_ettr_lv_text(t, sizeof(t)))
+    {
+        if (!r6_ac_lv_text(t, sizeof(t), 0)) return gr_et_erase(b, m);
+        if (bmp_string_width(GR_ET_FONT, t) + 4 > R6ETTR_LV_WMAX) r6_ac_lv_text(t, sizeof(t), 1);
+        own = 2;
+    }
+    if (gr_et_valid && gr_et_own == own && !strcmp(t, gr_et_text) && gr_et_intact(b)) return 0;
+#else
     if (r6_gd_evf || !r6_ettr_lv_text(t, sizeof(t))) return gr_et_erase(b, m);
     if (gr_et_valid && !strcmp(t, gr_et_text) && gr_et_intact(b)) return 0;
+#endif
     int h = fontspec_height(GR_ET_FONT) + 4, n = strlen(t), w = 0;
     while (n > 0 && (w = bmp_string_width(GR_ET_FONT, t) + 4) > R6ETTR_LV_WMAX) t[--n] = 0;   /* cut at the box */
     if (n <= 0) return gr_et_erase(b, m);
@@ -552,7 +598,67 @@ static int gr_et_step(uint8_t * b, uint8_t * m)
     gr_et_h = h;
     snprintf(gr_et_text, sizeof(gr_et_text), "%s", t);
     gr_et_valid = 1;
+#ifdef CONFIG_R6_ACLOCK
+    gr_et_own = own;
+    if (own == 2) r6_ac_lv_count(1);
+    else r6_ettr_lv_count(1);
+#else
     r6_ettr_lv_count(1);
+#endif
+    gr_drawn();
+    return changed | 1;
+}
+#endif
+
+#ifdef CONFIG_R6_TEMP
+/* M14.1: the temperature box (r6_temp.c r6_temp_lv_text, spec m14/m141 5.2): right-aligned at R6TB_X1, top R6TB_Y0, under
+ * Canon's and ML's histogram place, outside the ETTR line; fixed width (the widest text "A -40 degC! S99"), white on black
+ * or (warning) black on yellow; LCD shooting screen only, the same rules as the ETTR line (mirror cleared, drawn only on a
+ * new text / colour or a missing corner: the corners are checked against the current fill colour, skeptic M7) */
+#define GR_TB_FONT  FONT(FONT_MED, COLOR_WHITE, COLOR_BLACK)
+#define GR_TB_FONTW FONT(FONT_MED, COLOR_BLACK, COLOR_YELLOW)
+static char gr_tb_text[24];              /* the text in the box */
+static int gr_tb_w = 0, gr_tb_h = 0, gr_tb_col = COLOR_BLACK;
+
+static int gr_tb_intact(const uint8_t * b)
+{
+    const int x0 = R6TB_X1 - gr_tb_w, y0 = R6TB_Y0, x1 = R6TB_X1 - 1, y1 = y0 + gr_tb_h - 1;
+    return b[x0 + y0 * BMPPITCH] == gr_tb_col && b[x1 + y0 * BMPPITCH] == gr_tb_col
+        && b[x0 + y1 * BMPPITCH] == gr_tb_col && b[x1 + y1 * BMPPITCH] == gr_tb_col;
+}
+
+static int gr_tb_erase(uint8_t * b, uint8_t * m)
+{
+    if (!gr_tb_valid) return 0;
+    bmp_fill(COLOR_EMPTY, R6TB_X1 - gr_tb_w, R6TB_Y0, gr_tb_w, gr_tb_h);
+    gr_tb_valid = 0;
+    gr_tb_text[0] = 0;
+    r6_temp_lv_count(0);
+    gr_drawn();
+    return 1;
+}
+
+static int gr_tb_step(uint8_t * b, uint8_t * m)
+{
+    char t[sizeof(gr_tb_text)];
+    int warn = 0;
+    if (r6_gd_evf || !r6_temp_lv_text(t, sizeof(t), &warn)) return gr_tb_erase(b, m);
+    const int col = warn ? COLOR_YELLOW : COLOR_BLACK;
+    if (gr_tb_valid && col == gr_tb_col && !strcmp(t, gr_tb_text) && gr_tb_intact(b)) return 0;
+    if (!gr_tb_w)
+    {
+        gr_tb_w = bmp_string_width(GR_TB_FONT, "A -40" SYM_DEGREE "C! S99") + 4;
+        gr_tb_h = fontspec_height(GR_TB_FONT) + 4;
+    }
+    int changed = gr_tb_erase(b, m);
+    const int x0 = R6TB_X1 - gr_tb_w;
+    bmp_fill(col, x0, R6TB_Y0, gr_tb_w, gr_tb_h);
+    bmp_printf(warn ? GR_TB_FONTW : GR_TB_FONT, x0 + 2, R6TB_Y0 + 2, "%s", t);
+    for (int y = 0; y < gr_tb_h; y++) memset(m + x0 + (R6TB_Y0 + y) * BMPPITCH, 0, gr_tb_w);
+    snprintf(gr_tb_text, sizeof(gr_tb_text), "%s", t);
+    gr_tb_col = col;
+    gr_tb_valid = 1;
+    r6_temp_lv_count(1);
     gr_drawn();
     return changed | 1;
 }
@@ -568,6 +674,9 @@ int r6_grid_erase(void)
 #endif
 #ifdef CONFIG_R6_ETTR
     c |= gr_et_erase(b, m);
+#endif
+#ifdef CONFIG_R6_TEMP
+    c |= gr_tb_erase(b, m);
 #endif
     return c;
 }
@@ -629,6 +738,10 @@ int r6_grid_step(const struct r6_grid_rect * ex, int n)
     }
 #ifdef CONFIG_R6_MOTION
     changed |= gr_md_step(b, m, ex, n);                 /* M9.3: after the grid (the grid wins where they overlap) */
+    gr_drawn();
+#endif
+#ifdef CONFIG_R6_TEMP
+    changed |= gr_tb_step(b, m);                        /* M14.1: the temperature box, before the ETTR line */
     gr_drawn();
 #endif
 #ifdef CONFIG_R6_ETTR
