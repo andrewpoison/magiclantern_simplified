@@ -165,6 +165,10 @@ unsigned int exmem_clear(struct memSuite *hSuite, char fill)
 /* when size is set to zero, it will try to allocate the maximum possible block */
 static struct memSuite *shoot_malloc_suite_int(size_t size)
 {
+#ifdef CONFIG_R6_NO_SHOOT_MALLOC
+    (void) size;
+    return NULL;                       /* M14.1b (R6, spec m14/m141b 3.2): never AllocateMemoryResource / AllocateContinuousMemoryResource */
+#endif
     alloc_msg_t *suite_info = _malloc(sizeof(alloc_msg_t));
     
     suite_info->ret = NULL;
@@ -304,6 +308,10 @@ struct memSuite *_shoot_malloc_suite(size_t size)
 REQUIRES(mem_sem)
 struct memSuite * _shoot_malloc_suite_contig(size_t size)
 {
+#ifdef CONFIG_R6_NO_SHOOT_MALLOC
+    (void) size;
+    return NULL;                       /* M14.1b (R6, spec m14/m141b 3.2): never AllocateMemoryResource / AllocateContinuousMemoryResource */
+#endif
     //qprintf("_shoot_malloc_suite_contig(%x)\n", size);
 
     if (size == 0 || size > 1024*1024)

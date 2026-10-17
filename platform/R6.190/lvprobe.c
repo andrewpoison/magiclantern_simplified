@@ -3213,6 +3213,135 @@ static inline __attribute__((always_inline)) int lp_write_ast(struct lp_buf * b,
 }
 #endif
 
+#ifdef CONFIG_R6_SNAPMEM
+#ifndef CONFIG_R6_NO_SHOOT_MALLOC
+#error "lvprobe.c: CONFIG_R6_SNAPMEM needs CONFIG_R6_NO_SHOOT_MALLOC (mem.c allocator 0 = malloc, 1 = AllocateMemory)"
+#endif
+/* ---- M14.1b (spec m14/m141b 4..7): the snapshot's own task, its buffer ladder, its memory diagnostics ----
+ * mem.c's record of its own allocator choice (src/mem.c, CONFIG_R6_SNAPMEM; the same struct there): read through a seqlock,
+ * no lock, no Canon call. The values are those mem.c obtained itself (GetFreeMemForMalloc, GetFreeMemForAllocateMemory,
+ * GetMaxRegionForAllocateMemory); this file calls none of the AllocateMemory ones (M13 E3 a). */
+struct r6_mem_rec
+{
+    uint32_t seq;                      /* __mem_malloc calls since boot */
+    int size, flags, alloc, round;     /* the last call: chosen allocator (-1 none), search round 1..7 (0 none) */
+    const void * ptr;                  /* its result */
+    int f_ml, f_am, max_am;            /* the last values obtained (any call): GetFreeMemForMalloc,
+                                        * GetFreeMemForAllocateMemory, GetMaxRegionForAllocateMemory (raw) */
+    uint32_t s_ml, s_am, s_max;        /* seq of the call that obtained them (0 = never) */
+    int t_am;                          /* ML ms clock when f_am was obtained */
+};
+_Static_assert(sizeof(struct r6_mem_rec) == 52, "struct r6_mem_rec as in src/mem.c");
+extern int r6_mem_info(const void * ptr, struct r6_mem_rec * out);   /* src/mem.c: -2 busy, else the allocator of ptr (-1 NULL) */
+extern void tskmon_stack_check(uint32_t task_id);                    /* src/tskmon.c (ML) */
+extern void tskmon_stack_get_max(uint32_t task_id, uint32_t * used, uint32_t * free);
+
+#define LP_SNAP_STACK   0x3000    /* the snapshot task's stack (spec 4, Rev. 2 S3): 12 KB instead of run_in_separate_task's 32 KB */
+#define LP_SNAP_PRIO    0x1a      /* as run_in_separate_task's "run_test" */
+#define LP_AM_FLOOR     0x100000  /* a buffer from Canon's AllocateMemory heap only while >= 1 MiB stays free there (spec 5, S4;
+                                   * mem.c: "at 1MB free, 'dispcheck' may stop working") */
+/* the ladders (spec 5): LP_LOG_SIZE / LP_AST_SIZE are the first steps */
+static const int lp_lvp_steps[] = { LP_LOG_SIZE, 65536, 49152 };
+#ifdef CONFIG_R6_ASTRO
+static const int lp_ast_steps[] = { LP_AST_SIZE, 16384 };
+#endif
+#define LP_BSZ lp_bsz             /* the buffer sizes of the snapshot that runs */
+#define LP_ASZ lp_asz
+static int lp_bsz = 0, lp_asz = 0;
+/* a text cut at its cap (a smaller step: the camera's LVP) ends its last line before the trailer (the trailer's cap is raised
+ * already), so "log_truncated=1" stays a line of its own */
+static void lp_cut_nl(struct lp_buf * b)
+{
+    if (b->trunc && b->len > 0 && b->p[b->len - 1] != '\n') lp_printf(b, "\n");
+}
+
+/* one buffer of a snapshot: the step taken (or, without one, the last step tried) and what mem.c had obtained */
+struct lp_bufsrc { int size, step, src, round, own, q, f_ml, f_am, max_am, rej, why; };
+#define LP_WHY_NONE  1            /* mem.c gave NULL */
+#define LP_WHY_FLOOR 2            /* from AllocateMemory, but below LP_AM_FLOOR (or its value not from this call) */
+#define LP_WHY_BUSY  3            /* mem.c's record busy: source unknown */
+static struct lp_bufsrc lp_bs_lvp, lp_bs_ast;
+#define LP_SR_NONE  0             /* no snapshot yet */
+#define LP_SR_OK    1             /* both buffers */
+#define LP_SR_NOLVP 2             /* no memory: LVP */
+#define LP_SR_NOAST 3             /* no memory: AST */
+static int lp_snap_res = LP_SR_NONE;
+static int lp_snap_kind = 0;      /* 0 direct (lvprobe_snapshot_run), 1 menu, 2 delayed */
+static struct { uint32_t size, used, free; } lp_stack_last;   /* the snapshot task's stack at its end (tskmon), the last one */
+#ifdef CONFIG_R6_TLOG
+static int lp_skip_tl = 0;        /* "Skip temp/clock log" (spec 7): not saved, OFF at boot */
+#endif
+
+/* mem.c's record (seqlock: a write may run in another task; wait a little, the writer holds mem_sem only briefly) */
+static int lp_meminfo(const void * p, struct r6_mem_rec * m)
+{
+    int a = r6_mem_info(p, m);
+    for (int k = 0; a == -2 && k < 20; k++)
+    {
+        msleep(5);
+        a = r6_mem_info(p, m);
+    }
+    if (a == -2) memset(m, 0, sizeof(*m));
+    return a;
+}
+
+/* spec 5: down the ladder; only malloc(size) with flags 0 as before (mem.c: malloc pool or AllocateMemory, never
+ * shoot_malloc). A buffer from AllocateMemory stays only if mem.c's record belongs to this very call (own), its
+ * AllocateMemory free space was obtained in it (q & 2) and >= LP_AM_FLOOR stays free after it; else it is freed at once
+ * and the next step follows. NULL: no step */
+static char * lp_ladder(const int * steps, int n, struct lp_bufsrc * r)
+{
+    int rej = 0;
+    memset(r, 0, sizeof(*r));
+    for (int i = 0; i < n; i++)
+    {
+        struct r6_mem_rec m;
+        char * p = malloc(steps[i]);
+        int a = lp_meminfo(p, &m);
+        int own = p && a != -2 && m.seq && m.ptr == p;
+        r->size = steps[i]; r->step = i + 1; r->src = p ? a : -1; r->own = own; r->round = own ? m.round : -1;
+        r->q = own ? (m.s_ml == m.seq) | (m.s_am == m.seq) << 1 | (m.s_max == m.seq) << 2 : 0;
+        r->f_ml = m.s_ml ? m.f_ml : -1; r->f_am = m.s_am ? m.f_am : -1; r->max_am = m.s_max ? m.max_am : -1;
+        r->rej = rej; r->why = 0;
+        if (!p) { r->why = LP_WHY_NONE; continue; }
+        if (a == 0) return p;                                  /* ML's malloc pool: mem.c keeps its own reserve */
+        if (a == 1 && own && (r->q & 2) && m.f_am - steps[i] - 32 >= LP_AM_FLOOR) return p;
+        free(p);
+        r->why = a == 1 ? LP_WHY_FLOOR : LP_WHY_BUSY;
+        rej++;
+    }
+    return NULL;
+}
+
+static const char * lp_src_name(int s) { return s == 0 ? "ML" : s == 1 ? "AM" : s == -1 ? "-" : "?"; }
+
+static void lp_bs_line(struct lp_buf * b, const char * key, const struct lp_bufsrc * r)
+{
+    lp_printf(b, "%s=%d,%d,%s,%d,%d,%d,%d,%d,%d,%d\n", key, r->size, r->step, lp_src_name(r->src), r->round, r->own, r->q, r->f_ml,
+        r->f_am, r->max_am, r->rej);
+}
+
+/* spec 6.2: the snap.* lines (at most 480 B, before census A: inside the static budget, never cut) */
+static void lp_snap_lines(struct lp_buf * b)
+{
+    lp_printf(b, "# M14.1b snapshot memory (spec m14/m141b 6): src ML malloc pool, AM Canon AllocateMemory; own 1 = mem.c record of this call; q 1 f_ml 2 f_am 4 max_am of this call\n");
+    lp_printf(b, "snap.task=lp_snapshot,%d,%s\n", lp_snap_kind ? LP_SNAP_STACK : 0, lp_snap_kind == 1 ? "menu" : lp_snap_kind == 2 ? "delayed" : "direct");
+    lp_bs_line(b, "snap.lvp", &lp_bs_lvp);
+#ifdef CONFIG_R6_ASTRO
+    lp_bs_line(b, "snap.ast", &lp_bs_ast);
+#endif
+    lp_printf(b, "snap.stack_prev=%d,%d,%d\n", (int) lp_stack_last.size, (int) lp_stack_last.used, (int) lp_stack_last.free);
+#ifdef CONFIG_R6_TLOG
+    lp_printf(b, "snap.skip=%d\n", lp_skip_tl);
+#else
+    lp_printf(b, "snap.skip=0\n");
+#endif
+}
+#else
+#define LP_BSZ LP_LOG_SIZE
+#define LP_ASZ LP_AST_SIZE
+#endif
+
 /* M12.0 (spec m12/m120 4.3 step 2, Rev. 2 F9): the capture of a snapshot, both modes. Reads only: no card access, no
  * notice, no beep, no redraw, no XimrExe, no winsys_sem (gate_m120_ro.sh checks its call tree in the ELF); MMIO only
  * through r6_astro_ast's probe read and only while "Display regs" is ON. ettr.file / astro carry "?????" placeholders,
@@ -3235,6 +3364,9 @@ static void __attribute__((noinline)) lp_capture(struct lp_buf * b, struct lp_bu
     snprintf(id, sizeof(id), "%s", build_id);
     for (char * c = id; *c; c++) if (*c == ' ' || *c == '=') *c = 0;   /* build_id ends with a space */
     lp_printf(b, "ml_build_id=%s\n", id);
+#ifdef CONFIG_R6_SNAPMEM
+    lp_snap_lines(b);                     /* M14.1b (spec 6.2) */
+#endif
     lp_census(b, "A");
     msleep(500);
     lp_census(b, "B");
@@ -3268,6 +3400,10 @@ static void __attribute__((noinline)) lp_capture(struct lp_buf * b, struct lp_bu
         a->trunc = tr;
 #ifdef CONFIG_R6_TLOG
         /* M14.0 Tor 0g (spec m14/m140 4, Rev. 2 S1): the tp / tz section, after the trunc flag of the AST text */
+#ifdef CONFIG_R6_SNAPMEM
+        if (lp_skip_tl) lp_printf(a, "ast.tl_skip=1\n");   /* M14.1b (spec 7): "Skip temp/clock log" ON */
+        else
+#endif
         { int t3 = 0; a->len += r6tl_ast(a->p + a->len, a->cap - a->len, &t3); a->trunc |= t3; }
 #endif
         lp_printf(a, "ast.delay=%d,%d,%d,0x%x,%d,%d,%d,%d\n", mode, mode ? lp_t_sel : lp_t_cap, lp_t_cap, CURRENT_GUI_MODE, gui_state, lv,
@@ -3282,7 +3418,10 @@ static void __attribute__((noinline)) lp_capture(struct lp_buf * b, struct lp_bu
     lp_ring_tail(b);                      /* M10.2b: the picture / write rings last, down to LP_TAIL_SLACK */
 #endif
     int trunc = b->trunc;
-    b->cap = LP_LOG_SIZE;                 /* the trailer always fits */
+    b->cap = LP_BSZ;                      /* the trailer always fits */
+#ifdef CONFIG_R6_SNAPMEM
+    lp_cut_nl(b);
+#endif
     lp_printf(b, "log_truncated=%d\n", trunc);
     lp_printf(b, "log_bytes=%d\n# end\n", b->len);
 }
@@ -3315,6 +3454,35 @@ static void lp_snapshot_do(int mode, int delay_ms)
     char name[32];
     snprintf(lp_snap_msg, sizeof(lp_snap_msg), "running");
     if (delay_ms) msleep(delay_ms);
+#ifdef CONFIG_R6_SNAPMEM
+    /* M14.1b (spec 5): LVP first, then AST (as before); a missing step frees what is held, no file, no ASSERT */
+    lp_bsz = lp_asz = 0;
+    memset(&lp_bs_ast, 0, sizeof(lp_bs_ast));
+    struct lp_buf b = { .p = lp_ladder(lp_lvp_steps, COUNT(lp_lvp_steps), &lp_bs_lvp), .len = 0, .cap = 0, .trunc = 0 };
+    if (!b.p)
+    {
+        lp_snap_res = LP_SR_NOLVP;
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "no memory: LVP");
+        return;
+    }
+    lp_bsz = lp_bs_lvp.size;
+    b.cap = lp_bsz - LP_LOG_TAIL;
+#ifdef CONFIG_R6_ASTRO
+    struct lp_buf a = { .p = lp_ladder(lp_ast_steps, COUNT(lp_ast_steps), &lp_bs_ast), .len = 0, .cap = 0, .trunc = 0 };
+    if (!a.p)
+    {
+        free(b.p);
+        lp_snap_res = LP_SR_NOAST;
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "no memory: AST");
+        return;
+    }
+    lp_asz = lp_bs_ast.size;
+    a.cap = lp_asz - LP_LOG_TAIL;
+#else
+    struct lp_buf a = { 0 };
+#endif
+    lp_snap_res = LP_SR_OK;
+#else
     struct lp_buf b = { .p = malloc(LP_LOG_SIZE), .len = 0, .cap = LP_LOG_SIZE - LP_LOG_TAIL, .trunc = 0 };
 #ifdef CONFIG_R6_ASTRO
     struct lp_buf a = { .p = malloc(LP_AST_SIZE), .len = 0, .cap = LP_AST_SIZE - LP_LOG_TAIL, .trunc = 0 };
@@ -3332,6 +3500,7 @@ static void lp_snapshot_do(int mode, int delay_ms)
         return;
     }
     struct lp_buf a = { 0 };
+#endif
 #endif
     lp_capture(&b, &a, mode);             /* M12.0: reads only (spec 4.3 step 2) */
 #ifdef CONFIG_R6_ASTRO
@@ -3380,16 +3549,19 @@ static void lp_snapshot_do(int mode, int delay_ms)
          * LP_ETT_BINS bytes hold the bins copy. M12.0: built now (delayed: after the capture, line ett.delayed first) */
         char ename[32];
         int n = lp_file_no;
-        uint32_t (*bins)[256] = (uint32_t (*)[256]) (b.p + LP_LOG_SIZE - LP_ETT_BINS);
+        uint32_t (*bins)[256] = (uint32_t (*)[256]) (b.p + LP_BSZ - LP_ETT_BINS);
         b.len = 0;
         b.trunc = 0;
-        b.cap = LP_LOG_SIZE - LP_ETT_BINS - LP_LOG_TAIL;
+        b.cap = LP_BSZ - LP_ETT_BINS - LP_LOG_TAIL;
 #ifdef CONFIG_R6_ASTRO
         if (mode) lp_printf(&b, "ett.delayed=1,%d\n", lp_t_cap);
 #endif
         lp_ett_log(&b, bins, n);
         int trunc = b.trunc;
-        b.cap = LP_LOG_SIZE - LP_ETT_BINS;
+        b.cap = LP_BSZ - LP_ETT_BINS;
+#ifdef CONFIG_R6_SNAPMEM
+        lp_cut_nl(&b);
+#endif
         lp_printf(&b, "log_truncated=%d\n", trunc);
         lp_printf(&b, "log_bytes=%d\n# end\n", b.len);
         snprintf(ename, sizeof(ename), "ML/LOGS/ETT%05d.LOG", n);
@@ -3402,7 +3574,10 @@ static void lp_snapshot_do(int mode, int delay_ms)
         /* M12.0 (spec 4.2): ASTnnnnn.LOG with the same number, the closing lines added now */
         char aname[32];
         int at = a.trunc;
-        a.cap = LP_AST_SIZE;              /* the closing lines always fit */
+        a.cap = LP_ASZ;                   /* the closing lines always fit */
+#ifdef CONFIG_R6_SNAPMEM
+        lp_cut_nl(&a);
+#endif
         lp_printf(&a, "ast.write=%d,%d\n", get_ms_clock(), waited);
         lp_printf(&a, "log_truncated=%d\n", at);
         lp_printf(&a, "log_bytes=%d\n# end\n", a.len);
@@ -3419,6 +3594,9 @@ int lvprobe_snapshot_run(int delay_ms)
 {
     if (lp_snap_busy) return 0;
     lp_snap_busy = 1;
+#ifdef CONFIG_R6_SNAPMEM
+    lp_snap_kind = 0;
+#endif
     lp_snapshot_do(0, delay_ms);
     lp_snap_busy = 0;
     return 1;
@@ -3456,6 +3634,36 @@ static void lp_snapdelay_task(int unused)
     else
         lp_snapshot_do(1, 0);
     lp_snap_busy = 0;
+}
+#endif
+
+#ifdef CONFIG_R6_SNAPMEM
+/* M14.1b (spec 4): the snapshot's own task with a 12 KB stack (Canon's task memory) instead of run_in_separate_task's 32 KB
+ * "run_test"; the same body as before. At its end it measures its own stack through ML's tskmon (the high-water mark since
+ * the task started: the untouched 0x19980218 words; tskmon reads the task's DryOS record at the next switch to it) */
+static void lp_snap_entry(void * arg)
+{
+#ifdef CONFIG_R6_ASTRO
+    if (arg) lp_snapdelay_task(0);
+    else
+#endif
+    lp_snapshot_task(0);
+    int id = get_current_task_id();
+    uint32_t used = 0, fr = 0;
+    tskmon_stack_check(id);
+    msleep(20);
+    tskmon_stack_get_max(id, &used, &fr);
+    lp_stack_last.size = LP_SNAP_STACK;
+    lp_stack_last.used = used;
+    lp_stack_last.free = fr;
+}
+
+/* the menu's two selects (busy flag set there, before the task exists); as run_in_separate_task: the ML menu closes first */
+static void __attribute__((noinline)) lp_snap_start(int delayed)
+{
+    lp_snap_kind = delayed ? 2 : 1;
+    gui_stop_menu();
+    task_create("lp_snapshot", LP_SNAP_PRIO, LP_SNAP_STACK, lp_snap_entry, (void *) delayed);
 }
 #endif
 
@@ -3810,7 +4018,11 @@ static MENU_SELECT_FUNC(lp_snapshot_select)
 #endif
     lp_snap_busy = 1;
     snprintf(lp_snap_msg, sizeof(lp_snap_msg), "starting");
+#ifdef CONFIG_R6_SNAPMEM
+    lp_snap_start(0);                     /* M14.1b (spec 4) */
+#else
     run_in_separate_task(lp_snapshot_task, 0);
+#endif
 }
 
 static MENU_UPDATE_FUNC(lp_snapshot_update)
@@ -3840,7 +4052,11 @@ static MENU_SELECT_FUNC(lp_snapdelay_select)
     lp_snap_busy = 1;
     lp_t_sel = get_ms_clock();
     snprintf(lp_snap_msg, sizeof(lp_snap_msg), "starting (10 s)");
+#ifdef CONFIG_R6_SNAPMEM
+    lp_snap_start(1);                     /* M14.1b (spec 4) */
+#else
     run_in_separate_task(lp_snapdelay_task, 0);
+#endif
 }
 
 static int lp_ast_on = 0;                 /* menu mirror of r6_astro_probe_on() */
@@ -3890,6 +4106,42 @@ static MENU_UPDATE_FUNC(lp_x_update)
     if (lp_x_on) MENU_SET_RINFO("%d changes", (int) lp_xcb_n);
 }
 
+#ifdef CONFIG_R6_SNAPMEM
+/* M14.1b (spec 6.3): display only, no Canon call, no lock: ML's pool fresh (GetFreeMemForMalloc, read here before), Canon's
+ * AllocateMemory heap as mem.c saw it at its last allocation (r6_mem_info, seqlock), the last snapshot's buffers */
+static struct r6_mem_rec lp_mem_last;
+static void lp_kb(char * s, int n, int v) { snprintf(s, n, "%s", format_memory_size(v)); }
+static MENU_UPDATE_FUNC(lp_mem_update)
+{
+    struct r6_mem_rec m;
+    char a[16], c[16], d[16], t[MENU_MAX_WARNING_LEN];
+    if (r6_mem_info(NULL, &m) == -2) m = lp_mem_last;      /* a write runs: the last copy */
+    else lp_mem_last = m;
+    lp_kb(a, sizeof(a), GetFreeMemForMalloc());
+    if (m.s_am) lp_kb(c, sizeof(c), m.f_am); else snprintf(c, sizeof(c), "?");
+    MENU_SET_VALUE("ML %s  AM %s", a, c);
+    int n = 0;
+    if (m.s_am)
+    {
+        if (m.s_max && m.s_max == m.s_am) lp_kb(d, sizeof(d), m.max_am);   /* the largest block only from f_am's call */
+        else snprintf(d, sizeof(d), "?");
+        n += snprintf(t + n, sizeof(t) - n, "AM %s/%s %ds ago. ", c, d, (get_ms_clock() - m.t_am) / 1000);
+    }
+    else n += snprintf(t + n, sizeof(t) - n, "AM not queried yet. ");
+    const struct lp_bufsrc * f = lp_snap_res == LP_SR_NOLVP ? &lp_bs_lvp : &lp_bs_ast;
+    const char * why = f->why == LP_WHY_FLOOR ? "AM < 1M" : f->why == LP_WHY_BUSY ? "busy" : "none";
+    if (lp_snap_res == LP_SR_NONE) n += snprintf(t + n, sizeof(t) - n, "Last: none.");
+    else if (lp_snap_res == LP_SR_OK)
+        n += snprintf(t + n, sizeof(t) - n, "Last: LVP %dK %s, AST %dK %s.", lp_bs_lvp.size / 1024, lp_src_name(lp_bs_lvp.src),
+            lp_bs_ast.size / 1024, lp_src_name(lp_bs_ast.src));
+    else n += snprintf(t + n, sizeof(t) - n, "Last: no memory (%s %dK, %s).", lp_snap_res == LP_SR_NOLVP ? "LVP" : "AST", f->size / 1024, why);
+    if (lp_stack_last.size && n < (int) sizeof(t))
+        snprintf(t + n, sizeof(t) - n, " Stack %d.%dK/%dK.", (int) lp_stack_last.used / 1024, (int) (lp_stack_last.used % 1024) * 10 / 1024,
+            (int) lp_stack_last.size / 1024);
+    MENU_SET_WARNING(MENU_WARN_INFO, "%s", t);
+}
+#endif
+
 static struct menu_entry lp_menu[] = {
     {
         .name   = "LV probe",
@@ -3932,6 +4184,23 @@ static struct menu_entry lp_menu[] = {
                 .help   = "Captures 10 s after SET: open MENU, Q, playback... File when LV is back (60 s).",
                 .help2  = "Read-only capture: no notice, no file until LV runs. R6 ETTR Apply is refused until then.",
             },
+            #ifdef CONFIG_R6_SNAPMEM
+            {
+                .name   = "Snapshot memory",
+                .update = lp_mem_update,
+                .help   = "Free space as mem.c saw it at its last allocation (no extra Canon call).",
+                .help2  = "ML = malloc pool (keeps 256K), AM = Canon AllocateMemory heap (snapshot keeps 1M).",
+            },
+            #ifdef CONFIG_R6_TLOG
+            {
+                .name   = "Skip temp/clock log",
+                .priv   = &lp_skip_tl,
+                .max    = 1,
+                .help   = "Diagnosis only: snapshot without temperature / time zone / clock lines.",
+                .help2  = "Not saved: OFF at boot.",
+            },
+            #endif
+            #endif
             {
                 .name   = "Display regs",
                 .priv   = &lp_ast_on,

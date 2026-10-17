@@ -217,6 +217,21 @@
 #define CONFIG_R6_TEMP
 #define CONFIG_R6_ACLOCK
 
+/* R6.190 M14.1b (camera test M14.1 2026-10-17: every "Log snapshot" ended in Err 70 and a restart; user decision 2026-10-17
+ * "Bau bitte den 14.1b"; spec m14/m141b spec_m141b.md Rev. 2): ML never uses shoot_malloc on the R6. On 1.9.0
+ * AllocateContinuousMemoryResource / AllocateMemoryResource with ML's flags 0x50 end in Canon's ASSERT (Err 70); src/mem.c
+ * drops the allocator from its table, src/exmem.c returns NULL before any Canon call (both only in R6 blocks). */
+#define CONFIG_R6_NO_SHOOT_MALLOC
+
+/* R6.190 M14.1b (same decision; spec 4..7): "Log snapshot" / "Log snapshot in 10 s" run in their own task with a 12 KB stack
+ * (lvprobe.c, the existing task_create; no more run_in_separate_task with 32 KB from Canon's task memory); the snapshot
+ * buffers come down a ladder (LVP 96 / 64 / 48 KB, AST 40 / 16 KB) from mem.c's pools only (a buffer from Canon's
+ * AllocateMemory heap only while >= 1 MiB stays free there), else "no memory: LVP" / "no memory: AST" without a file;
+ * Debug > LV probe "Snapshot memory" and the LVP log (snap.*) show the source and the values mem.c itself obtained during
+ * its allocator choice (no extra Canon call); "Skip temp/clock log" (not saved) leaves the Tor 0g section out of a
+ * snapshot. Needs CONFIG_R6_NO_SHOOT_MALLOC. */
+#define CONFIG_R6_SNAPMEM
+
 #define CONFIG_TASK_STRUCT_V2_SMP
 #define CONFIG_TASK_ATTR_STRUCT_V5
 

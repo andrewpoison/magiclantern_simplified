@@ -273,6 +273,7 @@ static struct mem_allocator allocators[] = {
     },
 #endif
 
+#ifndef CONFIG_R6_NO_SHOOT_MALLOC     /* M14.1b (R6, spec m14/m141b 3.1): never shoot_malloc - Canon's ASSERT with ML's flags 0x50 */
     // Canon expects this memory pool to be completely empty when it starts some operations.
     // If it isn't, the camera can lock completely, Err 70, or crash.
     // An example operation is image editing.  Go to image review, press Q (Q/Set on some cams),
@@ -307,6 +308,7 @@ static struct mem_allocator allocators[] = {
         .minimum_alloc_size = 64 * 1024,
         .minimum_free_space = 256 * 1024,
     },
+#endif /* CONFIG_R6_NO_SHOOT_MALLOC */
 
 #if defined(CONFIG_MEMORY_SRM_NOT_WORKING)
     // SJE FIXME SRM is not understood well enough to function on these cams,
@@ -353,6 +355,47 @@ struct memcheck_hdr
     unsigned int length;    /* maybe this too, depending on allocator */
     unsigned int id;        /* on double free attempts, we will read this one after free */
 };
+#ifdef CONFIG_R6_SNAPMEM
+#ifndef CONFIG_R6_NO_SHOOT_MALLOC
+#error "mem.c: CONFIG_R6_SNAPMEM needs CONFIG_R6_NO_SHOOT_MALLOC (allocator 0 = malloc, 1 = AllocateMemory)"
+#endif
+/* M14.1b (R6, spec m14/m141b 6.1): the values this file obtained itself during its allocator choice, for the log snapshot
+ * (lvprobe.c: buffer source and Canon's heap at that time) and its menu - no extra Canon call. Written only here, only under
+ * mem_sem (one writer at a time), only with stores; read without a lock through the seqlock r6_mem_wseq (odd while a write
+ * runs). The same struct is declared in lvprobe.c (size checked there). */
+struct r6_mem_rec
+{
+    uint32_t seq;                      /* __mem_malloc calls since boot */
+    int size, flags, alloc, round;     /* the last call: chosen allocator (-1 none), search round 1..7 (0 none) */
+    const void * ptr;                  /* its result */
+    int f_ml, f_am, max_am;            /* the last values obtained (any call): GetFreeMemForMalloc,
+                                        * GetFreeMemForAllocateMemory, GetMaxRegionForAllocateMemory (raw) */
+    uint32_t s_ml, s_am, s_max;        /* seq of the call that obtained them (0 = never) */
+    int t_am;                          /* ML ms clock when f_am was obtained */
+};
+static struct r6_mem_rec r6_mem_r = { .alloc = -1 };
+static volatile uint32_t r6_mem_wseq = 0;
+#define R6_MEM_W(...) do { r6_mem_wseq++; __sync_synchronize(); __VA_ARGS__; __sync_synchronize(); r6_mem_wseq++; } while (0)
+
+/* a copy of the record (at most 4 tries, no wait; -2 = a write was running), then the allocator of ptr from its
+ * memcheck header (0 malloc, 1 AllocateMemory; -1 for ptr NULL) */
+int r6_mem_info(const void * ptr, struct r6_mem_rec * out)
+{
+    int ok = 0;
+    for (int i = 0; i < 4 && !ok; i++)
+    {
+        uint32_t s1 = r6_mem_wseq;
+        __sync_synchronize();
+        if (s1 & 1) continue;
+        memcpy(out, &r6_mem_r, sizeof(*out));
+        __sync_synchronize();
+        ok = r6_mem_wseq == s1;
+    }
+    if (!ok) return -2;
+    if (!ptr) return -1;
+    return ((const struct memcheck_hdr *) ((uintptr_t) ptr - MEM_SEC_ZONE))->allocator;
+}
+#endif
 
 struct memcheck_entry
 {
@@ -766,6 +809,9 @@ static int search_for_allocator(int size, int require_preferred_size, int requir
         require_dma ? "dma " : ""
     );
     
+#ifdef CONFIG_R6_SNAPMEM
+    R6_MEM_W(r6_mem_r.round++);
+#endif
     for (int a = 0; a < COUNT(allocators); a++)
     {
         int has_non_dma = allocators[a].malloc ? 1 : 0;
@@ -819,6 +865,10 @@ static int search_for_allocator(int size, int require_preferred_size, int requir
         
         /* do we have enough free space without exceeding the preferred limit? */
         int free_space = allocators[a].get_free_space ? allocators[a].get_free_space() : 30*1024*1024;
+#ifdef CONFIG_R6_SNAPMEM
+        if (a == 0) R6_MEM_W(r6_mem_r.f_ml = free_space, r6_mem_r.s_ml = r6_mem_r.seq);
+        if (a == 1) R6_MEM_W(r6_mem_r.f_am = free_space, r6_mem_r.s_am = r6_mem_r.seq, r6_mem_r.t_am = get_ms_clock());
+#endif
         //~ dbg_printf("%s: free space %s\n", allocators[a].name, format_memory_size(free_space));
         if (!(
                 (
@@ -846,6 +896,9 @@ static int search_for_allocator(int size, int require_preferred_size, int requir
         /* do we have a large enough contiguous chunk? */
         /* use a heuristic if we don't know, use a safety margin even if we know */
         int max_region = allocators[a].get_max_region ? allocators[a].get_max_region() - 1024 : free_space / 4;
+#ifdef CONFIG_R6_SNAPMEM
+        if (a == 1 && allocators[a].get_max_region) R6_MEM_W(r6_mem_r.max_am = max_region + 1024, r6_mem_r.s_max = r6_mem_r.seq);
+#endif
         if (size > max_region)
         {
             dbg_printf("%s: max region mismatch %s\n", allocators[a].name, format_memory_size(max_region));
@@ -938,6 +991,9 @@ void* __mem_malloc(size_t size, unsigned int flags, const char *file, unsigned i
 #endif
     ASSERT(mem_sem);
     take_semaphore(mem_sem, 0);
+#ifdef CONFIG_R6_SNAPMEM
+    R6_MEM_W(r6_mem_r.seq++, r6_mem_r.size = size, r6_mem_r.flags = flags, r6_mem_r.alloc = -1, r6_mem_r.round = 0, r6_mem_r.ptr = 0);
+#endif
 
     dbg_printf("alloc(%s) from %s:%d task %s\n",
                format_memory_size_and_flags(size, flags), file, line,
@@ -992,6 +1048,9 @@ void* __mem_malloc(size_t size, unsigned int flags, const char *file, unsigned i
             dbg_printf("alloc ok, took %s%d.%03d s => %x (size %x)\n", FMT_FIXEDPOINT3(t1-t0), ptr, size);
         }
         
+#ifdef CONFIG_R6_SNAPMEM
+        R6_MEM_W(r6_mem_r.alloc = allocator_index, r6_mem_r.ptr = ptr);
+#endif
         give_semaphore(mem_sem);
         return ptr;
     }
@@ -1000,6 +1059,9 @@ void* __mem_malloc(size_t size, unsigned int flags, const char *file, unsigned i
     snprintf(last_error_msg_short, sizeof(last_error_msg_short), "alloc(%s)", format_memory_size_and_flags(size, flags));
     snprintf(last_error_msg, sizeof(last_error_msg), "No allocator for %s at %s:%d, %s.", format_memory_size_and_flags(size, flags), file, line, get_current_task_name());
     dbg_printf("alloc not found\n");
+#ifdef CONFIG_R6_SNAPMEM
+    R6_MEM_W(r6_mem_r.alloc = -1, r6_mem_r.ptr = 0);
+#endif
     give_semaphore(mem_sem);
     return 0;
 }
