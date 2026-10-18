@@ -4389,7 +4389,7 @@ static struct menu_entry lp_menu[] = {
                 .select = lp_snapdelay_select,
                 .update = lp_snapshot_update,
                 .help   = "Captures 10 s after SET: open MENU, Q, playback... File when LV is back (60 s).",
-                .help2  = "Read-only capture: no notice, no file until LV runs. R6 ETTR Apply is refused until then.",
+                .help2  = "Read-only capture: no notice, no file until LV runs. ETTR Apply is refused until then.",
             },
             #ifdef CONFIG_R6_SNAPMEM
             {

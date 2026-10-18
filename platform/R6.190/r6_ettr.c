@@ -213,7 +213,7 @@ static const uint16_t et_hard_ppm[8] = { 5098, 7664, 10000, 12328, 14747, 17321,
 static const uint32_t et_numpix[4] = { 540000, 1093120, 479968, 455400 };
 
 static const char * const et_why_names[] = {
-    "ok", "off", "R6 Interval runs", "Tv write busy", "no live view", "not M", "Auto ISO", "settings unreadable",
+    "ok", "off", "Interval runs", "Tv write busy", "no live view", "not M", "Auto ISO", "settings unreadable",
     "ExpSim off", "magnified", "display size?", "Tv not on 1/3", "limits crossed", "no histogram", "no simulation",
     "frame not bound", "LV idle", "settling", "scene moving", "LV sim out of range",
 };
@@ -223,7 +223,7 @@ static const char * const et_valid_names[] = { "ok", "no LV", "read", "torn", "u
                                                        "magnify", "numpix", "idle", "range" };
 /* M11.1: R6ETT_A_* (<= 30 characters, never a comma: iv.ref and the menu) */
 static const char * const et_a_names[] = {
-    "-", "Mode is not Apply", "Tv writes OFF (R6 Interval)", "busy", "R6 Interval / Motion runs", "log snapshot runs",
+    "-", "Mode is not Apply", "Tv writes OFF (Interval)", "busy", "Interval / Motion trigger runs", "log snapshot runs",
     "not M", "Tv writes", "Tv not on 1/3", "Tv beyond your limits / G", "advisor", "not from the ML menu",
     "no live view", "live view not steady", "clock went back", "Tv changed", "a setting changed", "picture taken",
     "display changed (EVF/LCD)", "half press", "Canon menu / playback", "Trash pressed", "LV not steady",
@@ -1361,16 +1361,16 @@ static void ap_stop(int a)
         else if (ok) snprintf(et_msg, sizeof(et_msg), "ETTR stopped: %s.\nTv back to %s.", r, b1);
         else if (end == R6ETT_E_RESTORED) snprintf(et_msg, sizeof(et_msg), "ETTR stopped: %s.\nTv stays %s.", r, b1);
         else if (end == R6ETT_E_PEND) snprintf(et_msg, sizeof(et_msg), "ETTR stopped: %s.\nTv returns to %s in LV (2 min).", r, b1);
-        else if (end == R6ETT_E_OFFER) snprintf(et_msg, sizeof(et_msg), "ETTR stopped: %s.\nR6 Interval > Tv back to %s.", r, b1);
+        else if (end == R6ETT_E_OFFER) snprintf(et_msg, sizeof(et_msg), "ETTR stopped: %s.\nInterval > Tv back to %s.", r, b1);
         else if (end == R6ETT_E_USER) snprintf(et_msg, sizeof(et_msg), "ETTR stopped: %s.\nYour Tv stays.", r);
-        else snprintf(et_msg, sizeof(et_msg), "ETTR stopped: %s.\nTv not restored (see R6 Interval).", r);
+        else snprintf(et_msg, sizeof(et_msg), "ETTR stopped: %s.\nTv not restored (see Interval).", r);
         ap_box();
     }
     else                                                         /* Tor 1's notice stays on screen; the menu line points to it */
     {
         char r[72];
         ap_reason(r, sizeof(r), a, ap.lock);
-        snprintf(et_msg, sizeof(et_msg), "ETTR stopped: %s. Tor 1 notice: R6 Interval > Tv writes.", r);
+        snprintf(et_msg, sizeof(et_msg), "ETTR stopped: %s. Tor 1 notice: Interval > Tv writes.", r);
     }
     ap_ui = a == R6ETT_A_NONEED ? AP_UI_OK : AP_UI_STOPPED;
     ap_end(end, a);
@@ -1963,7 +1963,7 @@ uint32_t r6_ettr_lv_count(int draw)
 static MENU_UPDATE_FUNC(et_mode_update)
 {
     if (et_mode && !et_lv) MENU_SET_WARNING(MENU_WARN_INFO, "Show in LV is OFF: the proposal is only in this menu.");
-    else if (et_mode == 2 && !_r6pw_on()) MENU_SET_WARNING(MENU_WARN_ADVICE, "Apply once needs R6 Interval > Tv writes ON.");
+    else if (et_mode == 2 && !_r6pw_on()) MENU_SET_WARNING(MENU_WARN_ADVICE, "Apply once needs Interval > Tv writes ON.");
 }
 
 static MENU_UPDATE_FUNC(et_lim_update)
@@ -2105,10 +2105,10 @@ static MENU_UPDATE_FUNC(et_meas_update)
 
 static struct menu_entry et_menu[] = {
     {
-        .name   = "R6 ETTR",
+        .name   = "ETTR",
         .select = menu_open_submenu,
         .help   = "M11.1: proposes a Tv from Canon's LV histogram (R, G, B); Apply once writes it.",
-        .help2  = "M, ExpSim on, ISO fixed. Apply: Tv only, through R6 Interval's Tv writes; ML never presses.",
+        .help2  = "M, ExpSim on, ISO fixed. Apply: Tv only, through Interval's Tv writes; ML never presses.",
         .children = (struct menu_entry[]) {
             {
                 .name    = "Mode",
@@ -2116,7 +2116,7 @@ static struct menu_entry et_menu[] = {
                 .max     = 2,
                 .choices = CHOICES("Off", "Display only", "Apply"),
                 .update  = et_mode_update,
-                .help    = "Apply: also 'Apply once' writes Tv (R6 Interval > Tv writes ON). Never at startup.",
+                .help    = "Apply: also 'Apply once' writes Tv (Interval > Tv writes ON). Never at startup.",
                 .help2   = "Log: Debug > LV probe > Log snapshot writes ETTnnnnn.LOG next to LVPnnnnn.LOG.",
             },
             {

@@ -1443,7 +1443,7 @@ static void pw_pend_start(int why)
             _r6pw_lock_name(S.last_lock), _r6pw_tvs(a, S.last), _r6pw_tvs(b, S.base));
     else if (S.e_ctx == R6PW_CTX_ETTR)            /* M11.1 (3.8) */
         pw_note(1, "ETTR: Tv %s returns to %s\nwhen you are back in LV (2 min).", _r6pw_tvs(a, S.last), _r6pw_tvs(b, S.base));
-    else pw_note(1, "R6 Interval: Tv %s returns to %s\nwhen you are back in LV (2 min).", _r6pw_tvs(a, S.last), _r6pw_tvs(b, S.base));
+    else pw_note(1, "Interval: Tv %s returns to %s\nwhen you are back in LV (2 min).", _r6pw_tvs(a, S.last), _r6pw_tvs(b, S.base));
 }
 
 /* the "Tv back" offer: rec_tv now (a fresh read) */
@@ -1454,8 +1454,8 @@ static void pw_offer(void)
     S.offer = 1;
     S.boot_rec = pw_cs[1].mrec ? pw_cs[1].rec : S.last;
     if (S.e_ctx == R6PW_CTX_ETTR)                 /* M11.1 (3.8) */
-        pw_note(1, "ETTR: Tv not restored. Shoot > R6 Interval\n> Tv back to %s, or turn the dial.", _r6pw_tvs(a, S.base));
-    else pw_note(1, "Tv not restored. Shoot > R6 Interval >\nTv back to %s, or turn the dial.", _r6pw_tvs(a, S.base));
+        pw_note(1, "ETTR: Tv not restored. Shoot > Interval\n> Tv back to %s, or turn the dial.", _r6pw_tvs(a, S.base));
+    else pw_note(1, "Tv not restored. Shoot > Interval >\nTv back to %s, or turn the dial.", _r6pw_tvs(a, S.base));
 }
 
 static void pw_rule(void);
@@ -1821,8 +1821,8 @@ void _r6pw_back_dropped(int why)
 {
     char a[12];
     if (!pw_task()) return;
-    if (why == 1) pw_note(1, "Tv back dropped: no live view.\nIn live view select R6 Interval >\nTv back to %s again.", _r6pw_tvs(a, S.base));
-    else pw_note(1, "Tv back dropped: live view not steady.\nSelect R6 Interval > Tv back to %s\nagain.", _r6pw_tvs(a, S.base));
+    if (why == 1) pw_note(1, "Tv back dropped: no live view.\nIn live view select Interval >\nTv back to %s again.", _r6pw_tvs(a, S.base));
+    else pw_note(1, "Tv back dropped: live view not steady.\nSelect Interval > Tv back to %s\nagain.", _r6pw_tvs(a, S.base));
 }
 
 /* ---- the tick (3.10 order: consumer, boot check, open-request watch, pending restore, offer, marker rule) ---- */
@@ -1888,7 +1888,7 @@ static void pw_boot(int now)
     t[0] = 0;
     int parts = !mok + !!la + !!lb;
     if (parts == 1 && !mok)
-        snprintf(t, sizeof(t), "Tv in M %s, not yours %s:\n%s cut off. R6 Interval >\nTv back, or turn the dial.",
+        snprintf(t, sizeof(t), "Tv in M %s, not yours %s:\n%s cut off. Interval >\nTv back, or turn the dial.",
             _r6pw_tvs(a, r), _r6pw_tvs(b, S.base), S.mk_ctx == R6PW_CTX_ETTR ? "ETTR run" : "ML bracket");   /* M11.1 (3.8) */
     else if (parts == 1)
     {

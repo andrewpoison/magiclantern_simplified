@@ -8,7 +8,8 @@
  *    16 T - 16: 0.5 degC hysteresis). The threshold state is advanced only by r6_temp_poll, once per poll from
  *    r6_tlog_task (skeptic M8); the box, the menu and the log only read it.
  *  - Display > "Temperature": the box text, Show in LV, Warn at, Canon's status, the 8 sensors in 0.1 degC (r6tl_c).
- *  - The box (A 37 degC) is drawn by r6_grid.c on the LCD shooting screen (Global Draw), never during ML's own picture.
+ *  - The box (A 37 degC) is drawn by r6_grid.c on the LCD and (M15.0) EVF shooting screen (Global Draw), never during ML's
+ *    own picture.
  * The degree sign is SYM_DEGREE (ML's font), never UTF-8.
  */
 #include "dryos.h"
@@ -189,8 +190,8 @@ static struct menu_entry r6tb_menu[] = {
                 .priv    = &temp_lv,
                 .max     = 1,
                 .depends_on = DEP_GLOBAL_DRAW,
-                .help    = "A box with sensor A (whole " SYM_DEGREE "C, as in EXIF) on the LCD shooting screen (Global Draw).",
-                .help2   = "Not in the EVF, not during an exposure. Saved.",
+                .help    = "A box with sensor A (" SYM_DEGREE "C as in EXIF), LCD and EVF (Global Draw).",
+                .help2   = "Not during an exposure. Saved.",
             },
             {
                 .name    = "Warn at",

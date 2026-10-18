@@ -1,14 +1,15 @@
 /*
  * R6.190 M14.1: the camera temperature (r6_temp.c, CONFIG_R6_TEMP; spec m14/m141 spec_m141.md Rev. 2, 2.2 / 4.2 / 5.2):
  * Display > "Temperature" (sensor A as in EXIF, Canon's 8 sensors in 0.1 degC, Canon's status) and a small box on the LCD
- * shooting screen (drawn by r6_grid.c). Everything from r6_tlog_task's newest poll (Tor 0g, read only). No Canon access here.
+ * and (M15.0) EVF shooting screen (drawn by r6_grid.c). Everything from r6_tlog_task's newest poll (Tor 0g, read only). No
+ * Canon access here.
  */
 #ifndef _r6_temp_h_
 #define _r6_temp_h_
 
 #include <stdint.h>
 
-#define R6TB_X1        704      /* the box: right edge (exclusive), under Canon's / ML's histogram */
+#define R6TB_X1        704      /* the box: right edge (exclusive), under Canon's / ML's histogram (LCD and EVF, M15.0) */
 #define R6TB_Y0        122      /* its top row */
 #define R6TB_STALE_MS  5000     /* a poll older than this is no value */
 

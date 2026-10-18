@@ -26,8 +26,13 @@
  * (ML's own arithmetic on ML's settings; this task is its only caller). Read-only exports for r6_temp.c / r6_aclock.c:
  * r6tl_now (the newest poll) and r6tl_rtc (the newest RTC pair), both seqlock copies without waiting, and r6tl_tz_now (the
  * time-zone struct through the snapshot's evaluation r6tl_tz_eval, with its own buffers r6tl_qa / r6tl_qb; only
- * r6_aclock_task calls it). The snapshot ends with the tb.* / ac.* lines of r6_temp.c / r6_aclock.c (copies only), printed
- * with r6tl_pf / r6tl_i / r6tl_u.
+ * the astro clock's step calls it). The snapshot ends with the tb.* / ac.* lines of r6_temp.c / r6_aclock.c (copies only),
+ * printed with r6tl_pf / r6tl_i / r6tl_u.
+ *
+ * M15.0 (E-b, spec m15/m150 1; nothing new at Canon): the astro clock has no task of its own any more (its 4 KB stack go
+ * back to Canon's task memory sys_mem). r6_tlog_task runs its step r6_ac_step after each poll; the loop body is r6tl_poll,
+ * and while the clock computes a night, its chunk callback polls through r6tl_poll_due when a poll is due. Everything
+ * stays in this one task: r6tl_seq and r6ac_seq keep one writer each, LoadCalendarFromRTC stays in r6tl_poll only.
  */
 #include "dryos.h"
 #include "tasks.h"
@@ -60,6 +65,7 @@
 #define R6TL_RING_MS  10000     /* one ring entry per this */
 #define R6TL_RTC_MS   60000     /* one RTC pair per this (the first with the first ring entry) */
 #define R6TL_RING_N   32        /* ring entries (320 s) */
+#define R6TL_SLEEP_MIN_MS 10    /* M15.0: the shortest sleep of the task's loop (after a long step of the astro clock) */
 #define R6TL_TZ_MAX   33        /* the zone table is read only for 1 <= len <= this (Tor 0g: 33 x 8 B, Canon's table) */
 
 /* the only Canon load of this file: aligned, off <= ext - 4 (off + 4 could wrap), [base, base + ext) inside one allowed region */
@@ -93,83 +99,112 @@ static struct r6tl_s r6tl_s;            /* written by r6tl_task only */
 static struct r6tl_s r6tl_cp;           /* the snapshot's copy (r6tl_ast only; lp_snap_busy: one reader at a time) */
 static volatile uint32_t r6tl_seq = 0;  /* odd while r6tl_task writes r6tl_s */
 static int16_t r6tl_last[8];            /* the task's previous poll */
+/* M15.0 (E-b): the poll's own state, touched only in r6_tlog_task (up to M14.1c the locals of the task's loop): the last ring
+ * entry, the last RTC pair, the polls and the polls with a change in the ring window; the start of the last poll (the loop's
+ * deadline, r6tl_poll_due); 1 while r6tl_poll_due polls (no nesting) */
+static int t_ring, t_rtc, win_n, win_chg;
+static int r6tl_t_poll, r6tl_in_poll;
+
+/* one poll: M14.0's loop body. M15.0 (E-b): from r6_tlog_task's loop and, while the astro clock computes there (r6_ac_step),
+ * from its chunk callback through r6tl_poll_due - always this task, so r6tl_seq keeps its one writer */
+static void r6tl_poll(void)
+{
+    int now = get_ms_clock();
+    int16_t t[8];
+    uint32_t st = 0;
+    int okm = 0;
+    r6tl_t_poll = now;
+    for (int i = 0; i < 8; i++)
+    {
+        uint32_t w = 0;
+        okm |= r6tl_rd(R6TL_TAB, 0x60, 12 * i + 4, &w) << i;
+        t[i] = (int16_t) (w & 0xFFFF);
+    }
+    int st_ok = r6tl_rd(R6TL_STATUS, 4, 0, &st);
+    int warn = 0, hyst = 0;
+#ifdef CONFIG_R6_TEMP
+    warn = r6_temp_poll(t[3], (okm >> 3) & 1, st, st_ok, &hyst);   /* M14.1: the warning state, ML's own arithmetic */
+#endif
+    int chg = r6tl_s.polls && memcmp(t, r6tl_last, sizeof(t));
+    memcpy(r6tl_last, t, sizeof(t));
+    win_n += win_n < 255;
+    win_chg += chg && win_chg < 255;
+    int ring = now - t_ring >= R6TL_RING_MS;
+    r6tl_seq++;
+    __sync_synchronize();
+    if (r6tl_s.polls) r6tl_s.pgmax = MAX(r6tl_s.pgmax, now - r6tl_s.tpoll);
+    else r6tl_s.tchg = now;
+    r6tl_s.tpoll = now;
+    r6tl_s.polls++;
+    memcpy(r6tl_s.cur, t, sizeof(t));
+    r6tl_s.cur_ok = okm;
+    r6tl_s.cur_st = st;
+    r6tl_s.cur_st_ok = st_ok;
+    r6tl_s.cur_warn = warn;
+    r6tl_s.cur_hyst = hyst;
+    r6tl_s.cur_t = now;
+    if (chg)
+    {
+        r6tl_s.pchg++;
+        if (now - r6tl_s.tchg > r6tl_s.gmax) { r6tl_s.gmax = now - r6tl_s.tchg; r6tl_s.gend = now; }
+        r6tl_s.tchg = now;
+    }
+    if (ring)
+    {
+        struct r6tl_e * e = &r6tl_s.r[r6tl_s.n % R6TL_RING_N];
+        e->t = now; e->a = t[3]; e->sh = t[5]; e->isa = t[6]; e->isb = t[7]; e->st = st;
+        e->nchg = win_chg; e->npoll = win_n;
+        r6tl_s.n++;
+        t_ring = now;
+        win_n = 0;
+        win_chg = 0;
+    }
+    __sync_synchronize();
+    r6tl_seq++;
+    if (ring && (!r6tl_s.rtc_n || now - t_rtc >= R6TL_RTC_MS))
+    {
+        /* the RTC pair: outside the seqlock (the call waits for Canon's RTC task), stored under it */
+        struct tm tm;
+        memset(&tm, 0, sizeof(tm));
+        int t0 = get_ms_clock();
+        LoadCalendarFromRTC(&tm);
+        int t1 = get_ms_clock();
+        t_rtc = now;
+        r6tl_seq++;
+        __sync_synchronize();
+        r6tl_s.tm = tm;
+        r6tl_s.rtc_t = t1;
+        r6tl_s.rtc_dur = t1 - t0;
+        r6tl_s.rtc_n++;
+        r6tl_s.rtc_max = MAX(r6tl_s.rtc_max, t1 - t0);
+        __sync_synchronize();
+        r6tl_seq++;
+    }
+}
+
+/* M15.0 (E-b): a poll if R6TL_POLL_MS passed since the start of the last one. Only from the astro clock's chunk callback
+ * r6ac_yield, which runs in r6_tlog_task (r6_ac_step): the temperature and the RTC pair keep their pace during a night */
+void r6tl_poll_due(void)
+{
+    if (r6tl_in_poll || get_ms_clock() - r6tl_t_poll < R6TL_POLL_MS) return;
+    r6tl_in_poll = 1;
+    r6tl_poll();
+    r6tl_in_poll = 0;
+}
 
 static void r6tl_task(void * unused)
 {
-    int t_ring = get_ms_clock(), t_rtc = 0, win_n = 0, win_chg = 0;
+    t_ring = r6tl_t_poll = get_ms_clock();
     TASK_LOOP
     {
-        msleep(R6TL_POLL_MS);
-        int now = get_ms_clock();
-        int16_t t[8];
-        uint32_t st = 0;
-        int okm = 0;
-        for (int i = 0; i < 8; i++)
-        {
-            uint32_t w = 0;
-            okm |= r6tl_rd(R6TL_TAB, 0x60, 12 * i + 4, &w) << i;
-            t[i] = (int16_t) (w & 0xFFFF);
-        }
-        int st_ok = r6tl_rd(R6TL_STATUS, 4, 0, &st);
-        int warn = 0, hyst = 0;
-#ifdef CONFIG_R6_TEMP
-        warn = r6_temp_poll(t[3], (okm >> 3) & 1, st, st_ok, &hyst);   /* M14.1: the warning state, ML's own arithmetic */
+        /* M15.0: after a long step of the clock (R6TL_SLEEP_MIN_MS or more since the start of the last poll) the next poll comes
+         * R6TL_POLL_MS after that start; otherwise the plain R6TL_POLL_MS sleep of M14.0 (the same pace and phase as before) */
+        int w = R6TL_POLL_MS - (get_ms_clock() - r6tl_t_poll);
+        msleep(w > R6TL_POLL_MS - R6TL_SLEEP_MIN_MS ? R6TL_POLL_MS : COERCE(w, R6TL_SLEEP_MIN_MS, R6TL_POLL_MS));
+        r6tl_poll();
+#ifdef CONFIG_R6_ACLOCK
+        r6_ac_step();                   /* M15.0 (E-b): the astro clock, only here (r6_aclock.c; no task of its own) */
 #endif
-        int chg = r6tl_s.polls && memcmp(t, r6tl_last, sizeof(t));
-        memcpy(r6tl_last, t, sizeof(t));
-        win_n += win_n < 255;
-        win_chg += chg && win_chg < 255;
-        int ring = now - t_ring >= R6TL_RING_MS;
-        r6tl_seq++;
-        __sync_synchronize();
-        if (r6tl_s.polls) r6tl_s.pgmax = MAX(r6tl_s.pgmax, now - r6tl_s.tpoll);
-        else r6tl_s.tchg = now;
-        r6tl_s.tpoll = now;
-        r6tl_s.polls++;
-        memcpy(r6tl_s.cur, t, sizeof(t));
-        r6tl_s.cur_ok = okm;
-        r6tl_s.cur_st = st;
-        r6tl_s.cur_st_ok = st_ok;
-        r6tl_s.cur_warn = warn;
-        r6tl_s.cur_hyst = hyst;
-        r6tl_s.cur_t = now;
-        if (chg)
-        {
-            r6tl_s.pchg++;
-            if (now - r6tl_s.tchg > r6tl_s.gmax) { r6tl_s.gmax = now - r6tl_s.tchg; r6tl_s.gend = now; }
-            r6tl_s.tchg = now;
-        }
-        if (ring)
-        {
-            struct r6tl_e * e = &r6tl_s.r[r6tl_s.n % R6TL_RING_N];
-            e->t = now; e->a = t[3]; e->sh = t[5]; e->isa = t[6]; e->isb = t[7]; e->st = st;
-            e->nchg = win_chg; e->npoll = win_n;
-            r6tl_s.n++;
-            t_ring = now;
-            win_n = 0;
-            win_chg = 0;
-        }
-        __sync_synchronize();
-        r6tl_seq++;
-        if (ring && (!r6tl_s.rtc_n || now - t_rtc >= R6TL_RTC_MS))
-        {
-            /* the RTC pair: outside the seqlock (the call waits for Canon's RTC task), stored under it */
-            struct tm tm;
-            memset(&tm, 0, sizeof(tm));
-            int t0 = get_ms_clock();
-            LoadCalendarFromRTC(&tm);
-            int t1 = get_ms_clock();
-            t_rtc = now;
-            r6tl_seq++;
-            __sync_synchronize();
-            r6tl_s.tm = tm;
-            r6tl_s.rtc_t = t1;
-            r6tl_s.rtc_dur = t1 - t0;
-            r6tl_s.rtc_n++;
-            r6tl_s.rtc_max = MAX(r6tl_s.rtc_max, t1 - t0);
-            __sync_synchronize();
-            r6tl_seq++;
-        }
     }
 }
 
@@ -288,7 +323,7 @@ static void r6tl_tab(struct r6tl_tv * t)
 /* the time-zone struct (+0x20 .. +0x30: len, table, DST, free offset, zone) and, for 1 <= len <= 33, its table */
 struct r6tl_zv { uint32_t f[5]; int tab; uint32_t t[2 * R6TL_TZ_MAX]; };
 static struct r6tl_zv r6tl_za, r6tl_zb;     /* the snapshot's (r6tl_ast only) */
-static struct r6tl_zv r6tl_qa, r6tl_qb;     /* M14.1: r6tl_tz_now's (r6_aclock_task only; skeptic H2) */
+static struct r6tl_zv r6tl_qa, r6tl_qb;     /* M14.1: r6tl_tz_now's (the clock's step only; skeptic H2) */
 static void r6tl_tz(uint32_t q, struct r6tl_zv * z)
 {
     for (int k = 0; k < 5; k++)
@@ -335,7 +370,8 @@ static int r6tl_tz_eval(uint32_t q, struct r6tl_zv * za, struct r6tl_zv * zb, st
     return 1;
 }
 
-/* M14.1: the time-zone struct now, for r6_aclock_task only (never a menu update, a drawing path or the snapshot): its own
+/* M14.1: the time-zone struct now, for the clock's step only (r6_ac_step in r6_tlog_task since M15.0; never a menu update, a
+ * drawing path or the snapshot): its own
  * buffers; valid_ac = valid and read twice equal and the zone found in Canon's table (skeptic M3); 1 = valid_ac */
 int r6tl_tz_now(struct r6tl_tz * o)
 {

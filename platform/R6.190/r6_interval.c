@@ -476,11 +476,11 @@ static const char * const iv_cam_names[] = {
     "Canon CC: mechaless mode", "Canon interval timer on", "Canon timer setting (0x80040064) on", "interval < exposure + 2s",
     "B: Tv not Bulb", "Canon CC: not B", "Canon CC: Tv not Bulb", "Canon bulb timer off",                     /* M9.2 */
     "Canon bulb timer not 0:00:31..0:30:00", "Canon bulb not idle", "Canon CC: 0x5E8 set",
-    "other series running", "B: not for R6 Motion (M, Tv up to 30 s)", "no memory for the detector",   /* M9.3 */
+    "other series running", "B: Motion trigger needs M, Tv <= 30 s", "no memory for the detector",   /* M9.3 */
     "WB bracketing on", "Canon HDR mode on", "multiple exposure on", "focus bracketing on", "multi-shot NR on",   /* M10.2 */
     "bracket: M only", "Tv writes", "bracket Tv list", "bracket: over 50 pictures",
     "Tv write open: no ML pictures until restart", "not from the ML menu",
-    "R6 ETTR running",                                                                                  /* M11.1 */
+    "ETTR running",                                                                                  /* M11.1 */
 };
 /* every enum value has its name (a missing one would be a NULL %s) */
 typedef char iv_stop_names_complete[COUNT(iv_stop_names) == R6IV_NSTOPS ? 1 : -1];
@@ -1130,7 +1130,7 @@ int r6_iv_menu_block(void)
     {
         st.menu_blocked++;
         _r6ettr_trash();                     /* one store (volatile et_trash), the run acts in r6_iv_task (2.5, 2.8) */
-        NotifyBox(3000, "R6 ETTR: Apply stops.\nPress Trash again for the ML menu.");
+        NotifyBox(3000, "ETTR: Apply stops.\nPress Trash again for the ML menu.");
         return 1;
     }
 #endif
@@ -1144,13 +1144,13 @@ int r6_iv_menu_block(void)
     /* M9.3 review F5: the feature whose picture runs (a bulb is always R6 Interval's). Review round 2: every line fits
      * the screen (FONT_LARGE at x = 50: <= 670 px, argnor32 widths: bulb 433 / 503 / 391 px at 1799/1800 s, the others
      * <= 619 px); the bulb text is 94 characters at 1799/1800 s (NotifyBox keeps 98) */
-    const char * nm = (iv_in_pic && st.mode != R6IV_MODE_INTERVAL) ? "R6 Motion" : "R6 Interval";
-    if (ovr) NotifyBox(3000, "R6 Interval: bulb did not end.\nPress the shutter fully once, or switch off.");
+    const char * nm = (iv_in_pic && st.mode != R6IV_MODE_INTERVAL) ? "Motion trigger" : "Interval";
+    if (ovr) NotifyBox(3000, "Interval: bulb did not end.\nPress the shutter fully once, or switch off.");
     else if (iv_bulb && !iv_bulb_end_t)                   /* M9.3: up to 30 min */
-        NotifyBox(3000, "R6 Interval: bulb %d/%d s.\nAbort: full press, not near the end.\nML menu after the picture.", MAX(get_ms_clock() - iv_t1, 0) / 1000, iv_bulb_s);
-    else if (iv_bulb) NotifyBox(3000, "R6 Interval: Canon busy (NR).\nML menu after it.");
-    else if (evb && _r6pw_state()->ev_on) NotifyBox(3000, "R6 Interval: bracket %d/%d running.\nML menu after it.", MIN(bk.k + 1, bk.n), bk.n);
-    else if (evb) NotifyBox(3000, "R6 Interval: Tv restore running.\nML menu after it.");   /* review round 1, safety L5 */
+        NotifyBox(3000, "Interval: bulb %d/%d s.\nAbort: full press, not near the end.\nML menu after the picture.", MAX(get_ms_clock() - iv_t1, 0) / 1000, iv_bulb_s);
+    else if (iv_bulb) NotifyBox(3000, "Interval: Canon busy (NR).\nML menu after it.");
+    else if (evb && _r6pw_state()->ev_on) NotifyBox(3000, "Interval: bracket %d/%d running.\nML menu after it.", MIN(bk.k + 1, bk.n), bk.n);
+    else if (evb) NotifyBox(3000, "Interval: Tv restore running.\nML menu after it.");   /* review round 1, safety L5 */
     else NotifyBox(3000, "%s: picture running.\nPress Trash again right after it.", nm);
     return 1;
 }
@@ -2298,7 +2298,7 @@ static void iv_tick(int now, int dt)
     /* M10.2b: a series, Test or R6 Motion run started after "Tv back to ..." was selected drops the command (no write
      * during or after the run; the offer stays, select it again); Start is not refused for it */
     if (iv_back_t && st.running)
-        iv_back_drop_now(st.mode != R6IV_MODE_INTERVAL ? "R6 Motion started" : st.test ? "Test started" : "series started", 0);
+        iv_back_drop_now(st.mode != R6IV_MODE_INTERVAL ? "Motion trigger started" : st.test ? "Test started" : "series started", 0);
     if (iv_back_t && !st.running) iv_back_tick(now);
 #ifdef CONFIG_R6_ETTR
     if (r6_ettr_run_active())                              /* M11.1: one step of the run per tick (r6_ettr.c, no sleep) */
@@ -2493,7 +2493,7 @@ static MENU_UPDATE_FUNC(iv_start_update)
     if (r6_iv_md_running())                  /* M9.3 */
     {
         MENU_SET_NAME("Start");
-        MENU_SET_VALUE("R6 Motion running");
+        MENU_SET_VALUE("Motion trigger running");
         MENU_SET_ICON(MNI_ACTION, 0);
         return;
     }
@@ -2861,7 +2861,7 @@ static MENU_SELECT_FUNC(iv_back_select)
         : (p->landed_ae && !p->landed_ok && p->landed_ae2 && !p->landed_ok2) ? "ML's Tv in 2 modes: set them first"
         : shooting_mode != SHOOTMODE_M ? "set M first" : p->armed ? "busy"
         : (st.running || iv_cmd) ? "series running"         /* M10.2 review round 2 (S2-1): two open landed records */
-        : iv_ettr_busy() ? "R6 ETTR running" : 0;           /* M11.1: X2 */
+        : iv_ettr_busy() ? "ETTR running" : 0;           /* M11.1: X2 */
     iv_back_why = why;
     if (!why) iv_cmd = 5;
 }
@@ -2890,7 +2890,7 @@ static MENU_UPDATE_FUNC(iv_apo_update)
 
 static struct menu_entry iv_menu[] = {
     {
-        .name   = "R6 Interval",
+        .name   = "Interval",
         .select = menu_open_submenu,
         .help   = "M9.3: pictures at an interval (shutter callbacks, no settings written).",
         .help2  = "M: Tv up to 30 s. B: Canon timer 31 s .. 30 min (ML menu waits for it). Single, MF, max 50.",

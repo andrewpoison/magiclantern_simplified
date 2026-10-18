@@ -7,11 +7,15 @@
  *    10 s, valid only when read twice equal and found in Canon's table; one failed read keeps the last zone for at most
  *    30 s) or the manual offset of the menu. After a change of Canon's zone / DST the clock waits for an RTC pair taken
  *    after the change (Canon moved its clock too; skeptic M4);
- *  - the night (local noon .. noon) is computed by r6_acore.c in the task r6_aclock_task only: once per new key (noon,
+ *  - the night (local noon .. noon) is computed by r6_acore.c in the clock's step only: once per new key (noon,
  *    location, offset, Milky Way criteria) that stayed 1 s unchanged, in chunks of at most AC_CHUNK evaluations with a
  *    10 ms sleep between them (r6_tlog_task and r6_hist_task share priority 0x1f; skeptic H3); a newer key aborts it;
  *  - "now" every 10 s at the location of the night's key; phases with each night and when one is passed;
  *  - results go to r6ac_pub under a seqlock; the menu updates, the LV line (r6_grid.c) and the log only copy them.
+ * M15.0 (E-b, spec m15/m150 1): no task of its own (r6_aclock_task gave its 4 KB stack back to Canon's sys_mem). The step
+ * r6_ac_step runs in r6_tlog_task after each poll (the clock's tick: R6AC_TASK_MS - R6AC_TICK_SLACK_MS); the chunk callback
+ * polls the temperature / RTC through r6tl_poll_due when a poll is due. A published state older than R6AC_PAIR_MAX_MS (the
+ * task stands, e.g. in LoadCalendarFromRTC) reads as "clock invalid" (r6ac_look), as an old RTC pair did before.
  * Location by hand only (no GPS, E8), 0.01 deg, saved, default 50.60 N / 11.30 E.
  * Writes: this file's own state and settings. No Canon RAM / MMIO / property write, no new Canon call; msleep only here.
  * Texts: no "%%" in a format (Canon's vsnprintf takes an argument for it, QEMU q141a): the percent sign is a "%s" argument.
@@ -61,7 +65,7 @@ struct r6ac_stat
     int calc_ms, pair_age, fails_row;
 };
 
-/* the published state (writer r6_aclock_task, seqlock r6ac_seq) */
+/* the published state (writer: the clock's step in r6_tlog_task, seqlock r6ac_seq) */
 struct r6ac_res
 {
     uint8_t state, night_ok, now_ok, zvalid, pending, src, eu, pad;
@@ -108,7 +112,7 @@ static int r6ac_get(struct r6ac_res * o)
     return 0;
 }
 
-/* ---- the zone (r6_aclock_task only) ---- */
+/* ---- the zone (the clock's step only) ---- */
 static struct r6tl_tz r6ac_zv;         /* the last valid zone */
 static int r6ac_zv_ok, r6ac_zv_t, r6ac_fails, r6ac_pend, r6ac_pend_t;
 
@@ -145,6 +149,7 @@ static int r6ac_yield(void * ctx)
     c->us_sum += d;
     if (d > c->us_chunk) c->us_chunk = d;
     msleep(R6AC_YIELD_MS);
+    r6tl_poll_due();                    /* M15.0: r6_tlog_task's poll when due (not counted as computing time: before t_us) */
     c->t_us = get_us_clock();
     return c->lat != r6ac_lat || c->lon != r6ac_lon || c->gc != r6ac_mwgc || c->sun != r6ac_mwsun || c->src != r6ac_tzsrc
         || c->utcq != r6ac_utcq;
@@ -203,136 +208,134 @@ static int r6ac_mdays(int y, int m)
     return ml[m - 1] + (m == 2 && !(y & 3));
 }
 
-static void r6ac_task(void * unused)
+/* M15.0 (E-b): one step of the clock, from r6_tlog_task after its poll (up to M14.1c the loop body of r6_aclock_task; its
+ * locals are this function's statics: only r6_tlog_task runs it). At most one step per R6AC_TASK_MS - R6AC_TICK_SLACK_MS: at
+ * the camera's poll pace (1 s plus the wake-up delay) the clock ticks with every poll */
+void r6_ac_step(void)
 {
-    int t_tz = 0, t_now = 0, key_t = 0, first = 1, have_loc = 0, last_n = 0, pend_ok = 0;
-    int32_t last_loc = 0;
-    struct r6ac_key pend;
-    memset(&pend, 0, sizeof(pend));
-    TASK_LOOP
+    static int t_tz = 0, t_now = 0, key_t = 0, first = 1, have_loc = 0, last_n = 0, pend_ok = 0, t_step = 0;
+    static int32_t last_loc = 0;
+    static struct r6ac_key pend;
+    const int now = get_ms_clock();
+    if (now - t_step < R6AC_TASK_MS - R6AC_TICK_SLACK_MS) return;
+    t_step = now;
+    struct r6ac_res * r = &r6ac_r;
+    struct r6ac_stat * s = &r->st;
+    const int src = COERCE(r6ac_tzsrc, 0, 1);
+    struct r6ac_key want;
+    want.loc.lat_e2 = COERCE(r6ac_lat, -9000, 9000);
+    want.loc.lon_e2 = COERCE(r6ac_lon, -18000, 18000);
+    want.crit.gc_min_deg = r6ac_gc_deg[COERCE(r6ac_mwgc, 0, 2)];
+    want.crit.sun_max_deg = r6ac_sun_deg[COERCE(r6ac_mwsun, 0, 2)];
+
+    /* the zone */
+    if (first || now - t_tz >= R6AC_TZ_MS) { t_tz = now; r6ac_zone(now); }
+    first = 0;
+    const int zuse = r6ac_zv_ok && (r6ac_fails == 0 || (r6ac_fails < 2 && now - r6ac_zv_t <= R6AC_ZONE_KEEP_MS));
+
+    /* the clock: the newest RTC pair, extrapolated */
+    struct tm tm;
+    int t_ms = 0, n = 0, st = R6AC_OK;
+    int32_t locs = 0;
+    memset(&tm, 0, sizeof(tm));
+    if (!r6tl_rtc(&tm, &t_ms, &n)) st = R6AC_WAIT;
+    else
     {
-        msleep(R6AC_TASK_MS);
-        const int now = get_ms_clock();
-        struct r6ac_res * r = &r6ac_r;
-        struct r6ac_stat * s = &r->st;
-        const int src = COERCE(r6ac_tzsrc, 0, 1);
-        struct r6ac_key want;
-        want.loc.lat_e2 = COERCE(r6ac_lat, -9000, 9000);
-        want.loc.lon_e2 = COERCE(r6ac_lon, -18000, 18000);
-        want.crit.gc_min_deg = r6ac_gc_deg[COERCE(r6ac_mwgc, 0, 2)];
-        want.crit.sun_max_deg = r6ac_sun_deg[COERCE(r6ac_mwsun, 0, 2)];
-
-        /* the zone */
-        if (first || now - t_tz >= R6AC_TZ_MS) { t_tz = now; r6ac_zone(now); }
-        first = 0;
-        const int zuse = r6ac_zv_ok && (r6ac_fails == 0 || (r6ac_fails < 2 && now - r6ac_zv_t <= R6AC_ZONE_KEEP_MS));
-
-        /* the clock: the newest RTC pair, extrapolated */
-        struct tm tm;
-        int t_ms = 0, n = 0, st = R6AC_OK;
-        int32_t locs = 0;
-        memset(&tm, 0, sizeof(tm));
-        if (!r6tl_rtc(&tm, &t_ms, &n)) st = R6AC_WAIT;
+        const int y = tm.tm_year + 1900, mo = tm.tm_mon + 1, age = now - t_ms;
+        s->pair_age = age;
+        if (mo < 1 || mo > 12 || tm.tm_mday < 1 || tm.tm_mday > r6ac_mdays(y, mo) || tm.tm_hour < 0 || tm.tm_hour > 23
+            || tm.tm_min < 0 || tm.tm_min > 59 || tm.tm_sec < 0 || tm.tm_sec > 60 || age < 0 || age > R6AC_PAIR_MAX_MS)
+            st = R6AC_CLOCK_BAD;
+        else if (y < R6AC_Y_MIN || y > R6AC_Y_MAX) st = R6AC_RANGE;
         else
         {
-            const int y = tm.tm_year + 1900, mo = tm.tm_mon + 1, age = now - t_ms;
-            s->pair_age = age;
-            if (mo < 1 || mo > 12 || tm.tm_mday < 1 || tm.tm_mday > r6ac_mdays(y, mo) || tm.tm_hour < 0 || tm.tm_hour > 23
-                || tm.tm_min < 0 || tm.tm_min > 59 || tm.tm_sec < 0 || tm.tm_sec > 60 || age < 0 || age > R6AC_PAIR_MAX_MS)
-                st = R6AC_CLOCK_BAD;
-            else if (y < R6AC_Y_MIN || y > R6AC_Y_MAX) st = R6AC_RANGE;
-            else
+            locs = ac_utc_s(y, mo, tm.tm_mday, tm.tm_hour, tm.tm_min, MIN(tm.tm_sec, 59), 0) + age / 1000;
+            if (have_loc && locs < last_loc && last_loc - locs <= 2)
             {
-                locs = ac_utc_s(y, mo, tm.tm_mday, tm.tm_hour, tm.tm_min, MIN(tm.tm_sec, 59), 0) + age / 1000;
-                if (have_loc && locs < last_loc && last_loc - locs <= 2)
-                {
-                    if (n != last_n) s->back_jumps++;   /* a new pair a little behind the extrapolation: hold */
-                    locs = last_loc;
-                }
-                last_loc = locs;
-                have_loc = 1;
+                if (n != last_n) s->back_jumps++;   /* a new pair a little behind the extrapolation: hold */
+                locs = last_loc;
             }
-            if (r6ac_pend && t_ms - r6ac_pend_t > 0) r6ac_pend = 0;   /* a pair taken after the zone change */
+            last_loc = locs;
+            have_loc = 1;
         }
-        last_n = n;
+        if (r6ac_pend && t_ms - r6ac_pend_t > 0) r6ac_pend = 0;   /* a pair taken after the zone change */
+    }
+    last_n = n;
 
-        /* the offset */
-        int32_t off = 0;
-        if (st == R6AC_OK)
-        {
-            if (src) off = 15 * COERCE(r6ac_utcq, -48, 56);
-            else if (!zuse) st = R6AC_TZ_BAD;
-            else if (r6ac_pend) st = R6AC_PENDING;
-            else off = r6ac_zv.total;
-        }
-        r->src = src;
-        r->zvalid = zuse;
-        r->pending = r6ac_pend;
-        r->off = off;
-        r->local_s = locs;
-        r->utc_s = locs - off * 60;
-        r->tick_ms = now;
-        r->zu_zone = r6ac_zv.zone; r->zu_dst = r6ac_zv.dst; r->zu_off = r6ac_zv.off; r->zu_total = r6ac_zv.total;
-        /* the EU DST hint needs today's UTC date: only with a valid clock and offset (review R1 F1: not while waiting, with an
-         * invalid clock or after a zone change) */
-        if (st == R6AC_OK) r6ac_eu(r->utc_s);
-        else r->eu = 0;
+    /* the offset */
+    int32_t off = 0;
+    if (st == R6AC_OK)
+    {
+        if (src) off = 15 * COERCE(r6ac_utcq, -48, 56);
+        else if (!zuse) st = R6AC_TZ_BAD;
+        else if (r6ac_pend) st = R6AC_PENDING;
+        else off = r6ac_zv.total;
+    }
+    r->src = src;
+    r->zvalid = zuse;
+    r->pending = r6ac_pend;
+    r->off = off;
+    r->local_s = locs;
+    r->utc_s = locs - off * 60;
+    r->tick_ms = now;
+    r->zu_zone = r6ac_zv.zone; r->zu_dst = r6ac_zv.dst; r->zu_off = r6ac_zv.off; r->zu_total = r6ac_zv.total;
+    /* the EU DST hint needs today's UTC date: only with a valid clock and offset (review R1 F1: not while waiting, with an
+     * invalid clock or after a zone change) */
+    if (st == R6AC_OK) r6ac_eu(r->utc_s);
+    else r->eu = 0;
 
-        if (st == R6AC_OK)
+    if (st == R6AC_OK)
+    {
+        /* the night's key: from the local noon of today (from 12:00 on) or of yesterday */
+        int Y, M, D, h, mi, sc, wd;
+        ac_civil(locs, 0, &Y, &M, &D, &h, &mi, &sc, &wd);
+        if (h < 12) ac_civil(locs - 86400, 0, &Y, &M, &D, &h, &mi, &sc, &wd);
+        want.t0 = ac_utc_s(Y, M, D, 12, 0, 0, off);
+        want.off = off;
+        r->want = want;
+        int do_now = 0, phases = 0;
+        if (!r->night_ok || !r6ac_keq(&r->nk, &want))
         {
-            /* the night's key: from the local noon of today (from 12:00 on) or of yesterday */
-            int Y, M, D, h, mi, sc, wd;
-            ac_civil(locs, 0, &Y, &M, &D, &h, &mi, &sc, &wd);
-            if (h < 12) ac_civil(locs - 86400, 0, &Y, &M, &D, &h, &mi, &sc, &wd);
-            want.t0 = ac_utc_s(Y, M, D, 12, 0, 0, off);
-            want.off = off;
-            r->want = want;
-            int do_now = 0, phases = 0;
-            if (!r->night_ok || !r6ac_keq(&r->nk, &want))
+            st = R6AC_COMPUTING;
+            if (!pend_ok || !r6ac_keq(&pend, &want)) { pend = want; pend_ok = 1; key_t = now; s->key_changes++; }
+            else if (now - key_t >= R6AC_DEBOUNCE_MS)
             {
-                st = R6AC_COMPUTING;
-                if (!pend_ok || !r6ac_keq(&pend, &want)) { pend = want; pend_ok = 1; key_t = now; s->key_changes++; }
-                else if (now - key_t >= R6AC_DEBOUNCE_MS)
-                {
-                    s->debounced++;
-                    r->state = st;
-                    r6ac_publish();
-                    r6ac_cx_start();
-                    int rc = ac_night(&want.loc, &want.crit, want.t0, &r6ac_wk, &r6ac_nb, r6ac_yield, &r6ac_cx);
-                    r6ac_cx_end(1);
-                    if (rc == 0)
-                    {
-                        r->n = r6ac_nb;
-                        r->nk = want;
-                        r->night_ok = 1;
-                        s->n_night++;
-                        s->calc_ms = get_ms_clock();
-                        pend_ok = 0;
-                        do_now = phases = 1;
-                        st = R6AC_OK;
-                    }
-                    else s->aborts++;
-                }
-            }
-            if (r->night_ok && (do_now || !r->now_ok || now - t_now >= R6AC_NOW_MS))
-            {
-                const int32_t u = r->utc_s;
-                if (!r->now_ok || u >= r->w.next_new || u >= r->w.next_full || r->w.next_new == AC_NONE || r->w.next_full == AC_NONE)
-                    phases = 1;
-                r6ac_wb = r->w;
+                s->debounced++;
+                r->state = st;
+                r6ac_publish();
                 r6ac_cx_start();
-                int rc = ac_now(&r->nk.loc, u, phases, &r6ac_wk, &r6ac_wb, r6ac_yield, &r6ac_cx);
-                r6ac_cx_end(0);
-                if (rc == 0) { r->w = r6ac_wb; r->now_ok = 1; s->n_now++; t_now = now; }
+                int rc = ac_night(&want.loc, &want.crit, want.t0, &r6ac_wk, &r6ac_nb, r6ac_yield, &r6ac_cx);
+                r6ac_cx_end(1);
+                if (rc == 0)
+                {
+                    r->n = r6ac_nb;
+                    r->nk = want;
+                    r->night_ok = 1;
+                    s->n_night++;
+                    s->calc_ms = get_ms_clock();
+                    pend_ok = 0;
+                    do_now = phases = 1;
+                    st = R6AC_OK;
+                }
                 else s->aborts++;
             }
         }
-        r->state = st;
-        r6ac_publish();
+        if (r->night_ok && (do_now || !r->now_ok || now - t_now >= R6AC_NOW_MS))
+        {
+            const int32_t u = r->utc_s;
+            if (!r->now_ok || u >= r->w.next_new || u >= r->w.next_full || r->w.next_new == AC_NONE || r->w.next_full == AC_NONE)
+                phases = 1;
+            r6ac_wb = r->w;
+            r6ac_cx_start();
+            int rc = ac_now(&r->nk.loc, u, phases, &r6ac_wk, &r6ac_wb, r6ac_yield, &r6ac_cx);
+            r6ac_cx_end(0);
+            if (rc == 0) { r->w = r6ac_wb; r->now_ok = 1; s->n_now++; t_now = now; }
+            else s->aborts++;
+        }
     }
+    r->state = st;
+    r6ac_publish();
 }
-
-TASK_CREATE("r6_aclock_task", r6ac_task, 0, 0x1f, 0x1000);
 
 /* ---- text (copies only; no division by 10 / 60: small loops) ---- */
 static int r6ac_dm(int32_t v, int32_t d, int32_t * rest)
@@ -405,6 +408,9 @@ struct r6ac_v { struct r6ac_res r; int got, ok, night, now; int32_t utc, loc; };
 static void r6ac_look(struct r6ac_v * v)
 {
     v->got = r6ac_get(&v->r);
+    /* M15.0 (E-b): the step runs in r6_tlog_task; a published state older than R6AC_PAIR_MAX_MS (that task stands, e.g. in
+     * LoadCalendarFromRTC) is no clock, in this copy (the published state stays): status, LV line and log all follow */
+    if (v->got && get_ms_clock() - v->r.tick_ms > R6AC_PAIR_MAX_MS) v->r.state = R6AC_CLOCK_BAD;
     v->ok = v->got && (v->r.state == R6AC_OK || v->r.state == R6AC_COMPUTING);
     v->night = v->ok && v->r.night_ok;
     v->now = v->night && v->r.now_ok;
@@ -791,7 +797,7 @@ static MENU_UPDATE_FUNC(r6ac_utcq_update)
 
 static MENU_UPDATE_FUNC(r6ac_lv_update)
 {
-    if (r6ac_lv && r6_ettr_lv_wanted()) MENU_SET_WARNING(MENU_WARN_INFO, "R6 ETTR's line is shown instead (it has priority).");
+    if (r6ac_lv && r6_ettr_lv_wanted()) MENU_SET_WARNING(MENU_WARN_INFO, "ETTR's line is shown instead (it has priority).");
 }
 
 static MENU_UPDATE_FUNC(r6ac_status_update)
@@ -935,7 +941,7 @@ static struct menu_entry r6ac_menu[] = {
                 .max     = 1,
                 .depends_on = DEP_GLOBAL_DRAW,
                 .update  = r6ac_lv_update,
-                .help    = "One line on the LCD shooting screen (Global Draw). R6 ETTR's line has priority.",
+                .help    = "One line on the LCD shooting screen (Global Draw). ETTR's line has priority.",
                 .help2   = "Saved.",
             },
             {

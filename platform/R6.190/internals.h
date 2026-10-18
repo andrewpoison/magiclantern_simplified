@@ -208,11 +208,13 @@
 
 /* R6.190 M14.1 (spec m14/m141 spec_m141.md Rev. 2; docs/m14_plan.md E1..E13, approved 2026-10-15, read only; "M14.1
  * starten" 2026-10-16): Display > "Temperature" (r6_temp.c: sensor A in whole degC as in EXIF, Canon's 8 sensors in 0.1 degC,
- * the warning at Canon's status != 0 or "Warn at", default 45 degC) with a small box on the LCD shooting screen, and
+ * the warning at Canon's status != 0 or "Warn at", default 45 degC) with a small box on the LCD (M15.0: and EVF) shooting
+ * screen, and
  * Display > "Astro clock" (r6_aclock.c, r6_acore.c: twilight, moon, Milky Way, Polaris; location by hand, no GPS; UTC from
- * the camera clock and Canon's time zone or a manual offset) with an optional LV line in R6 ETTR's place (ETTR first).
- * Only r6_tlog_task's newest poll, RTC pair and the time-zone struct of Tor 0g; the night is computed in r6_aclock_task in
- * chunks with a sleep between them. Drawing only in r6_grid.c (overlay task, write-under, LCD). No new Canon address, no new
+ * the camera clock and Canon's time zone or a manual offset) with an optional LV line in ETTR's place (ETTR first).
+ * Only r6_tlog_task's newest poll, RTC pair and the time-zone struct of Tor 0g; the night is computed in chunks with a sleep
+ * between them, since M15.0 (E-b) in r6_tlog_task itself (r6_ac_step, no task of its own). Drawing only in r6_grid.c
+ * (overlay task, write-under, LCD; the temperature box also in the EVF since M15.0). No new Canon address, no new
  * Canon call, no write to Canon RAM / MMIO / properties. Need CONFIG_R6_TLOG, CONFIG_R6_GRID and (clock) CONFIG_R6_ETTR. */
 #define CONFIG_R6_TEMP
 #define CONFIG_R6_ACLOCK

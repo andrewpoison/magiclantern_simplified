@@ -696,7 +696,7 @@ static MENU_UPDATE_FUNC(md_det_update)
 
 static MENU_UPDATE_FUNC(md_cam_update)
 {
-    if (shooting_mode == SHOOTMODE_BULB) { MENU_SET_VALUE("B: not for motion"); return; }
+    if (shooting_mode == SHOOTMODE_BULB) { MENU_SET_VALUE("B: not for Motion trigger"); return; }
     MENU_SET_VALUE("%s", r6_iv_cam_name(r6_iv_cam_check()));
 }
 
@@ -711,7 +711,7 @@ static MENU_UPDATE_FUNC(md_last_update)
 
 static struct menu_entry md_menu[] = {
     {
-        .name   = "R6 Motion",
+        .name   = "Motion trigger",
         .select = menu_open_submenu,
         .update = md_main_update,
         .help   = "M9.3: picture when something moves (Canon's FaceYuv image, shutter callbacks).",
@@ -730,7 +730,7 @@ static struct menu_entry md_menu[] = {
                 .update  = md_fixed_update,
                 .max     = 1,
                 .choices = (const char *[]) { "Display only", "Release" },
-                .help    = "Display only: detector runs and counts. Release: takes pictures (R6 Interval checks).",
+                .help    = "Display only: detector runs and counts. Release: takes pictures (Interval checks).",
             },
             {
                 .name    = "Trigger",
@@ -813,7 +813,7 @@ static struct menu_entry md_menu[] = {
                 .name   = "Camera",
                 .update = md_cam_update,
                 .icon_type = IT_ALWAYS_ON,
-                .help   = "Release: R6 Interval's camera check (M, Tv up to 30 s, single, MF).",
+                .help   = "Release: Interval's camera check (M, Tv up to 30 s, single, MF).",
             },
             {
                 .name   = "Last run",

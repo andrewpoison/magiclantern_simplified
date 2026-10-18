@@ -75,6 +75,9 @@
  * line's place when R6 ETTR has no text (ETTR first), the owner flag
  * gr_et_own counts each erase for the one who drew. drawn and r6_grid_erase
  * cover both.
+ *
+ * M15.0 (spec m15/m150 4): the temperature box also in the EVF, at the same
+ * ML coordinates (gr_tb_step); the ETTR / clock line stays LCD only.
  */
 
 #include "dryos.h"
@@ -613,8 +616,12 @@ static int gr_et_step(uint8_t * b, uint8_t * m)
 #ifdef CONFIG_R6_TEMP
 /* M14.1: the temperature box (r6_temp.c r6_temp_lv_text, spec m14/m141 5.2): right-aligned at R6TB_X1, top R6TB_Y0, under
  * Canon's and ML's histogram place, outside the ETTR line; fixed width (the widest text "A -40 degC! S99"), white on black
- * or (warning) black on yellow; LCD shooting screen only, the same rules as the ETTR line (mirror cleared, drawn only on a
- * new text / colour or a missing corner: the corners are checked against the current fill colour, skeptic M7) */
+ * or (warning) black on yellow; the same rules as the ETTR line (mirror cleared, drawn only on a new text / colour or a
+ * missing corner: the corners are checked against the current fill colour, skeptic M7). M15.0 (spec m15/m150 4, former
+ * M14.2): also in the EVF, at the same ML coordinates (image rows -30..449 there, M7.7: right, just below ML's histogram
+ * place; Canon's info bar below the image is not touched; write-under keeps Canon's elements on top), under the overlay
+ * gate of every other overlay (EVF only with Canon's 1280 x 854 stills layout at (0, 0); erased at every LCD <-> EVF
+ * switch by r6_gd_erase, then drawn again on the new screen). The ETTR / clock line stays LCD only. */
 #define GR_TB_FONT  FONT(FONT_MED, COLOR_WHITE, COLOR_BLACK)
 #define GR_TB_FONTW FONT(FONT_MED, COLOR_BLACK, COLOR_YELLOW)
 static char gr_tb_text[24];              /* the text in the box */
@@ -642,7 +649,7 @@ static int gr_tb_step(uint8_t * b, uint8_t * m)
 {
     char t[sizeof(gr_tb_text)];
     int warn = 0;
-    if (r6_gd_evf || !r6_temp_lv_text(t, sizeof(t), &warn)) return gr_tb_erase(b, m);
+    if (!r6_temp_lv_text(t, sizeof(t), &warn)) return gr_tb_erase(b, m);   /* M15.0: LCD and EVF */
     const int col = warn ? COLOR_YELLOW : COLOR_BLACK;
     if (gr_tb_valid && col == gr_tb_col && !strcmp(t, gr_tb_text) && gr_tb_intact(b)) return 0;
     if (!gr_tb_w)

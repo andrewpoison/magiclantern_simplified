@@ -39,7 +39,12 @@ int r6tl_now(struct r6tl_now * o);
 struct tm;
 int r6tl_rtc(struct tm * tm, int * t_ms, int * n);
 
-/* M14.1: the time-zone struct now (Tor 0g, double read, every pointer checked; only r6_aclock_task calls it) */
+/* M15.0 (E-b): r6_tlog_task's poll when one is due (R6TL_POLL_MS since the start of the last one); only from the astro
+ * clock's chunk callback r6ac_yield, which runs in r6_tlog_task (r6_ac_step) */
+void r6tl_poll_due(void);
+
+/* M14.1: the time-zone struct now (Tor 0g, double read, every pointer checked; only the clock's step calls it, in r6_tlog_task
+ * since M15.0) */
 enum { R6TL_TZF_PTR = 1, R6TL_TZF_TAB, R6TL_TZF_TORN, R6TL_TZF_NOZONE, R6TL_TZF_RANGE, R6TL_TZF_DST };
 struct r6tl_tz
 {
