@@ -232,6 +232,12 @@
  * snapshot. Needs CONFIG_R6_NO_SHOOT_MALLOC. */
 #define CONFIG_R6_SNAPMEM
 
+/* R6.190 M14.1c (Tor 0h, user decision 2026-10-17; spec m14/m141c spec_m141c.md Rev. 2): before the snapshot task, lvprobe.c reads
+ * Canon's task memory sys_mem (0xFCF24, read only, every node checked, no Canon call, no lock): without one free block of >= 16,400 B
+ * "Log snapshot" shows "no task memory" instead of Err 70 and creates no task; unreadable: as M14.1b. Debug > LV probe "Task memory"
+ * and the LVP log (snap.sys_*) show the largest block and the free sum. Needs CONFIG_R6_SNAPMEM. */
+#define CONFIG_R6_TASKMEM
+
 #define CONFIG_TASK_STRUCT_V2_SMP
 #define CONFIG_TASK_ATTR_STRUCT_V5
 

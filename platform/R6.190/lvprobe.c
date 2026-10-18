@@ -3321,6 +3321,143 @@ static void lp_bs_line(struct lp_buf * b, const char * key, const struct lp_bufs
         r->f_am, r->max_am, r->rej);
 }
 
+#ifdef CONFIG_R6_TASKMEM
+#ifndef CONFIG_R6_SNAPMEM
+#error "lvprobe.c: CONFIG_R6_TASKMEM needs CONFIG_R6_SNAPMEM (the snapshot task it checks)"
+#endif
+/* ---- M14.1c (spec m14/m141c 2..6, Tor 0h, user decision 2026-10-17): Canon's task memory sys_mem, read only ----
+ * A task stack of n bytes takes one free block of align8(n + 8) from sys_mem (first fit, ROM 0xE0142C70); the snapshot task
+ * (0x3000) needs 12,296 B in one piece. Before task_create, the free list is walked like Canon's 0xE02CACF4 (size, next per node)
+ * without a Canon call, without a lock, without a write: the range is checked once (r6_fy_ram_ok), then every node arithmetically
+ * against the constants before its two loads (aligned, inside the pool, ascending, size plausible), at most LP_SYS_NMAX nodes; two
+ * passes between three header reads, the invariant free + used == total, up to LP_SYS_TRIES attempts. Worst case: "unknown",
+ * and then the snapshot behaves exactly as in M14.1b. */
+#define LP_SYS_POOL     0x000FCF24u   /* Tor 0h: Canon's sys_mem pool struct, 9 words (spec m14/m141c 2) */
+#define LP_SYS_START    0x002ADE98u   /* pinned [+4] */
+#define LP_SYS_LEN      0x000E2200u   /* pinned [+0]; [+8] must be LEN - 8 */
+#define LP_SYS_HDR      8             /* pinned [+0x10]: a block of n bytes takes align8(n + 8) */
+#define LP_SYS_NMAX     256           /* free nodes per pass, at most */
+#define LP_SYS_TRIES    4             /* attempts (two passes each) */
+#define LP_SYS_NEED     ((LP_SNAP_STACK + LP_SYS_HDR + 7) & ~7)   /* 0x3008 = 12,296 */
+#define LP_SYS_RESERVE  0x1008        /* left for Canon: one default 4 KB task stack */
+#define LP_SYS_MIN      (LP_SYS_NEED + LP_SYS_RESERVE)            /* 0x4010 = 16,400 */
+#define LP_SYS_LO       (LP_SYS_START + LP_SYS_HDR)               /* first byte a free node may start at */
+#define LP_SYS_HI       (LP_SYS_START + LP_SYS_LEN)               /* end of the pool (exclusive) */
+#define LP_SYS_RD(a)    (*(volatile const uint32_t *) (a))        /* the only Canon load of the M14.1c code */
+_Static_assert(LP_SYS_NEED == 0x3008 && LP_SYS_MIN == 0x4010, "M14.1c: the snapshot task's block and the threshold (spec 3, 5)");
+#define LP_SYS_OK       0
+#define LP_SYS_LAYOUT   1             /* a fixed header field differs: no node is read, no further attempt */
+#define LP_SYS_NODE     2             /* a node pointer or size outside the rules */
+#define LP_SYS_ORDER    3             /* backwards, a cycle or an overlap */
+#define LP_SYS_MANY     4             /* more than LP_SYS_NMAX nodes */
+#define LP_SYS_SUM      5             /* free + used != total */
+#define LP_SYS_BUSY     6             /* changed while read (headers / passes differ, a header in Canon's intermediate state) */
+struct lp_sys { int ok, why, tries; uint32_t largest, sum, nfree, used, count, peak, t; uint32_t h[9]; };   /* h: the last header read */
+struct lp_sys_pr { uint32_t n, sum, largest, x; int why; };
+#define LP_SR_NOTASK    4             /* lp_snap_res: refused before the task, no task memory */
+#define LP_SYS_DEC_RUN  1             /* lp_sys_pre_dec: the task was created after an ok check */
+#define LP_SYS_DEC_UNK  2             /* ... after an unknown check (exactly M14.1b) */
+#define LP_SYS_DEC_DIR  3             /* the direct call (QEMU test): read for the log only */
+static struct lp_sys lp_sys_boot, lp_sys_pre, lp_sys_cap, lp_sys_menu;
+static int lp_sys_pre_dec = 0, lp_sys_menu_n = 0, lp_sys_menu_t = 0;
+static int lp_sys_refusals = 0, lp_sys_ref_largest = 0, lp_sys_ref_t = 0;
+
+/* the header: 9 loads, nothing else (a leaf) */
+static void __attribute__((noinline)) lp_sys_hdr(uint32_t * h)
+{
+    h[0] = LP_SYS_RD(LP_SYS_POOL + 0x00);
+    h[1] = LP_SYS_RD(LP_SYS_POOL + 0x04);
+    h[2] = LP_SYS_RD(LP_SYS_POOL + 0x08);
+    h[3] = LP_SYS_RD(LP_SYS_POOL + 0x0C);
+    h[4] = LP_SYS_RD(LP_SYS_POOL + 0x10);
+    h[5] = LP_SYS_RD(LP_SYS_POOL + 0x14);
+    h[6] = LP_SYS_RD(LP_SYS_POOL + 0x18);
+    h[7] = LP_SYS_RD(LP_SYS_POOL + 0x1C);
+    h[8] = LP_SYS_RD(LP_SYS_POOL + 0x20);
+}
+
+/* a header: the fixed fields (LAYOUT), then the consistency of the moving ones (BUSY: Canon writes used before peak) */
+static inline __attribute__((always_inline)) int lp_sys_hok(const uint32_t * h)
+{
+    if (h[0] != LP_SYS_LEN || h[1] != LP_SYS_START || h[2] != LP_SYS_LEN - 8 || h[4] != LP_SYS_HDR || !(h[5] & 2)) return LP_SYS_LAYOUT;
+    if (h[7] > h[2] || h[7] > h[6] || h[6] > h[2] || h[8] > h[2] / 8) return LP_SYS_BUSY;
+    return LP_SYS_OK;
+}
+
+/* one pass over the free list from p (a leaf): every node checked before its two loads, only arithmetic on the constants */
+static int __attribute__((noinline)) lp_sys_pass(uint32_t p, struct lp_sys_pr * r)
+{
+    uint32_t n = 0, sum = 0, largest = 0, x = 0, end = LP_SYS_LO;
+    int why = LP_SYS_OK;
+    while (p)
+    {
+        if (n >= LP_SYS_NMAX) { why = LP_SYS_MANY; break; }
+        if ((p & 7) || p < LP_SYS_LO || p > LP_SYS_HI - 8) { why = LP_SYS_NODE; break; }   /* before any load */
+        if (p < end) { why = LP_SYS_ORDER; break; }                                        /* backwards, cycle, overlap */
+        uint32_t size = LP_SYS_RD(p), next = LP_SYS_RD(p + 4);
+        if ((size & 7) || size < LP_SYS_HDR || size > LP_SYS_HI - p) { why = LP_SYS_NODE; break; }
+        sum += size;
+        if (size > largest) largest = size;
+        n++;
+        x = x * 31 + (p ^ size);
+        end = p + size;
+        p = next;
+    }
+    r->n = n; r->sum = sum; r->largest = largest; r->x = x; r->why = why;
+    return why;
+}
+
+/* spec 4.4: 1 = ok (consistent), 0 = unknown (why); never a crash. Calls only r6_fy_ram_ok, lp_sys_hdr, lp_sys_pass */
+static int __attribute__((noinline)) lp_sys_read(struct lp_sys * r)
+{
+    uint32_t h2[9], h3[9];
+    struct lp_sys_pr a, b;
+    int why = LP_SYS_LAYOUT;
+    r->ok = 0; r->tries = 0; r->largest = 0; r->sum = 0; r->nfree = 0; r->used = 0; r->count = 0; r->peak = 0;
+    if (!r6_fy_ram_ok(LP_SYS_POOL, 0x24) || !r6_fy_ram_ok(LP_SYS_START, LP_SYS_LEN)) { r->why = LP_SYS_LAYOUT; return 0; }   /* no load */
+    for (int t = 0; t < LP_SYS_TRIES; t++)
+    {
+        r->tries = t + 1;
+        lp_sys_hdr(r->h);
+        r->used = r->h[7]; r->count = r->h[8]; r->peak = r->h[6];
+        why = lp_sys_hok(r->h);
+        if (why == LP_SYS_LAYOUT) break;                    /* no node load, no further attempt */
+        if (why) continue;
+        int wa = lp_sys_pass(r->h[3], &a);
+        lp_sys_hdr(h2);
+        lp_sys_pass(h2[3], &b);
+        lp_sys_hdr(h3);
+        int w2 = lp_sys_hok(h2), w3 = lp_sys_hok(h3);
+        if (w2 == LP_SYS_LAYOUT || w3 == LP_SYS_LAYOUT) { why = LP_SYS_LAYOUT; break; }
+        why = LP_SYS_BUSY;
+        if (w2 || w3) continue;
+        if (h2[3] != r->h[3] || h3[3] != r->h[3] || h2[7] != r->h[7] || h3[7] != r->h[7] || h2[8] != r->h[8] || h3[8] != r->h[8]
+            || h2[6] != r->h[6] || h3[6] != r->h[6]) continue;
+        if (a.n != b.n || a.sum != b.sum || a.largest != b.largest || a.x != b.x || a.why != b.why) continue;
+        why = wa;
+        if (why) continue;
+        why = LP_SYS_SUM;
+        if (a.sum + r->h[7] != r->h[2]) continue;
+        r->ok = 1; r->why = LP_SYS_OK; r->largest = a.largest; r->sum = a.sum; r->nfree = a.n;
+        return 1;
+    }
+    r->why = why;
+    return 0;
+}
+
+static const char * lp_sys_why(int w)
+{
+    return w == LP_SYS_LAYOUT ? "layout" : w == LP_SYS_NODE ? "node" : w == LP_SYS_ORDER ? "order" : w == LP_SYS_MANY ? "many" :
+        w == LP_SYS_SUM ? "sum" : w == LP_SYS_BUSY ? "busy" : w == LP_SYS_OK ? "ok" : "?";
+}
+
+static void lp_sys_line(struct lp_buf * b, const char * key, const struct lp_sys * s, const char * dec)
+{
+    lp_printf(b, "%s=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d%s%s\n", key, s->ok, s->why, s->tries, (int) s->largest, (int) s->sum,   /* %d: DryOS has no %u */
+        (int) s->nfree, (int) s->used, (int) s->count, (int) s->peak, (int) s->t, dec ? "," : "", dec ? dec : "");
+}
+
+#endif
 /* spec 6.2: the snap.* lines (at most 480 B, before census A: inside the static budget, never cut) */
 static void lp_snap_lines(struct lp_buf * b)
 {
@@ -3335,6 +3472,20 @@ static void lp_snap_lines(struct lp_buf * b)
     lp_printf(b, "snap.skip=%d\n", lp_skip_tl);
 #else
     lp_printf(b, "snap.skip=0\n");
+#endif
+#ifdef CONFIG_R6_TASKMEM
+    /* M14.1c (spec m14/m141c 6.2): sys_mem at ML's init, before the task (the decision), in the task; the refusals */
+    lp_printf(b, "# sys_mem 0xFCF24 (m141c 6.2): ok,why,tries,largest,free,nfree,used,count,peak,t_ms[,dec]; min %d\n", LP_SYS_MIN);
+    lp_sys_line(b, "snap.sys_boot", &lp_sys_boot, 0);
+    lp_sys_line(b, "snap.sys_pre", &lp_sys_pre, lp_sys_pre_dec == LP_SYS_DEC_RUN ? "run" : lp_sys_pre_dec == LP_SYS_DEC_UNK ? "unknown" : lp_sys_pre_dec == LP_SYS_DEC_DIR ? "direct" : "-");
+    lp_sys_line(b, "snap.sys_cap", &lp_sys_cap, 0);
+    lp_printf(b, "snap.sys_ref=%d,%d,%d\n", lp_sys_refusals, lp_sys_ref_largest, lp_sys_ref_t);
+    if (lp_sys_pre.why == LP_SYS_LAYOUT && lp_sys_pre.tries)
+    {
+        const uint32_t * h = lp_sys_pre.h;
+        lp_printf(b, "snap.sys_raw=%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X,%08X\n", (unsigned) h[0], (unsigned) h[1], (unsigned) h[2], (unsigned) h[3],
+            (unsigned) h[4], (unsigned) h[5], (unsigned) h[6], (unsigned) h[7], (unsigned) h[8]);
+    }
 #endif
 }
 #else
@@ -3597,6 +3748,13 @@ int lvprobe_snapshot_run(int delay_ms)
 #ifdef CONFIG_R6_SNAPMEM
     lp_snap_kind = 0;
 #endif
+#ifdef CONFIG_R6_TASKMEM
+    lp_sys_read(&lp_sys_pre);             /* M14.1c (spec 5, C5): for the log only, never a refusal (no task here) */
+    lp_sys_pre.t = get_ms_clock();
+    lp_sys_pre_dec = LP_SYS_DEC_DIR;
+    lp_sys_read(&lp_sys_cap);
+    lp_sys_cap.t = get_ms_clock();
+#endif
     lp_snapshot_do(0, delay_ms);
     lp_snap_busy = 0;
     return 1;
@@ -3643,6 +3801,10 @@ static void lp_snapdelay_task(int unused)
  * the task started: the untouched 0x19980218 words; tskmon reads the task's DryOS record at the next switch to it) */
 static void lp_snap_entry(void * arg)
 {
+#ifdef CONFIG_R6_TASKMEM
+    lp_sys_read(&lp_sys_cap);             /* M14.1c (spec 6.2): sys_mem with this task's stack taken */
+    lp_sys_cap.t = get_ms_clock();
+#endif
 #ifdef CONFIG_R6_ASTRO
     if (arg) lp_snapdelay_task(0);
     else
@@ -3661,7 +3823,26 @@ static void lp_snap_entry(void * arg)
 /* the menu's two selects (busy flag set there, before the task exists); as run_in_separate_task: the ML menu closes first */
 static void __attribute__((noinline)) lp_snap_start(int delayed)
 {
+#ifdef CONFIG_R6_TASKMEM
+    /* M14.1c (spec m14/m141c 5): Tor 0h, read only, right before the task. One free block >= LP_SYS_MIN, else no task (no Err 70):
+     * the ML menu stays open with the reason. sys_mem not readable for sure ("unknown"): exactly M14.1b */
+    int ok = lp_sys_read(&lp_sys_pre);
+    lp_sys_pre.t = get_ms_clock();
+    if (ok && lp_sys_pre.largest < LP_SYS_MIN)
+    {
+        lp_sys_refusals++;
+        lp_sys_ref_largest = lp_sys_pre.largest;
+        lp_sys_ref_t = lp_sys_pre.t;
+        lp_snap_res = LP_SR_NOTASK;
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "no task memory: %d < %d", (int) lp_sys_pre.largest, LP_SYS_MIN);
+        lp_snap_busy = 0;
+        return;
+    }
+    lp_sys_pre_dec = ok ? LP_SYS_DEC_RUN : LP_SYS_DEC_UNK;
+    lp_snap_kind = delayed ? 2 : 1;       /* only after the check (spec 5, C2) */
+#else
     lp_snap_kind = delayed ? 2 : 1;
+#endif
     gui_stop_menu();
     task_create("lp_snapshot", LP_SNAP_PRIO, LP_SNAP_STACK, lp_snap_entry, (void *) delayed);
 }
@@ -4131,6 +4312,9 @@ static MENU_UPDATE_FUNC(lp_mem_update)
     const struct lp_bufsrc * f = lp_snap_res == LP_SR_NOLVP ? &lp_bs_lvp : &lp_bs_ast;
     const char * why = f->why == LP_WHY_FLOOR ? "AM < 1M" : f->why == LP_WHY_BUSY ? "busy" : "none";
     if (lp_snap_res == LP_SR_NONE) n += snprintf(t + n, sizeof(t) - n, "Last: none.");
+#ifdef CONFIG_R6_TASKMEM
+    else if (lp_snap_res == LP_SR_NOTASK) n += snprintf(t + n, sizeof(t) - n, "Last: no task memory (largest %d B).", lp_sys_ref_largest);
+#endif
     else if (lp_snap_res == LP_SR_OK)
         n += snprintf(t + n, sizeof(t) - n, "Last: LVP %dK %s, AST %dK %s.", lp_bs_lvp.size / 1024, lp_src_name(lp_bs_lvp.src),
             lp_bs_ast.size / 1024, lp_src_name(lp_bs_ast.src));
@@ -4142,6 +4326,29 @@ static MENU_UPDATE_FUNC(lp_mem_update)
 }
 #endif
 
+#ifdef CONFIG_R6_TASKMEM
+/* M14.1c (spec 6.1): display only; sys_mem read at most once per second (ML's ms clock), kB rounded down */
+static MENU_UPDATE_FUNC(lp_sys_update)
+{
+    int now = get_ms_clock();
+    if (!lp_sys_menu_n || now - lp_sys_menu_t >= 1000)
+    {
+        lp_sys_read(&lp_sys_menu);
+        lp_sys_menu.t = now;
+        lp_sys_menu_t = now;
+        lp_sys_menu_n++;
+    }
+    const struct lp_sys * s = &lp_sys_menu;
+    char bt[32];
+    if (s->ok) MENU_SET_VALUE("largest %dkB  free %dkB", (int) (s->largest / 1024), (int) (s->sum / 1024));
+    else MENU_SET_VALUE("unknown (%s)", lp_sys_why(s->why));
+    if (lp_sys_boot.ok) snprintf(bt, sizeof(bt), "Boot %dkB/%dkB.", (int) (lp_sys_boot.largest / 1024), (int) (lp_sys_boot.sum / 1024));
+    else snprintf(bt, sizeof(bt), "Boot unknown.");
+    MENU_SET_WARNING(MENU_WARN_INFO, "%d blocks, used %dkB/%dkB, peak %dkB, %d obj. %s Need %d B.", (int) s->nfree, (int) (s->used / 1024),
+        (int) ((LP_SYS_LEN - 8) / 1024), (int) (s->peak / 1024), (int) s->count, bt, LP_SYS_MIN);
+}
+
+#endif
 static struct menu_entry lp_menu[] = {
     {
         .name   = "LV probe",
@@ -4191,6 +4398,14 @@ static struct menu_entry lp_menu[] = {
                 .help   = "Free space as mem.c saw it at its last allocation (no extra Canon call).",
                 .help2  = "ML = malloc pool (keeps 256K), AM = Canon AllocateMemory heap (snapshot keeps 1M).",
             },
+            #ifdef CONFIG_R6_TASKMEM
+            {
+                .name   = "Task memory",
+                .update = lp_sys_update,
+                .help   = "Canon task memory (sys_mem), read only: the snapshot task needs one free block >= 16kB.",
+                .help2  = "Below that: \"no task memory\" instead of Err 70. unknown = as M14.1b.",
+            },
+            #endif
             #ifdef CONFIG_R6_TLOG
             {
                 .name   = "Skip temp/clock log",
@@ -4241,6 +4456,10 @@ static struct menu_entry lp_menu[] = {
 
 static void lp_init()
 {
+#ifdef CONFIG_R6_TASKMEM
+    lp_sys_read(&lp_sys_boot);            /* M14.1c (spec 6.3): sys_mem at ML's init, once */
+    lp_sys_boot.t = get_ms_clock();
+#endif
     menu_add("Debug", lp_menu, COUNT(lp_menu));
 }
 
