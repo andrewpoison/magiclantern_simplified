@@ -409,6 +409,14 @@ static int db_traceback (lua_State *L) {
 }
 
 
+#ifdef CONFIG_R6_LUA
+/* M16.0 (spec m16/m160 4.4, K2): only getinfo and traceback (strict.lua, config.lua, logger.lua, calc.lua) */
+static const luaL_Reg dblib[] = {
+  {"getinfo", db_getinfo},
+  {"traceback", db_traceback},
+  {NULL, NULL}
+};
+#else
 static const luaL_Reg dblib[] = {
   {"debug", db_debug},
   {"getuservalue", db_getuservalue},
@@ -428,6 +436,7 @@ static const luaL_Reg dblib[] = {
   {"traceback", db_traceback},
   {NULL, NULL}
 };
+#endif
 
 
 LUAMOD_API int luaopen_debug (lua_State *L) {

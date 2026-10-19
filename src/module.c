@@ -47,6 +47,12 @@ static struct msg_queue * module_mq = 0;
 #define MSG_MODULE_LOAD_OFFLINE_STRINGS 3 /* argument: module index in high half (FFFF0000) */
 #define MSG_MODULE_UNLOAD_OFFLINE_STRINGS 4 /* same argument */
 
+#ifdef CONFIG_R6_MODSUP
+/* M16.0 (spec m16/m160 3.3.1, 5.1): the symbol file's task_create must point to r6_task_try_create (the R6 task model), else no
+ * module is linked (r6_alias_seen / r6_alias_ok live in r6_modsup.c); the module code buffer NULL is a link failure */
+#include "r6_modsup.h"                  /* platform/R6.190 */
+#endif
+
 static int module_load_symbols(TCCState *s, char *filename)
 {
     uint32_t size = 0;
@@ -54,6 +60,10 @@ static int module_load_symbols(TCCState *s, char *filename)
     char *buf = NULL;
     uint32_t count = 0;
     uint32_t pos = 0;
+#ifdef CONFIG_R6_MODSUP
+    r6_alias_seen = 0;
+    r6_alias_ok = 0;
+#endif
 
     if( FIO_GetFileSize( filename, &size ) != 0 )
     {
@@ -120,6 +130,13 @@ static int module_load_symbols(TCCState *s, char *filename)
         }
         //~ sscanf(address_buf, "%x", &address);
         address = strtoul(address_buf, NULL, 16);
+#ifdef CONFIG_R6_MODSUP
+        if (!strcmp(symbol_buf, "task_create"))
+        {
+            r6_alias_seen++;
+            r6_alias_ok = address == (uint32_t) &r6_task_try_create;
+        }
+#endif
 
         tcc_add_symbol(s, symbol_buf, (void*)address);
         count++;
@@ -514,6 +531,9 @@ static void _module_load_all(uint32_t list_only)
     uint32_t module_cnt = 0;
     struct fio_file file;
     uint32_t update_properties = 0;
+#ifdef CONFIG_R6_MODSUP
+    int r6_link_nomem = 0;      /* M16.0 (spec m16/m160 5.1): bytes of module code without a buffer */
+#endif
 
     if(module_console_enabled)
     {
@@ -658,6 +678,24 @@ static void _module_load_all(uint32_t list_only)
         return;
     }
     
+#ifdef CONFIG_R6_MODSUP
+    /* M16.0 (spec m16/m160 3.3.1): a stale, foreign or overwritten symbol file: no module task may bypass the R6 task model */
+    if (r6_alias_seen != 1 || !r6_alias_ok)
+    {
+        printf("  [E] " CONFIG_MODULES_MODEL_SYM " without R6 task alias: no module linked\n");
+        for (uint32_t mod = 0; mod < module_cnt; mod++)
+        {
+            if(module_list[mod].enabled)
+            {
+                module_list[mod].error = 1;
+                snprintf(module_list[mod].status, sizeof(module_list[mod].status), "Err");
+                snprintf(module_list[mod].long_status, sizeof(module_list[mod].long_status), "Linking failed (no R6 task alias)");
+            }
+        }
+        tcc_delete(state); console_show();
+        return;
+    }
+#endif
     /* load modules */
     printf("Load modules...\n");
     for (uint32_t mod = 0; mod < module_cnt; mod++)
@@ -699,7 +737,13 @@ static void _module_load_all(uint32_t list_only)
             {
                 module_list[mod].error = 1;
                 snprintf(module_list[mod].status, sizeof(module_list[mod].status), "FileErr");
+#ifdef CONFIG_R6_MODSUP
+                /* M16.0 (spec m16/m160 5.1): with its arguments (without, %s read junk; page 0 is unmapped on the R6); lowercase %x:
+                 * Canon's vsnprintf turned -1 with %02X into a byte 0xFF and an F (QEMU m160c C1) */
+                snprintf(module_list[mod].long_status, sizeof(module_list[mod].long_status), "Load failed: %s, ret 0x%x", module_list[mod].filename, (int) ret);
+#else
                 snprintf(module_list[mod].long_status, sizeof(module_list[mod].long_status), "Load failed: %s, ret 0x%02X");
+#endif
                 printf("  [E] %s\n", module_list[mod].long_status);
             }
         }
@@ -714,8 +758,18 @@ static void _module_load_all(uint32_t list_only)
     {
         void* buf = (void*) malloc(size);
         
+#ifdef CONFIG_R6_MODSUP
+        /* M16.0 (spec m16/m160 5.1): no buffer for the module code: tcc_relocate(state, NULL) would count as success */
+        r6_link_nomem = buf ? 0 : size;
+        if (buf)
+        {
+            reloc_status = tcc_relocate(state, buf);
+            module_code = buf;
+        }
+#else
         reloc_status = tcc_relocate(state, buf);
         module_code = buf;
+#endif
     }
     if(size < 0 || reloc_status < 0)
 #else
@@ -723,6 +777,24 @@ static void _module_load_all(uint32_t list_only)
     if(ret < 0)
 #endif
     {
+#ifdef CONFIG_R6_MODSUP
+        /* M16.0 (spec m16/m160 5.1): no memory for the module code; a module with an error already (FileErr) keeps it */
+        if (r6_link_nomem)
+        {
+            printf("  [E] failed to link modules (no memory for %d B)\n", r6_link_nomem);
+            for (uint32_t mod = 0; mod < module_cnt; mod++)
+            {
+                if(module_list[mod].enabled && !module_list[mod].error)
+                {
+                    module_list[mod].error = 1;
+                    snprintf(module_list[mod].status, sizeof(module_list[mod].status), "Err");
+                    snprintf(module_list[mod].long_status, sizeof(module_list[mod].long_status), "Linking failed (no memory)");
+                }
+            }
+            tcc_delete(state); console_show();
+            return;
+        }
+#endif
         printf("  [E] failed to link modules\n");
         for (uint32_t mod = 0; mod < module_cnt; mod++)
         {

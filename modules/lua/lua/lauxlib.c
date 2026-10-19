@@ -24,6 +24,9 @@
 #include "lua.h"
 
 #include "lauxlib.h"
+#ifdef CONFIG_R6_LUA
+#include "../lua_r6.h"          /* M16.0 (spec m16/m160 5.5): lua_r6_realloc */
+#endif
 
 
 /*
@@ -941,7 +944,12 @@ static void *l_alloc (void *ud, void *ptr, size_t osize, size_t nsize) {
     return NULL;
   }
   else
+#ifdef CONFIG_R6_LUA
+    /* M16.0 (spec m16/m160 5.5, 4.8): the R6 allocator (1 MiB floor, fault hook; for a new block osize is a type, not a size) */
+    return lua_r6_realloc(ptr, ptr ? osize : 0, nsize);
+#else
     return realloc(ptr, nsize);
+#endif
 }
 
 

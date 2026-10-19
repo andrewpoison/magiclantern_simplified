@@ -21,6 +21,9 @@
 
 #include "lauxlib.h"
 #include "lualib.h"
+#ifdef CONFIG_R6_LUA
+#include "../lua_r6.h"          /* M16.0 (spec m16/m160 4.7): the stack guard in pattern matching */
+#endif
 
 
 /*
@@ -207,6 +210,9 @@ static int str_dump (lua_State *L) {
 
 
 typedef struct MatchState {
+#ifdef CONFIG_R6_LUA
+  uint32_t r6_floor;  /* M16.0 (spec 4.7): the lowest stack pointer match() may run at (0: unknown) */
+#endif
   int matchdepth;  /* control for recursive depth (to avoid C stack overflow) */
   const char *src_init;  /* init of source string */
   const char *src_end;  /* end ('\0') of source string */
@@ -418,6 +424,10 @@ static const char *match_capture (MatchState *ms, const char *s, int l) {
 
 
 static const char *match (MatchState *ms, const char *s, const char *p) {
+#ifdef CONFIG_R6_LUA
+  if (ms->r6_floor && lua_r6_sp() < ms->r6_floor)  /* M16.0 (spec 4.7): the stack guard, one compare per level */
+    luaL_error(ms->L, "pattern too complex");
+#endif
   if (ms->matchdepth-- == 0)
     luaL_error(ms->L, "pattern too complex");
   init: /* using goto's to optimize tail recursion */
@@ -612,6 +622,9 @@ static int str_find_aux (lua_State *L, int find) {
     }
     ms.L = L;
     ms.matchdepth = MAXCCALLS;
+#ifdef CONFIG_R6_LUA
+    ms.r6_floor = lua_r6_floor();  /* M16.0 (spec 4.7) */
+#endif
     ms.src_init = s;
     ms.src_end = s + ls;
     ms.p_end = p + lp;
@@ -653,6 +666,9 @@ static int gmatch_aux (lua_State *L) {
   const char *src;
   ms.L = L;
   ms.matchdepth = MAXCCALLS;
+#ifdef CONFIG_R6_LUA
+  ms.r6_floor = lua_r6_floor();  /* M16.0 (spec 4.7) */
+#endif
   ms.src_init = s;
   ms.src_end = s+ls;
   ms.p_end = p + lp;
@@ -762,6 +778,9 @@ static int str_gsub (lua_State *L) {
   }
   ms.L = L;
   ms.matchdepth = MAXCCALLS;
+#ifdef CONFIG_R6_LUA
+  ms.r6_floor = lua_r6_floor();  /* M16.0 (spec 4.7) */
+#endif
   ms.src_init = src;
   ms.src_end = src+srcl;
   ms.p_end = p + lp;

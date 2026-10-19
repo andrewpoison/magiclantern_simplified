@@ -7204,15 +7204,26 @@ static void task_without_powersave(struct cbr * cbr)
     powersave_permit();
 }
 
+#ifdef CONFIG_R6_MODSUP
+#include "r6_modsup.h"                  /* platform/R6.190: r6_task_try_create (M16.0) */
+#endif
+
 void run_in_separate_task(void* routine, int argument)
 {
     gui_stop_menu();
     if (!routine) return;
     
     struct cbr * cbr = malloc(sizeof(struct cbr));
+#ifdef CONFIG_R6_MODSUP
+    /* M16.0 (spec m16/m160 3.4): the R6 task model - with Canon's task memory too small a refusal, not Err 70 (32 KB: 32,776 + 4,104 B) */
+    if (!cbr) return;
+    cbr->user_routine = routine; cbr->argument = argument;
+    if (r6_task_try_create("run_test", 0x1a, 0x8000, task_without_powersave, cbr) == R6TK_REFUSED) free(cbr);
+#else
     cbr->user_routine = routine;
     cbr->argument = argument;
     task_create("run_test", 0x1a, 0x8000, task_without_powersave, cbr);
+#endif
 }
 
 /* fixme: may be slow on large menus */

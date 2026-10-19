@@ -663,6 +663,9 @@ static int integrity_check(void) {
   if (umm_heap == NULL) {
     umm_init();
   }
+#ifdef CONFIG_R6_LUA
+  if (umm_heap == NULL) return 0;      /* M16.0 (spec m16/m160 5.2): no heap block */
+#endif
 
   /* Iterate through all free blocks */
   prev = 0;
@@ -864,6 +867,9 @@ static int check_poison_all_blocks(void) {
   if (umm_heap == NULL) {
     umm_init();
   }
+#ifdef CONFIG_R6_LUA
+  if (umm_heap == NULL) return 0;      /* M16.0 (spec m16/m160 5.2): no heap block */
+#endif
 
   /* Now iterate through the blocks list */
   blockNo = UMM_NBLOCK(blockNo) & UMM_BLOCKNO_MASK;
@@ -965,6 +971,14 @@ UMM_HEAP_INFO ummHeapInfo;
 void *umm_info( void *ptr, int force ) {
 
   unsigned short int blockNo = 0;
+
+#ifdef CONFIG_R6_LUA
+  /* M16.0 (spec m16/m160 5.2): no heap yet (block refused): nothing to walk (umm_free_heap_size reports 0) */
+  if (umm_heap == NULL) {
+    memset( &ummHeapInfo, 0, sizeof( ummHeapInfo ) );
+    return NULL;
+  }
+#endif
 
   /* Protect the critical section... */
   UMM_CRITICAL_ENTRY();
@@ -1183,6 +1197,13 @@ static unsigned short int umm_assimilate_down( unsigned short int c, unsigned sh
 void umm_init( void ) {
   /* init heap pointer and size, and memset it to 0 */
   umm_heap = (umm_block *)UMM_MALLOC_CFG__HEAP_ADDR;
+#ifdef CONFIG_R6_LUA
+  /* M16.0 (spec m16/m160 5.2): no heap block: no memset(NULL); the callers return NULL, a later call tries again */
+  if (umm_heap == NULL) {
+    umm_numblocks = 0;
+    return;
+  }
+#endif
   umm_numblocks = (UMM_MALLOC_CFG__HEAP_SIZE / sizeof(umm_block));
   memset(umm_heap, 0x00, UMM_MALLOC_CFG__HEAP_SIZE);
 
@@ -1335,6 +1356,9 @@ static void *_umm_malloc( size_t size ) {
   if (umm_heap == NULL) {
     umm_init();
   }
+#ifdef CONFIG_R6_LUA
+  if (umm_heap == NULL) return NULL;   /* M16.0 (spec m16/m160 5.2): no heap block (a later call tries again) */
+#endif
 
   /*
    * the very first thing we do is figure out if we're being asked to allocate
@@ -1465,6 +1489,9 @@ static void *_umm_realloc( void *ptr, size_t size ) {
   if (umm_heap == NULL) {
     umm_init();
   }
+#ifdef CONFIG_R6_LUA
+  if (umm_heap == NULL) return NULL;   /* M16.0 (spec m16/m160 5.2): no heap block (a later call tries again) */
+#endif
 
   /*
    * This code looks after the case of a NULL value for ptr. The ANSI C

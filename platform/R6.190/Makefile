@@ -34,6 +34,11 @@ ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_tlog.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_acore.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_aclock.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_temp.o
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_modsup.o
+
+# M16.0 (spec m16/m160 3.3): in R6_190.sym, task_create points to r6_task_try_create (the R6 task model for modules);
+# without r6_task_try_create in the ELF the build fails
+ML_MODULES_SYM_POST = $(PYTHON) r6_symalias.py --require $(BUILD_DIR)/$(ML_MODULES_SYM_NAME).tmp
 
 include ../Makefile
 .DEFAULT_GOAL := $(BUILD_DIR)/cam_complete

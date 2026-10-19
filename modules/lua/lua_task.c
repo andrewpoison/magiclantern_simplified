@@ -13,6 +13,9 @@
 #include <powersave.h>
 
 #include "lua_common.h"
+#ifdef CONFIG_R6_LUA
+#include "lua_r6.h"             /* M16.0 (spec m16/m160 3.5, 4.3): task site, E11 limits */
+#endif
 
 struct lua_task_func
 {
@@ -42,9 +45,11 @@ static void lua_run_task(struct lua_task_func * lua_task_func)
             
             if(lua_rawgeti(L, LUA_REGISTRYINDEX, lua_task_func->function_ref) == LUA_TFUNCTION)
             {
+#ifndef CONFIG_R6_LUA
                 /* script created a task;
                  * it can't be unloaded while this task is running */
                 lua_set_cant_unload(L, 1, LUA_TASK_UNLOAD_MASK);
+#endif
 
                 if (lua_task_func->disable_psave)
                 {
@@ -104,6 +109,63 @@ static void lua_run_task(struct lua_task_func * lua_task_func)
  @tparam[opt=false] bool disable_powersave Set to `true` to prevent the camera from turning off while running this task.
  @function create
  */
+#ifdef CONFIG_R6_LUA
+/* M16.0 (spec m16/m160 3.5, 4.3; E11): priority in [R6L_PRIO_MIN, R6L_PRIO_MAX] (below 0x1C: raised; above Canon's maximum:
+ * Canon's task_create would assert), each change once per script on the console; stack default R6L_STACK_TASK_DEF, else rounded
+ * up to 4 KB and kept in [R6L_STACK_TASK_MIN, R6L_STACK_TASK_MAX]; the R6 task model (refused: an error, nothing leaks).
+ * The function is referenced explicitly (upstream referenced the top of the stack, i.e. the last given argument). */
+static int luaCB_task_create(lua_State * L)
+{
+    if(!lua_isfunction(L, 1)) return luaL_argerror(L, 1, "function expected");
+    LUA_PARAM_INT_OPTIONAL(priority, 2, 0x1c);
+    LUA_PARAM_INT_OPTIONAL(stack_size, 3, 0);
+    LUA_PARAM_BOOL_OPTIONAL(disable_psave, 4, 0);
+
+    struct r6_lua_stat * st = r6_lua_stat();
+    int pmin = lua_r6_cfg(R6L_PRIO_MIN), pmax = lua_r6_cfg(R6L_PRIO_MAX);
+    if (priority < pmin || priority > pmax)
+    {
+        int up = priority < pmin;
+        if (lua_r6_once(L, up ? 0 : 1))
+        {
+            printf("[%s] task.create: priority 0x%x %s to 0x%x\n", lua_get_script_filename(L), priority, up ? "raised" : "lowered",
+                up ? pmin : pmax);
+        }
+        priority = up ? pmin : pmax;
+        st->prio_clamped++;
+    }
+    int stack = lua_r6_cfg(R6L_STACK_TASK_DEF);
+    if (stack_size > 0)
+    {
+        uint32_t s = ((uint32_t) stack_size + 0xFFF) & ~0xFFFu;
+        uint32_t smin = lua_r6_cfg(R6L_STACK_TASK_MIN), smax = lua_r6_cfg(R6L_STACK_TASK_MAX);
+        stack = s < smin ? (int) smin : s > smax ? (int) smax : (int) s;
+        if (stack != stack_size) st->stack_clamped++;
+    }
+
+    struct lua_task_func * func = malloc(sizeof(struct lua_task_func));
+    if(!func) return luaL_error(L, "malloc error\n");
+
+    func->L = L;
+    lua_pushvalue(L, 1);
+    func->function_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+    func->disable_psave = disable_psave;
+    char why[48];
+    /* counted before the task runs (the task only decrements at its end): a main chunk that returns before its task ran keeps
+     * the script loaded (upstream counted in the task: load_script could lua_close the state first, the task then hung in
+     * lua_script()'s ASSERT(0); while(1) at its priority) */
+    lua_set_cant_unload(L, 1, LUA_TASK_UNLOAD_MASK);
+    uint32_t ret = lua_r6_start(R6LK_TASK, "lua_script_task", priority, stack, lua_run_task, func, why, sizeof(why));
+    if (ret == R6TK_REFUSED)
+    {
+        lua_set_cant_unload(L, 0, LUA_TASK_UNLOAD_MASK);
+        luaL_unref(L, LUA_REGISTRYINDEX, func->function_ref);
+        free(func);
+        return luaL_error(L, "task not started (%s)", why);
+    }
+    return 0;
+}
+#else
 static int luaCB_task_create(lua_State * L)
 {
     if(!lua_isfunction(L, 1)) return luaL_argerror(L, 1, "function expected");
@@ -121,6 +183,7 @@ static int luaCB_task_create(lua_State * L)
     if (ret & 1) return luaL_error(L, "task not started\n");
     return 0;
 }
+#endif
 
 /***
  Yields execution of this script to other tasks and event handlers

@@ -240,6 +240,16 @@
  * and the LVP log (snap.sys_*) show the largest block and the free sum. Needs CONFIG_R6_SNAPMEM. */
 #define CONFIG_R6_TASKMEM
 
+/* R6.190 M16.0 (plan docs/m16_plan.md M16.0, rule 13, user decision 2026-10-18; spec m16/m160 spec_m160.md Rev. 2): the groundwork
+ * for Lua and modules (r6_modsup.c, lvprobe.c, src/menu.c, src/module.c, src/property.c). Every module task (task_create in
+ * R6_190.sym points to r6_task_try_create, r6_symalias.py; the loader links no module without that alias), every Lua task and
+ * run_in_separate_task go through the M14.1c check of Canon's task memory (Tor 0h, read only), right before task_create and under
+ * one lock with the snapshot task: one free block >= align8(stack + 8) + 4,104 B, else a refusal instead of Err 70; "unknown"
+ * refuses; priority 0 or > 0x20 refuses. Also: the five symbols modules import (interval, wait_lv_frames, take_screenshot), Lua's
+ * limits and fault hook, the stack rest of the running task, NULL checks of the module loader, a bound of the property handler
+ * table. No Canon write, no new Canon address, no new stub. Needs CONFIG_R6_TASKMEM. */
+#define CONFIG_R6_MODSUP
+
 #define CONFIG_TASK_STRUCT_V2_SMP
 #define CONFIG_TASK_ATTR_STRUCT_V5
 

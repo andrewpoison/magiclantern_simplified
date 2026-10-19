@@ -35,6 +35,9 @@
 #include <powersave.h>
 #include "lua_common.h"
 #include "umm_malloc/umm_malloc.h"
+#ifdef CONFIG_R6_LUA
+#include "lua_r6.h"             /* M16.0 (spec m16/m160 3.5, 4): task sites, abort anchor, limits */
+#endif
 
 struct lua_script
 {
@@ -60,6 +63,10 @@ struct lua_script
     struct semaphore * sem;
     struct msg_queue * key_mq;
     struct menu_entry * menu_entry;
+#ifdef CONFIG_R6_LUA
+    int r6_dead;                /* M16.0 (spec 4.6): aborted with something registered: no more Lua code on this state */
+    int r6_once;                /* M16.0 (spec 4.3): hints printed once per script (bits) */
+#endif
     struct lua_script * next;
 };
 
@@ -98,8 +105,39 @@ int lua_take_semaphore(lua_State * L, int timeout, struct semaphore ** assoc_sem
     struct lua_script * script = lua_script(L);
 
     if (assoc_semaphore) *assoc_semaphore = script->sem;
+#ifdef CONFIG_R6_LUA
+    /* M16.0 (spec 4.6): a dead script (aborted with something registered): callbacks skip it at once; the callers that wait
+     * without a limit (task.yield, key.wait, a task's start) and ignore the result stay here, as on its taken semaphore */
+    if (script->r6_dead)
+    {
+        if (timeout) return -1;
+        lua_r6_park("dead script");
+    }
+#endif
     return take_semaphore(script->sem, timeout);
 }
+
+#ifdef CONFIG_R6_LUA
+/* M16.0 (spec 4.3): 1 the first time this bit is asked for the script of L */
+int lua_r6_once(lua_State * L, int bit)
+{
+    struct lua_script * script = lua_script(L);
+    if (script->r6_once & (1 << bit)) return 0;
+    script->r6_once |= 1 << bit;
+    return 1;
+}
+
+/* review R2-01 / R2-04: without lua_script()'s ASSERT: 1 = a script has this state and is not dead, 0 = dead, -1 = no script has
+ * it (closed: an old entry of a callback list). lua_scripts never shrinks (add_script), so any task may walk it. */
+int lua_r6_alive(lua_State * L)
+{
+    for (struct lua_script * script = lua_scripts; script; script = script->next)
+    {
+        if (script->L == L) return script->r6_dead ? 0 : 1;
+    }
+    return -1;
+}
+#endif
 
 int lua_give_semaphore(lua_State * L, struct semaphore ** assoc_semaphore)
 {
@@ -120,6 +158,9 @@ static void lua_print_free_mem(void)
 {
     extern int core_reallocs;    /* ml-lua-shim.c */
     extern int core_reallocs_size;
+#ifdef CONFIG_R6_LUA
+    lua_r6_umm_stat();          /* M16.0 (spec 4.9): umm free (last, smallest) for r6_lua_stat */
+#endif
     printf("[Lua] free umm_heap : %s\n", format_memory_size(umm_free_heap_size()));
     if (core_reallocs)
     {
@@ -217,6 +258,9 @@ static unsigned int lua_do_cbr(unsigned int ctx, struct script_event_entry * eve
             }
             else
             {
+#ifdef CONFIG_R6_LUA
+                if (!lua_script(L)->r6_dead)    /* M16.0 (spec 4.6): a dead script is skipped without a line */
+#endif
                 printf("[%s] semaphore timeout: %s (%dms)\n", lua_get_script_filename(L), event_name, timeout);
             }
         }
@@ -598,10 +642,19 @@ static int pushargs (lua_State *L) {
 static lua_State * load_lua_state(int argc, char** argv)
 {
     lua_State* L = luaL_newstate();
+#ifdef CONFIG_R6_LUA
+    /* M16.0 (spec 5.2, 4.6, 4.8): no memory for the state: NULL to load_script; else the abort anchor knows it */
+    if (!L) return NULL;
+    lua_r6_anchor_L(L);
+    r6_lua_fault(R6LF_MARK_1);
+#endif
     luaL_requiref(L, "_G", luaopen_base, 1);
     luaL_requiref(L, LUA_LOADLIBNAME, luaopen_package, 1);
     luaL_requiref(L, "globals", luaopen_globals, 0);
     luaL_requiref(L, LUA_STRLIBNAME, luaopen_string, 0);
+#ifdef CONFIG_R6_LUA
+    r6_lua_fault(R6LF_MARK_2);
+#endif
     
     luaL_getsubtable(L, LUA_REGISTRYINDEX, "_PRELOAD");
     const luaL_Reg *lib;
@@ -611,6 +664,9 @@ static lua_State * load_lua_state(int argc, char** argv)
         lua_setfield(L, -2, lib->name);
     }
     lua_pop(L, 1);
+#ifdef CONFIG_R6_LUA
+    r6_lua_fault(R6LF_MARK_3);
+#endif
     
     lua_getglobal(L, "_G");
     lua_newtable(L);
@@ -644,6 +700,9 @@ static lua_State * load_lua_state(int argc, char** argv)
     }
 
     createargtable(L, argv, argc, 0);
+#ifdef CONFIG_R6_LUA
+    r6_lua_fault(R6LF_MARK_4);
+#endif
 
     return L;
 }
@@ -768,6 +827,10 @@ static int lua_get_flag(struct lua_script * script, const char * flag)
     return 0;
 }
 
+#ifdef CONFIG_R6_LUA
+/* M16.0 (spec 4.6): this body is lua_r6_load_body; load_script (after it) wraps it with the abort anchor */
+#define load_script lua_r6_load_body
+#endif
 static void load_script(struct lua_script * script)
 {
     if(script->L)
@@ -782,6 +845,19 @@ static void load_script(struct lua_script * script)
     script->load_time = get_seconds_clock();
     script->state = SCRIPT_STATE_LOADING_OR_RUNNING;
     lua_State* L = script->L = load_lua_state(script->argc, script->argv);
+#ifdef CONFIG_R6_LUA
+    /* M16.0 (spec 5.2): no memory for the Lua state (upstream used NULL): before the semaphore and the queue exist */
+    if (!L)
+    {
+        fprintf(stderr, "[%s] not enough memory (Lua state)\n", script->filename);
+        lua_clear_last_error(script);
+        script->last_error = copy_string("not enough memory (Lua state)");
+        script->state = SCRIPT_STATE_NOT_RUNNING;
+        script->load_time = 0;
+        powersave_permit();
+        return;
+    }
+#endif
     script->cant_unload = 0;
     script->cant_yield = 0;
     script->tasks_started = 0;
@@ -792,6 +868,9 @@ static void load_script(struct lua_script * script)
         /* create semaphore on first run */
         script->sem = create_named_semaphore(script->filename, SEM_CREATE_LOCKED);
         ASSERT(script->sem);
+#ifdef CONFIG_R6_LUA
+        lua_r6_anchor_sem(1);   /* M16.0 (spec 4.6): this task holds it until the give below */
+#endif
     }
 
     if (!script->key_mq)
@@ -804,12 +883,21 @@ static void load_script(struct lua_script * script)
     char full_path[MAX_PATH_LEN];
     snprintf(full_path, MAX_PATH_LEN, SCRIPTS_DIR "/%s", script->filename);
     printf("[%s] script starting.\n", script->filename);
+#ifdef CONFIG_R6_LUA
+    r6_lua_fault(R6LF_MARK_5);
+#endif
 
     int status = luaL_loadfile(L, full_path);
     if (status == LUA_OK) {
         int n = pushargs(L);  /* push arguments to script */
+#ifdef CONFIG_R6_LUA
+        r6_lua_fault(R6LF_MARK_6);
+#endif
         status = docall(L, n, LUA_MULTRET);
     }
+#ifdef CONFIG_R6_LUA
+    r6_lua_fault(R6LF_MARK_7);
+#endif
 
     if (status != LUA_OK)
     {
@@ -819,6 +907,9 @@ static void load_script(struct lua_script * script)
     }
 
     give_semaphore(script->sem);
+#ifdef CONFIG_R6_LUA
+    lua_r6_anchor_sem(0);
+#endif
 
     /* allow simple scripts to use config_save events */
     if (config_save_cbr_scripts && (script->cant_unload & (1 << config_save_cbr_scripts->mask)))
@@ -873,6 +964,57 @@ static void load_script(struct lua_script * script)
     /* script finished or loaded in background; allow auto power off */
     powersave_permit();
 }
+
+#ifdef CONFIG_R6_LUA
+#undef load_script
+/* M16.0 (spec 4.6): after abort() jumped back here - an unprotected Lua error (memory in luaL_requiref, createargtable, pushargs,
+ * lua_tostring after docall). Nothing registered: lua_close (finalizers run protected), the script can run again; else "dead":
+ * no more Lua code on this state, its semaphore stays as it is */
+static void lua_r6_after_abort(struct lua_r6_anchor * a)
+{
+    struct lua_script * script = a->script;
+    struct r6_lua_stat * st = r6_lua_stat();
+    lua_State * L = a->L;
+    powersave_permit();                         /* load_script's powersave_prohibit */
+    lua_clear_last_error(script);
+    if (!L || (script->cant_unload == 0 && script->tasks_started == 0))
+    {
+        if (L) lua_close(L);
+        if (L) st->abort_close++;
+        if (a->sem) give_semaphore(script->sem);    /* first run: created locked by this task */
+        script->L = NULL;
+        script->state = SCRIPT_STATE_NOT_RUNNING;
+        script->load_time = 0;
+        script->menu_entry->icon_type = IT_ACTION;
+        script->last_error = copy_string("aborted (unprotected Lua error)");
+        fprintf(stderr, "[%s] aborted (unprotected Lua error).\n", script->filename);
+    }
+    else
+    {
+        script->L = L;                          /* callbacks of the script still find it (and skip it) */
+        script->r6_dead = 1;
+        st->dead++;
+        script->state = SCRIPT_STATE_RUNNING_IN_BACKGROUND;    /* no new start from the menu */
+        script->last_error = copy_string("aborted; restart the camera to run it again");
+        fprintf(stderr, "[%s] aborted; restart the camera to run it again.\n", script->filename);
+    }
+    lua_print_free_mem();
+}
+
+/* M16.0 (spec 4.6): the anchor of abort() for both callers (lua_load_task: autorun, lua_user_load_task: Run Script) */
+static void load_script(struct lua_script * script)
+{
+    struct lua_r6_anchor a;
+    if (setjmp(a.jb))
+    {
+        lua_r6_after_abort(&a);
+        return;
+    }
+    lua_r6_anchor_push(&a, script, script->filename);
+    lua_r6_load_body(script);
+    lua_r6_anchor_pop(&a);
+}
+#endif
 
 static MENU_UPDATE_FUNC(script_print_state)
 {
@@ -997,7 +1139,19 @@ static MENU_SELECT_FUNC(lua_script_menu_select)
         {
             console_clear();
             script->state = SCRIPT_STATE_LOADING_OR_RUNNING;
+#ifdef CONFIG_R6_LUA
+            /* M16.0 (spec 3.5): R6 task model, stack R6L_STACK_USER; refused: the menu shows ERROR with the reason */
+            char why[48];
+            if (lua_r6_start(R6LK_USER, "lua_user_load_task", 0x1c, 0, lua_user_load_task, script, why, sizeof(why)) == R6TK_REFUSED)
+            {
+                script->state = SCRIPT_STATE_NOT_RUNNING;
+                lua_clear_last_error(script);
+                script->last_error = copy_string(why);
+                printf("[%s] not started: %s\n", script->filename, why);
+            }
+#else
             task_create("lua_user_load_task", 0x1c, 0x10000, lua_user_load_task, script);
+#endif
             return;
         }
     }
@@ -1060,7 +1214,20 @@ static MENU_SELECT_FUNC(lua_script_edit)
         editor->argv[1] = full_path;
 
         editor->state = SCRIPT_STATE_LOADING_OR_RUNNING;
+#ifdef CONFIG_R6_LUA
+        /* M16.0 (spec 3.5): as "Run Script" */
+        char why[48];
+        if (lua_r6_start(R6LK_USER, "lua_user_load_task", 0x1c, 0, lua_user_load_task, editor, why, sizeof(why)) == R6TK_REFUSED)
+        {
+            editor->state = SCRIPT_STATE_NOT_RUNNING;
+            lua_clear_last_error(editor);
+            editor->last_error = copy_string(why);
+            console_show();
+            printf("[%s] not started: %s\n", editor->filename, why);
+        }
+#else
         task_create("lua_user_load_task", 0x1c, 0x10000, lua_user_load_task, editor);
+#endif
     }
     else
     {
@@ -1407,9 +1574,54 @@ void lua_stack_dump(lua_State *L)
   printf(" }\n");  /* end the listing */
 }
 
+#ifdef CONFIG_R6_LUA
+/* M16.0 (spec 3.5): lua_load_task refused at start: an entry in "Scripts" shows why; SET tries again */
+static char lua_r6_nomem_val[32];
+static struct menu_entry lua_r6_nomem_menu[];
+
+static int lua_r6_load_start(void)
+{
+    char why[48];
+    if (lua_r6_start(R6LK_LOAD, "lua_load_task", 0x1c, 0, lua_load_task, (void *) 0, why, sizeof(why)) != R6TK_REFUSED)
+        return 1;
+    const char * v = strncmp(why, "no task memory: ", 16) == 0 ? why + 16 : why;
+    snprintf(lua_r6_nomem_val, sizeof(lua_r6_nomem_val), "%s", v);
+    printf("[Lua] not started: %s\n", why);
+    return 0;
+}
+
+static MENU_UPDATE_FUNC(lua_r6_nomem_update)
+{
+    MENU_SET_VALUE("%s", lua_r6_nomem_val);
+}
+
+static MENU_SELECT_FUNC(lua_r6_nomem_select)
+{
+    if (lua_r6_load_start()) menu_remove("Scripts", lua_r6_nomem_menu, 1);
+}
+
+static struct menu_entry lua_r6_nomem_menu[] = {
+    {
+        .name       = "Lua: no task memory",
+        .select     = lua_r6_nomem_select,
+        .update     = lua_r6_nomem_update,
+        .icon_type  = IT_ACTION,
+        .help       = "Not enough task memory when Lua started. SET: try again."
+    },
+};
+#endif
+
 static unsigned int lua_init()
 {
+#ifdef CONFIG_R6_LUA
+    /* M16.0 (spec 3.5, 4.1): the core table; lua_load_task through the R6 task model, stack R6L_STACK_LOAD; the property queue
+     * once, here (review R2-02) */
+    lua_r6_init();
+    lua_r6_prop_init();
+    if (!lua_r6_load_start()) menu_add("Scripts", lua_r6_nomem_menu, COUNT(lua_r6_nomem_menu));
+#else
     task_create("lua_load_task", 0x1c, 0x10000, lua_load_task, (void*) 0);
+#endif
     return 0;
 }
 

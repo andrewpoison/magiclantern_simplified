@@ -34,6 +34,9 @@ static int actual_num_handlers = 0;
 static int actual_num_properties = 0;
 static struct prop_handler property_handlers[256];
 static unsigned property_list[256];
+#ifdef CONFIG_R6_MODSUP
+static int r6_prop_full = 0;           /* M16.0 (spec m16/m160 5.4): handlers refused, the tables full */
+#endif
 
 /* the token is needed for unregistering handlers and property cleanup */
 static void global_token_handler(void * token)
@@ -104,6 +107,22 @@ void prop_add_handler (uint32_t property, void *handler)
     }
     #endif
 
+#ifdef CONFIG_R6_MODSUP
+    /* M16.0 (spec m16/m160 5.4): both tables have 256 entries and are written before upstream checks property_list only (and
+     * only after the write): with Lua handlers from scripts, a full table refuses the handler instead of writing past its end */
+    {
+        int r6dup = 0;
+        for (int i = 0; i < actual_num_properties; i++)
+        {
+            if (property_list[i] == property) { r6dup = 1; break; }
+        }
+        if (actual_num_handlers >= (int) COUNT(property_handlers) || (!r6dup && actual_num_properties >= (int) COUNT(property_list)))
+        {
+            if (!r6_prop_full++) printf("Too many prop handlers (0x%x refused)\n", property);
+            return;
+        }
+    }
+#endif
     //DryosDebugMsg(0, 15, "adding prop handler: 0x%x", property);
 #if defined(POSITION_INDEPENDENT)
     handler[entry].handler = PIC_RESOLVE(handler[entry].handler);

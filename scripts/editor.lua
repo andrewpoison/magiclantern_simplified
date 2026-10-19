@@ -499,7 +499,7 @@ function editor:run(filename)
         self:main_loop()
     end, debug.traceback)
     if status == false then
-        debug.sethook()
+        if debug.sethook then debug.sethook() end -- R6 M16.0 (spec m16/m160 4.4): no sethook on the R6
         self.debugging = false
         handle_error(error)
     end

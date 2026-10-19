@@ -19,7 +19,8 @@ LIB_O = $(addprefix $(BUILD_DIR)/$(LUA_SRC)/, $(LIB_O_00))
 LUA_LIB_O_00 = lua_globals.o lua_console.o lua_camera.o \
                lua_lv.o lua_lens.o lua_movie.o lua_display.o \
                lua_key.o lua_menu.o lua_dryos.o lua_interval.o \
-               lua_battery.o lua_task.o lua_property.o lua_constants.o
+               lua_battery.o lua_task.o lua_property.o lua_constants.o \
+               lua_r6.o
 LUA_LIB_O = $(addprefix $(BUILD_DIR)/, $(LUA_LIB_O_00))
 
 UMM_O = $(BUILD_DIR)/umm_malloc/umm_malloc.o
@@ -31,6 +32,8 @@ MODULE_OBJS = $(BUILD_DIR)/$(LUA_SRC)/ml-lua-shim.o \
               $(BUILD_DIR)/lua.o \
               $(BUILD_DIR)/dietlibc.a \
               $(UMM_O)
+# M16.0 (spec m16/m160 3.5, 4, 5): the R6 blocks (task model, E11, stack guard, NULL checks) and lua_r6.o
+MODULE_CFLAGS += -DCONFIG_R6_LUA
 MODULE_CFLAGS += -DLUA_32BITS -DLUA_COMPAT_FLOATSTRING -Idietlibc/include/ \
                  -Wno-undef
 

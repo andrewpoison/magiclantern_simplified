@@ -55,7 +55,13 @@
 extern void * __mem_malloc( size_t len, unsigned int flags, const char *file, unsigned int line);
 
 /* Start addresses and the size of the heap */
+#ifdef CONFIG_R6_LUA
+/* M16.0 (spec m16/m160 5.2): the fault hook and the 1 MiB floor; may be NULL (umm_init then leaves the heap NULL, retried later) */
+extern void * lua_r6_umm_heap(size_t size);
+#define UMM_MALLOC_CFG__HEAP_ADDR lua_r6_umm_heap(UMM_MALLOC_CFG__HEAP_SIZE);
+#else
 #define UMM_MALLOC_CFG__HEAP_ADDR __mem_malloc(UMM_MALLOC_CFG__HEAP_SIZE, 0, "umm", 0);
+#endif
 #define UMM_MALLOC_CFG__HEAP_SIZE (256*1024-32)
 
 /* A couple of macros to make packing structures less compiler dependent */

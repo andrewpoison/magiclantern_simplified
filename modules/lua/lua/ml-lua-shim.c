@@ -11,6 +11,9 @@ void *realloc(void *ptr, size_t size);
 #include <fio-ml.h>
 #include <errno.h>
 #include "umm_malloc/umm_malloc.h"
+#ifdef CONFIG_R6_LUA
+#include "../lua_r6.h"          /* M16.0 (spec m16/m160 5.6 F1, 5.5, 4.6, 4.8): fd table, allocations, abort, fault hook */
+#endif
 
 #undef DEBUG
 
@@ -25,10 +28,103 @@ void console_puts(const char* str);
 
 extern const char * format_memory_size( uint64_t size); /* e.g. 2.0GB, 32MB, 2.4kB... */
 
+#ifndef CONFIG_R6_LUA
 static uint64_t filesizes[16] = {0};
+#endif
 
 /* fixme: FIO functions actually return int, not FILE* */
 
+#ifdef CONFIG_R6_LUA
+/* M16.0 (spec m16/m160 5.6 F1): file descriptors 3..18 index a table of FIO handles (lua_r6.c, slots taken with r6_cas32);
+ * upstream used the FIO handle itself and dropped every handle outside 3..16 */
+int __libc_open(const char * fn, int flags, ...)
+{
+    dbg_printf("__libc_open(%s, %x) => ", fn, flags);
+
+    uint32_t filesize = 0;
+    if (FIO_GetFileSize(fn, &filesize) != 0)
+    {
+        if (!(flags & O_CREAT))
+        {
+            dbg_printf("ERR_SIZE\n");
+            errno = ENOENT;
+            return -1;
+        }
+    }
+
+    FILE * h =
+        (flags & O_CREAT) && (flags & O_APPEND) ?
+            FIO_CreateFileOrAppend(fn) :
+        (flags & O_CREAT) ?
+            FIO_CreateFile(fn) :
+            FIO_OpenFile(fn, flags);
+
+    if (!h)
+    {
+        dbg_printf("ERR_OPEN\n");
+        errno = ENOENT;
+        return -1;
+    }
+
+    int fd = lua_r6_fd_add((uint32_t) h, filesize);
+    if (fd < 0)
+    {
+        fprintf(stderr, "[Lua] too many open files\n");
+        FIO_CloseFile(h);
+        errno = EMFILE;
+        return -1;
+    }
+
+    dbg_printf("%d\n", fd);
+    return fd;
+}
+
+int __libc_close(int fd)
+{
+    dbg_printf("__libc_close(%d)\n", fd);
+
+    if (fd >= STDIN_FILENO && fd <= STDERR_FILENO)
+    {
+        /* closing standard I/O streams is not supported */
+        errno = ENOTSUP;
+        return -1;
+    }
+    uint32_t h = lua_r6_fd_del(fd);
+    if (!h)
+    {
+        errno = EBADF;
+        return -1;
+    }
+    FIO_CloseFile((FILE *) h);
+    return 0;
+}
+
+ssize_t __libc_read(int fd, void* buf, size_t count)
+{
+    dbg_printf("__libc_read(%d,%s)\n", fd, format_memory_size(count));
+
+    switch (fd)
+    {
+        case STDIN_FILENO:
+            /* todo: read from IME? */
+            errno = ENOSYS;
+            return -1;
+
+        case STDOUT_FILENO:
+        case STDERR_FILENO:
+            /* idk */
+            errno = ENOTSUP;
+            return -1;
+
+        default:
+        {
+            uint32_t h = lua_r6_fd_h(fd);
+            if (!h) { errno = EBADF; return -1; }
+            return FIO_ReadFile((FILE *) h, buf, count);
+        }
+    }
+}
+#else
 int __libc_open(const char * fn, int flags, ...)
 {
     dbg_printf("__libc_open(%s, %x) => ", fn, flags);
@@ -120,6 +216,7 @@ ssize_t __libc_read(int fd, void* buf, size_t count)
             return FIO_ReadFile((void*) fd, buf, count);
     }
 }
+#endif
 
 ssize_t __libc_write(int fd, const void* buf, size_t count)
 {
@@ -158,7 +255,13 @@ ssize_t __libc_write(int fd, const void* buf, size_t count)
         }
         default:
         {
+#ifdef CONFIG_R6_LUA
+            uint32_t h = lua_r6_fd_h(fd);     /* M16.0 (spec 5.6 F1) */
+            if (!h) { errno = EBADF; return -1; }
+            return FIO_WriteFile((FILE *) h, buf, count);
+#else
             return FIO_WriteFile((void*) fd, buf, count);
+#endif
         }
     }
 }
@@ -168,6 +271,24 @@ ssize_t write(int fd , const void* buf, size_t count)
     return __libc_write(fd, buf, count);
 }
 
+#ifdef CONFIG_R6_LUA
+/* M16.0 (spec 5.6 F1): through the fd table */
+off_t lseek(int fd, off_t offset, int whence)
+{
+    dbg_printf("lseek(%d,%d,%d)\n", fd, offset, whence);
+    uint32_t h = lua_r6_fd_h(fd);
+    if (!h) { errno = EBADF; return -1; }
+    return FIO_SeekSkipFile((FILE *) h, offset, whence);
+}
+
+int fstat(int fd, struct stat * buf)
+{
+    /* fixme: dummy implementation */
+    memset(buf, 0, sizeof(*buf));
+    buf->st_size = lua_r6_fd_size(fd);
+    return 0;
+}
+#else
 off_t lseek(int fd, off_t offset, int whence)
 {
     dbg_printf("lseek(%d,%d,%d)\n", fd, offset, whence);
@@ -185,6 +306,7 @@ int fstat(int fd, struct stat * buf)
     }
     return 0;
 }
+#endif
 
 int __rt_sigprocmask(int how, void* set, void* oldsetm, long nr)
 {
@@ -232,6 +354,10 @@ void* malloc(size_t size)
      * if it has round values, assume it's fio_malloc, for buffering files */
     int is_fio = !(size & 0x3FF);
     dbg_printf("%smalloc(%s)\n", is_fio ? "fio_" : "", format_memory_size(size));
+#ifdef CONFIG_R6_LUA
+    r6_lua_fault(R6LF_MALLOC);   /* M16.0 (spec 4.8): count only */
+    r6_lua_stat()->mallocs++;
+#endif
     
     void* ans = 0;
     
@@ -244,7 +370,11 @@ void* malloc(size_t size)
     if (ans == 0)
     {
         /* process large and/or failed requests with core malloc wrapper */
+#ifdef CONFIG_R6_LUA
+        ans = lua_r6_core_alloc(size, is_fio ? 3 : 0);    /* M16.0 (spec 5.5): the 1 MiB floor */
+#else
         ans = __mem_malloc(size, is_fio ? 3 : 0, "lua_stdio", 0);
+#endif
     }
     
     return ans;
@@ -267,6 +397,10 @@ int core_reallocs_size = 0;
 
 void* my_realloc(void* ptr, size_t size)
 {
+#ifdef CONFIG_R6_LUA
+    r6_lua_fault(R6LF_MALLOC);   /* M16.0 (spec 4.8): count only (Lua itself goes through lua_r6_realloc) */
+    r6_lua_stat()->mallocs++;
+#endif
     int use_umm =
         (umm_ptr_in_heap(ptr)) ||
         (ptr == 0 && size < 1024);
@@ -305,9 +439,13 @@ void* my_realloc(void* ptr, size_t size)
 
 void abort()
 {
+#ifdef CONFIG_R6_LUA
+    lua_r6_abort();     /* M16.0 (spec 4.6): back to load_script's anchor, else sleep (no busy loop) */
+#else
     //what should we do here?
     printf("abort\n");
     while(1);
+#endif
 }
 
 //taken from: http://stackoverflow.com/questions/2302969/how-to-implement-char-ftoafloat-num-without-sprintf-library-function-i

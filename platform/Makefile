@@ -243,8 +243,13 @@ ML_OBJS += $(BUILD_DIR)/module.o
 ML_MODULES_SYM_NAME ?= $(MODEL)_$(FW_VERSION).sym
 CFLAGS += -DCONFIG_MODULES_MODEL_SYM=\"$(ML_MODULES_SYM_NAME)\"
 
+# an optional post-processing step of the module symbol file, on $@.tmp (R6.190: r6_symalias.py); empty: a plain copy.
+# The file appears only after the step succeeded.
+ML_MODULES_SYM_POST ?=
 $(BUILD_DIR)/$(ML_MODULES_SYM_NAME): $(BUILD_DIR)/magiclantern.sym | $(BUILD_DIR)
-	$(CP) $(BUILD_DIR)/magiclantern.sym $(BUILD_DIR)/$(ML_MODULES_SYM_NAME)
+	$(CP) $(BUILD_DIR)/magiclantern.sym $@.tmp
+	$(ML_MODULES_SYM_POST)
+	$(MV) $@.tmp $@
 
 zip_contents:: $(BUILD_DIR)/$(ML_MODULES_SYM_NAME) \
                modules.hidden modules.included \

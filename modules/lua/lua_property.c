@@ -17,6 +17,9 @@
 #include <propvalues.h>
 
 #include "lua_common.h"
+#ifdef CONFIG_R6_LUA
+#include "lua_r6.h"             /* M16.0 (spec m16/m160 3.5, 4.5): property ring, task site */
+#endif
 
 // !!!DANGER WILL ROBINSON!!!
 //#define LUA_PROP_REQUEST_CHANGE
@@ -42,6 +45,154 @@ struct lua_prop_msg
 int lua_prop_task_running = 0;
 static struct lua_prop * prop_handlers = NULL;
 
+#ifdef CONFIG_R6_LUA
+/* M16.0 (spec m16/m160 3.5, 4.5): PropMgr only copies the value into a ring slot (lua_r6.c: no malloc, no lock, no Lua API) and
+ * posts its index; lua_prop_task (R6 task model, R6L_STACK_PROP) calls the handler protected: any error, also memory and the
+ * stack guard, is a "[Lua] prop handler failed" line. The queue holds as many messages as the ring has slots. */
+static char lua_r6_prop_why[48];
+struct lua_r6_pcall { struct lua_prop * p; struct lua_r6_pmsg * m; };
+
+/* review R2-03: one registration at a time across scripts and tasks (the property task's start, the duplicate check, the core
+ * handler, the list insert); r6_cas32, at most 2 s; given back before any Lua error and before the references */
+static volatile uint32_t lua_r6_reg_lock = 0;
+
+static int lua_r6_reg_take(void)
+{
+    for (int i = 0; i < 200; i++)
+    {
+        if (r6_cas32(&lua_r6_reg_lock, 0, 1)) return 1;
+        msleep(10);
+    }
+    return 0;
+}
+
+static void lua_r6_reg_give(void)
+{
+    r6_barrier();
+    lua_r6_reg_lock = 0;
+}
+
+/* review R2-02: the queue once, from lua_init (one task); lua_prop_task never starts without it */
+void lua_r6_prop_init(void)
+{
+    if (!lua_prop_queue) lua_prop_queue = msg_queue_create("lua_prop_queue", LUA_R6_PRING);
+}
+
+static int lua_r6_prop_call(lua_State * L)
+{
+    struct lua_r6_pcall * c = lua_touserdata(L, 1);
+    struct lua_prop * lua_prop = c->p;
+    struct lua_r6_pmsg * m = c->m;
+    lua_settop(L, 0);
+    if (lua_rawgeti(L, LUA_REGISTRYINDEX, lua_prop->prop_handler_ref) != LUA_TFUNCTION) return 0;
+    lua_rawgeti(L, LUA_REGISTRYINDEX, lua_prop->self_ref);
+    if (m->len > 4)
+    {
+        lua_pushstring(L, (char *) m->data);        /* long, probably a string (NUL terminated in the ring) */
+    }
+    else if (m->len == 4)
+    {
+        uint32_t v; memcpy(&v, m->data, 4); lua_pushinteger(L, v);
+    }
+    else if (m->len >= 2)
+    {
+        uint16_t v; memcpy(&v, m->data, 2); lua_pushinteger(L, v);
+    }
+    else lua_pushinteger(L, m->data[0]);
+    lua_call(L, 2, 0);
+    return 0;
+}
+
+static void lua_prop_task(int unused)
+{
+    struct r6_lua_stat * st = r6_lua_stat();
+    uint32_t drop_seen = st->ring_drop;
+    TASK_LOOP
+    {
+        uint32_t idx = 0;
+        int err = msg_queue_receive(lua_prop_queue, &idx, 0);
+        if (err || !idx) continue;
+
+        struct lua_r6_pmsg m;
+        if (lua_r6_prop_take(idx, &m))
+        {
+            /* review R2-01 / R2-04: the first active handler of a living script for this id. A closed script leaves its entry
+             * with LUA_NOREF and a freed L (lua_script() would ASSERT and spin), a dead one is skipped without a line; an
+             * entry in front must not hide an active one behind it */
+            struct lua_prop * lua_prop = NULL;
+            for(lua_prop = prop_handlers; lua_prop; lua_prop = lua_prop->next)
+            {
+                if (lua_prop->prop_id != m.id) continue;
+                if (lua_prop->prop_handler_ref != LUA_NOREF && lua_r6_alive(lua_prop->L) > 0) break;
+                st->prop_skip++;
+            }
+            if (lua_prop)
+            {
+                lua_State * L = lua_prop->L;
+                struct semaphore * sem = NULL;
+                if (lua_take_semaphore(L, 1000, &sem) == 0)
+                {
+                    int top = lua_gettop(L);
+                    struct lua_r6_pcall c = { lua_prop, &m };
+                    lua_pushcfunction(L, lua_r6_prop_call);
+                    lua_pushlightuserdata(L, &c);
+                    if (docall(L, 1, 0))
+                    {
+                        int s = lua_type(L, -1) == LUA_TSTRING;
+                        fprintf(stderr, "[Lua] prop handler failed: %s\n", s ? lua_tostring(L, -1) : "(no message)");
+                        if (s) lua_save_last_error(L);
+                    }
+                    lua_settop(L, top);
+                    give_semaphore(sem);
+                }
+                else
+                {
+                    printf("[Lua] semaphore timeout: prop handler %d (%dms)\n", lua_prop->prop_id, 1000);
+                }
+            }
+        }
+        uint32_t dr = st->ring_drop;
+        if (dr != drop_seen)
+        {
+            printf("[Lua] prop ring full: %d dropped\n", (int) (dr - drop_seen));
+            drop_seen = dr;
+        }
+    }
+}
+
+static void lua_prophandler(unsigned property, void * priv, void * addr, unsigned len)
+{
+    lua_r6_prop_post(lua_prop_queue, property, addr, len);
+}
+
+/* -1: no queue (review R2-02) or lua_prop_task refused (lua_r6_prop_why); no handler registered then. Called with lua_r6_reg_take */
+static int lua_register_prop_handler(unsigned prop_id)
+{
+    if (!lua_prop_queue)
+    {
+        snprintf(lua_r6_prop_why, sizeof(lua_r6_prop_why), "no property queue");
+        return -1;
+    }
+    if (r6_cas32((volatile uint32_t *) &lua_prop_task_running, 0, 1))
+    {
+        if (lua_r6_start(R6LK_PROP, "lua_prop_task", 0x1c, 0, lua_prop_task, 0, lua_r6_prop_why, sizeof(lua_r6_prop_why)) == R6TK_REFUSED)
+        {
+            r6_barrier();
+            lua_prop_task_running = 0;
+            return -1;
+        }
+    }
+    //check for existing prop handler
+    struct lua_prop * current;
+    for(current = prop_handlers; current; current = current->next)
+    {
+        if(current->prop_id == prop_id) return 0;
+    }
+    prop_add_handler(prop_id, &lua_prophandler);
+    prop_update_registration();
+    return 0;
+}
+#else
 //TODO: create a new task per script so that scripts don't block each other's prop handlers, necessary?
 static void lua_prop_task(int unused)
 {
@@ -135,6 +286,7 @@ static void lua_register_prop_handler(unsigned prop_id)
     prop_add_handler(prop_id, &lua_prophandler);
     prop_update_registration();
 }
+#endif
 
 static int luaCB_property_index(lua_State * L);
 static int luaCB_property_newindex(lua_State * L);
@@ -648,6 +800,41 @@ static int luaCB_property_newindex(lua_State * L)
             }
             if(!lua_isnil(L, 3))
             {
+#ifdef CONFIG_R6_LUA
+                /* M16.0 (spec 3.5): the property task first; refused: no handler, nothing to unload, an error. Review R2-03: one
+                 * registration at a time; review R2-05: the entry has LUA_NOREF before it goes into the list (lua_prop_task walks
+                 * it without the script's semaphore and skips it until the reference is there), a barrier before the head; the
+                 * references after it (a memory error in luaL_ref leaves the entry without a handler, not with stale words) */
+                if (!lua_r6_reg_take()) return luaL_error(L, "property handler: registration busy");
+                if (lua_register_prop_handler(prop_id) < 0)
+                {
+                    char why[48];
+                    snprintf(why, sizeof(why), "%s", lua_r6_prop_why);
+                    lua_r6_reg_give();
+                    return luaL_error(L, "property handler: %s", why);
+                }
+                //script created a prop handler so it can't be unloaded
+                lua_set_cant_unload(L, 1, LUA_PROP_UNLOAD_MASK);
+                current = malloc(sizeof(struct lua_prop));
+                if (!current)
+                {
+                    lua_r6_reg_give();
+                    update_cant_unload(L);
+                    return luaL_error(L, "malloc error");
+                }
+                current->prop_handler_ref = LUA_NOREF;
+                current->self_ref = LUA_NOREF;
+                current->L = L;
+                current->prop_id = prop_id;
+                current->next = prop_handlers;
+                r6_barrier();
+                prop_handlers = current;
+                lua_r6_reg_give();
+                lua_pushvalue(L, 3);
+                current->prop_handler_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+                lua_pushvalue(L, 1);
+                current->self_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+#else
                 //script created a prop handler so it can't be unloaded
                 lua_set_cant_unload(L, 1, LUA_PROP_UNLOAD_MASK);
                 
@@ -663,6 +850,7 @@ static int luaCB_property_newindex(lua_State * L)
                 current->prop_handler_ref = luaL_ref(L, LUA_REGISTRYINDEX);
                 lua_pushvalue(L, 1);
                 current->self_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+#endif
             }
             else
             {

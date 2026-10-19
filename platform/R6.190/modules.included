@@ -1,2 +1,8 @@
 # Module names in this file will be included in the cam magiclantern.zip
-# M6: no modules (bench needs take_screenshot, file_man can delete files)
+# M16.0 (spec m16/m160 6): the five modules that link on the R6 (docs/m16_plan.md 5). All enabled modules share one TCC link:
+# one that does not link takes the others with it. One name per line, no empty line (copy_included_modules.py:13).
+arkanoid
+bench
+file_man
+img_name
+lua

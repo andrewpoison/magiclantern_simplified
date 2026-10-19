@@ -76,6 +76,9 @@ static void freeCBR_nowait(unsigned int a)
 REQUIRES(mem_sem)
 void _shoot_free_suite(struct memSuite *hSuite)
 {
+#ifdef CONFIG_R6_NO_SHOOT_MALLOC
+    if (hSuite == NULL) return;   /* M16.0 H3 (spec m16/m160 5.3): no FreeMemoryResource, so freeCBR never gives free_sem: do not wait */
+#endif
     if (hSuite == shoot_full_suite)
     {
         shoot_full_suite = 0;

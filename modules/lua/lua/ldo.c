@@ -32,6 +32,9 @@
 #include "lundump.h"
 #include "lvm.h"
 #include "lzio.h"
+#ifdef CONFIG_R6_LUA
+#include "../lua_r6.h"          /* M16.0 (spec m16/m160 4.2, 4.7): text chunks only, the stack guard */
+#endif
 
 
 
@@ -411,6 +414,9 @@ int luaD_poscall (lua_State *L, StkId firstResult) {
 ** function position.
 */
 void luaD_call (lua_State *L, StkId func, int nResults, int allowyield) {
+#ifdef CONFIG_R6_LUA
+  lua_r6_stack_check(L);  /* M16.0 (spec 4.7): the rest of the task's stack, in bytes */
+#endif
   if (++L->nCcalls >= LUAI_MAXCCALLS) {
     if (L->nCcalls == LUAI_MAXCCALLS)
       luaG_runerror(L, "C stack overflow");
@@ -537,6 +543,12 @@ static void resume (lua_State *L, void *ud) {
   CallInfo *ci = L->ci;
   if (nCcalls >= LUAI_MAXCCALLS)
     resume_error(L, "C stack overflow", firstArg);
+#ifdef CONFIG_R6_LUA
+  /* M16.0 (spec 4.7): coroutines run on the same C stack; checked inside the protected resume (an error at the entry of
+   * lua_resume would hit the coroutine without a handler) */
+  if (lua_r6_stack_low())
+    resume_error(L, "C stack overflow", firstArg);
+#endif
   if (L->status == LUA_OK) {  /* may be starting a coroutine */
     if (ci != &L->base_ci)  /* not in base level? */
       resume_error(L, "cannot resume non-suspended coroutine", firstArg);
@@ -683,8 +695,14 @@ static void f_parser (lua_State *L, void *ud) {
   struct SParser *p = cast(struct SParser *, ud);
   int c = zgetc(p->z);  /* read first character */
   if (c == LUA_SIGNATURE[0]) {
+#ifdef CONFIG_R6_LUA
+    /* M16.0 (spec 4.2, E11): text chunks only (load, loadstring, loadfile, require, dofile) */
+    luaO_pushfstring(L, "attempt to load a binary chunk (R6: text only)");
+    luaD_throw(L, LUA_ERRSYNTAX);
+#else
     checkmode(L, p->mode, "binary");
     cl = luaU_undump(L, p->z, &p->buff, p->name);
+#endif
   }
   else {
     checkmode(L, p->mode, "text");

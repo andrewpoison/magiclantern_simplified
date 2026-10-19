@@ -704,7 +704,11 @@
 @@ LUAL_BUFFERSIZE is the buffer size used by the lauxlib buffer system.
 ** CHANGE it if it uses too much C-stack space.
 */
+#ifdef CONFIG_R6_LUA
+#define LUAL_BUFFERSIZE	512    /* M16.0 (spec m16/m160 4.7): smaller C stack frames (str_gsub ~2.4 KB -> ~0.9 KB); longer buffers grow on the heap */
+#else
 #define LUAL_BUFFERSIZE	((int)(0x80 * sizeof(void*) * sizeof(lua_Integer)))
+#endif
 
 /* }================================================================== */
 

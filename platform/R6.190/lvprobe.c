@@ -3457,6 +3457,43 @@ static void lp_sys_line(struct lp_buf * b, const char * key, const struct lp_sys
         (int) s->nfree, (int) s->used, (int) s->count, (int) s->peak, (int) s->t, dec ? "," : "", dec ? dec : "");
 }
 
+#ifdef CONFIG_R6_MODSUP
+#include "r6_modsup.h"
+_Static_assert(R6TK_HDR == LP_SYS_HDR && R6TK_RESERVE == LP_SYS_RESERVE, "M16.0: the wrapper uses the M14.1c block rule and reserve");
+_Static_assert(R6SQ_LAYOUT == LP_SYS_LAYOUT && R6SQ_NODE == LP_SYS_NODE && R6SQ_ORDER == LP_SYS_ORDER && R6SQ_MANY == LP_SYS_MANY
+    && R6SQ_SUM == LP_SYS_SUM && R6SQ_BUSY == LP_SYS_BUSY, "M16.0: r6sq_why_name() names the LP_SYS_* codes");
+/* M16.0 (spec m16/m160 3.2): the M14.1c read for r6_task_try_create; read only, no Canon call, any task (lp_sys_read works on
+ * locals and *r only). 1 = ok; not ok: largest = free = 0 */
+int lp_sys_query(struct r6_sysq * q)
+{
+    struct lp_sys s;
+    int ok = lp_sys_read(&s);
+    q->largest = ok ? s.largest : 0;
+    q->free = ok ? s.sum : 0;
+    q->used = s.used;
+    q->peak = s.peak;
+    q->count = s.count;
+    q->why = s.why;
+    return ok;
+}
+
+/* M16.0 (spec m16/m160 5.5): Canon's AllocateMemory free space after the allocation p of size bytes, from mem.c's record of this
+ * very call (no extra Canon call, M14.1b E3 a): malloc pool 0x7FFFFFFF; AllocateMemory f_am - size (>= 0) if the record belongs
+ * to p and its f_am was obtained in it; else -1 (unknown) */
+int r6_am_left(const void * p, uint32_t size)
+{
+    struct r6_mem_rec r;
+    int a = r6_mem_info(p, &r);
+    if (a == 0) return 0x7FFFFFFF;
+    if (a == 1 && p && r.seq && r.ptr == p && r.s_am == r.seq)
+    {
+        int left = r.f_am - (int) size;
+        return left < 0 ? 0 : left;
+    }
+    return -1;
+}
+#endif
+
 #endif
 /* spec 6.2: the snap.* lines (at most 480 B, before census A: inside the static budget, never cut) */
 static void lp_snap_lines(struct lp_buf * b)
@@ -3823,6 +3860,15 @@ static void lp_snap_entry(void * arg)
 /* the menu's two selects (busy flag set there, before the task exists); as run_in_separate_task: the ML menu closes first */
 static void __attribute__((noinline)) lp_snap_start(int delayed)
 {
+#ifdef CONFIG_R6_MODSUP
+    /* M16.0 (spec m16/m160 3.4, A8): read, check and task_create under the lock of r6_task_try_create, so a module / Lua task
+     * and the snapshot task cannot take each other's block. Lock not taken within 1 s (review R1-04): a wrapper creator holds it
+     * between its check and its task_create, both would check the same block and the second task_create could end in Err 70:
+     * no snapshot task then (refused after the M14.1c read below), "task memory busy", the ML menu stays open. No semaphore at
+     * all: nobody creates through the wrapper, as M14.1c without the lock */
+    int r6lk = r6tk_lock(1000);
+    int r6busy = !r6lk && r6tk_have_sem();
+#endif
 #ifdef CONFIG_R6_TASKMEM
     /* M14.1c (spec m14/m141c 5): Tor 0h, read only, right before the task. One free block >= LP_SYS_MIN, else no task (no Err 70):
      * the ML menu stays open with the reason. sys_mem not readable for sure ("unknown"): exactly M14.1b */
@@ -3836,8 +3882,20 @@ static void __attribute__((noinline)) lp_snap_start(int delayed)
         lp_snap_res = LP_SR_NOTASK;
         snprintf(lp_snap_msg, sizeof(lp_snap_msg), "no task memory: %d < %d", (int) lp_sys_pre.largest, LP_SYS_MIN);
         lp_snap_busy = 0;
+#ifdef CONFIG_R6_MODSUP
+        if (r6lk) r6tk_unlock();
+#endif
         return;
     }
+#ifdef CONFIG_R6_MODSUP
+    if (r6busy)                           /* review R1-04: the lock is held by a wrapper creator (see above) */
+    {
+        lp_snap_res = LP_SR_NOTASK;
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "task memory busy");
+        lp_snap_busy = 0;
+        return;
+    }
+#endif
     lp_sys_pre_dec = ok ? LP_SYS_DEC_RUN : LP_SYS_DEC_UNK;
     lp_snap_kind = delayed ? 2 : 1;       /* only after the check (spec 5, C2) */
 #else
@@ -3845,6 +3903,9 @@ static void __attribute__((noinline)) lp_snap_start(int delayed)
 #endif
     gui_stop_menu();
     task_create("lp_snapshot", LP_SNAP_PRIO, LP_SNAP_STACK, lp_snap_entry, (void *) delayed);
+#ifdef CONFIG_R6_MODSUP
+    if (r6lk) r6tk_unlock();
+#endif
 }
 #endif
 

@@ -26,6 +26,9 @@
 #include "lstate.h"
 #include "lstring.h"
 #include "ltable.h"
+#ifdef CONFIG_R6_LUA
+#include "../lua_r6.h"          /* M16.0 (spec m16/m160 4.7): the stack guard */
+#endif
 
 
 
@@ -325,6 +328,9 @@ static void adjust_assign (LexState *ls, int nvars, int nexps, expdesc *e) {
 
 static void enterlevel (LexState *ls) {
   lua_State *L = ls->L;
+#ifdef CONFIG_R6_LUA
+  lua_r6_stack_check(L);  /* M16.0 (spec 4.7): the parser's recursion, also in a small task (load()) */
+#endif
   ++L->nCcalls;
   checklimit(ls->fs, L->nCcalls, LUAI_MAXCCALLS, "C levels");
 }
@@ -1149,6 +1155,9 @@ static void assignment (LexState *ls, struct LHS_assign *lh, int nvars) {
       check_conflict(ls, lh, &nv.v);
     checklimit(ls->fs, nvars + ls->L->nCcalls, LUAI_MAXCCALLS,
                     "C levels");
+#ifdef CONFIG_R6_LUA
+    lua_r6_stack_check(ls->L);  /* M16.0 (spec 4.7): restassign recursion */
+#endif
     assignment(ls, &nv, nvars+1);
   }
   else {  /* assignment -> '=' explist */
