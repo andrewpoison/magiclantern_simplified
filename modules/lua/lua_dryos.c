@@ -24,6 +24,9 @@
 #include <propvalues.h>
 
 #include "lua_common.h"
+#ifdef CONFIG_R6_LUA
+#include "lua_r6.h"             /* M16.1 (spec m16/m161): the core facade r6_api_abi.h */
+#endif
 
 static int luaCB_card_index(lua_State * L);
 static int luaCB_card_newindex(lua_State * L);
@@ -268,6 +271,9 @@ static int luaCB_dryos_index(lua_State * L)
         /// Represents a date/time
         // @type date
         struct tm tm;
+#ifdef CONFIG_R6_LUA
+        memset(&tm, 0, sizeof(tm));     /* M16.1 (spec m16/m161 7.2): Canon fills neither tm_isdst nor tm_gmtoff */
+#endif
         LoadCalendarFromRTC(&tm);
         lua_newtable(L);
         /// Second
@@ -296,7 +302,15 @@ static int luaCB_dryos_index(lua_State * L)
         setfield(L, "yday", tm.tm_yday+1);
         /// Daylight Savings
         // @tfield bool isdst
+#ifdef CONFIG_R6_LUA
+        /* M16.1 (spec m16/m161 7.2): daylight saving time by Canon's zone (the published astro clock state); unknown: no field */
+        {
+            int d = r6_script_dst();
+            if (d >= 0) setboolfield(L, "isdst", d);
+        }
+#else
         setboolfield(L, "isdst", tm.tm_isdst);
+#endif
     }
     else lua_rawget(L, 1);
     return 1;
@@ -309,6 +323,9 @@ static int luaCB_dryos_newindex(lua_State * L)
     {
         return luaL_error(L, "'%s' is readonly!", key);
     }
+#ifdef CONFIG_R6_LUA
+    else if(!strcmp(key, "image_prefix")) return luaL_error(L, "dryos.image_prefix: not analysed yet (M16.2)");   /* M16.1 (7.3) */
+#endif
     else if(!strcmp(key, "image_prefix"))
     {
         static char prefix[8];
@@ -547,7 +564,11 @@ static int luaCB_card_image_path(lua_State * L)
             get_dcim_dir_suffix(),  /* CANON */
             get_file_prefix(),      /* IMG_ */
             file_num,               /* 1234 */
+#ifdef CONFIG_R6_LUA
+            extension ? extension : raw ? ".CR3" : ".JPG"     /* M16.1 (spec m16/m161 7.2): the R6 writes CR3 (HEIF: see impl_notes) */
+#else
             extension ? extension : raw ? ".CR2" : ".JPG"
+#endif
         );
 
         lua_pushstring(L, image_path);

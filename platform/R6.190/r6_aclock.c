@@ -962,4 +962,17 @@ static void r6ac_init()
 
 INIT_FUNC("r6_aclock", r6ac_init);
 
+#ifdef CONFIG_R6_SCRIPT
+/* M16.1 (spec m16/m161 7.2, SB-04, T1-M3): dryos.date's isdst for Lua: the daylight saving time of the zone the clock uses, from the
+ * published state through r6ac_look (its age check; r6ac_get stays inlined there, one more caller of r6ac_look only); 1 / 0, or
+ * -1 while no valid zone is published. Read only; named "_" (not exported, spec 2.1 A10) */
+int _r6_ac_dst(void)
+{
+    struct r6ac_v v;
+    r6ac_look(&v);
+    if (!v.got || !v.ok || !v.r.zvalid) return -1;
+    return v.r.zu_dst ? 1 : 0;
+}
+#endif
+
 #endif /* CONFIG_R6_ACLOCK */

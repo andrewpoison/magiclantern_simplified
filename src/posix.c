@@ -62,6 +62,10 @@ void *calloc(size_t nmemb, size_t size)
 void *realloc(void *ptr, size_t size)
 {
     void *ret = malloc(size);
+#ifdef CONFIG_R6_MODSUP
+    /* R6.190 M16.1 (spec m16/m161 8.3, B4): no memory: NULL, the old block stays (no memcpy into NULL, no free) */
+    if (!ret) return NULL;
+#endif
     
     if (ptr)
     {

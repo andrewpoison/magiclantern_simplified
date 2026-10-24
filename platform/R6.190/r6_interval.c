@@ -181,7 +181,8 @@
  * Canon ("open") blocks every ML press in every mode (iv_press, r6_iv_cam_check). Decision D2: Canon's HDR mode,
  * multiple exposure, WB / focus bracketing and multi-shot NR refuse every R6 Interval mode and R6 Motion Release.
  * "Tv back to ..." (command 5) runs r6_propw.c's offer after a cut-off bracket. Start, Test, "Tv writes" and "Tv
- * back to ..." act only when ML's menu key handling calls them (GuiMainTask, src/gui.c ml_gui_main_task).
+ * back to ..." act only when ML's menu key handling calls them (GuiMainTask, src/gui.c ml_gui_main_task); M16.1 (rule 24): Lua
+ * reaches them only through the facade r6_api.c (GuiMainTask with the origin mark, Ue7) or as the script jobs 7 / 8.
  *
  * M11.0 (docs/m11_plan.md 3.1, CONFIG_R6_ETTR): iv_event calls R6 ETTR's read-only r6_ettr_trace() right after each
  * member's confirmed write and right before each member's picture (one histogram read, no sleep, no drawing, no card
@@ -200,7 +201,17 @@
  * conditions are checked every 50 ms (every 10 ms inside a picture). Status
  * in the ML menu only; details in Debug > LV probe > Log snapshot (refused
  * while a series runs). Nothing is saved except interval, count and start
- * delay; a series never starts by itself.
+ * delay; a series never starts by itself (M16.1, rule 24: an autorun script can take pictures and write Tv after the start
+ * check, through its own script jobs).
+ *
+ * M16.1 (spec m16/m161 spec_m161.md Rev. 2a 2.5, 2.6, 3.3, 4.1, 4.3; CONFIG_R6_IV_SCRIPT): the script jobs of Lua's facade
+ * r6_api.c. One slot with a seq|state word and CAS (no job through iv_cmd). Job 7 "picture": iv_begin with R6IV_TEST_SCRIPT
+ * (every Interval check, no bracket, no start delay), the unchanged iv_shoot; the CAS TAKEN -> ACTIVE right before it. Job 8
+ * "Tv": the runner (pre-check without an arm up to 5 s, the second base read, the intent mark, _r6pw_arm_script, the wait rows,
+ * the one _r6pw_write with R6PW_K_SCRIPT, _r6pw_commit_script; every other end after the arm through _r6pw_series_end). Every
+ * tick a posted job gets BUSY on a long lock, expires (asynchronous, 30 s) or is taken; menu commands are refused while a job is
+ * open (iv_cmd taken atomically, here in the task). The intent mark keeps r6_iv_task from pressing / arming while a script
+ * switches Canon's GUI. A series end never ends a script arm.
  */
 
 #include "dryos.h"
@@ -221,6 +232,10 @@
 #ifdef CONFIG_R6_ETTR
 #include "r6_ettr.h"                     /* M11.0: R6 ETTR's read-only bracket trace (iv_event) */
 #endif
+#ifdef CONFIG_R6_IV_SCRIPT
+#include "r6_modsup_abi.h"               /* M16.1: r6_cas32 / r6_barrier (the script slot, spec m16/m161 2.5) */
+#include "r6_api.h"                      /* M16.1: the facade's result codes and shared limits */
+#endif
 
 #ifdef CONFIG_R6_INTERVAL
 
@@ -232,6 +247,9 @@
 #endif
 #ifndef CONFIG_R6_PROPW_TV
 #error "R6 M10.2: R6 Interval's Bracket mode and the press block need the Tv write path (internals.h CONFIG_R6_PROPW_TV)"
+#endif
+#if defined(CONFIG_R6_IV_SCRIPT) && !defined(CONFIG_R6_PW_SCRIPT)
+#error "R6 M16.1: the script jobs need CONFIG_R6_PW_SCRIPT (Tor 1's context script); r6_cas32 / r6_barrier come from r6_modsup.c"
 #endif
 
 extern int lv_action_raw_get(uint32_t * value, int * len);   /* propvalues.c */
@@ -271,6 +289,9 @@ extern int CC_SW2_CBR(int status);   /* [cc+0xE0] = status; post 0x20001000 / 0x
 #define R6IV_BKT_WRITE_MS    700   /* M10.2: per Tv write: 500 confirmation + 200 settle */
 #define R6IV_BACK_MAX_MS   60000   /* M10.2b: "Tv back to ...": once the ML menu hold is over, the wait for Canon's LV hold
                                     * ends after this (dropped); the ML menu itself has no limit (user decision 2026-10-06) */
+#ifdef CONFIG_R6_IV_SCRIPT
+#define R6IV_SCR_COMMIT_MS  5000   /* M16.1 (spec m16/m161 4.1): the Tv runner retries its commit (JOB / VIEWS) this long */
+#endif
 /* R6IV_MENU_TASK: r6_interval.h (M11.1: r6_ettr.c checks it as well) */
 /* M9.2: bulb with Canon's bulb timer. The menu texts name the limits as Canon shows them ("0:00:31 .. 0:30:00"):
  * change them together with R6IV_BULB_MIN_S / R6IV_BULB_MAX_S (no division by 60 / 3600 in this file) */
@@ -409,6 +430,41 @@ static volatile int iv_tv_seen = 0;
 static volatile int iv_tv_len = 0;
 static volatile uint32_t iv_aeb = 0;     /* PROP_AEB as delivered (shoot.c keeps its copy static) */
 static volatile int iv_aeb_seen = 0;
+#ifdef CONFIG_R6_IV_SCRIPT
+/* M16.1 (spec m16/m161 2.5): the script slot. w = seq << 8 | state; every change of w is a CAS on the whole word. The poster writes
+ * the fields only in FILL; r6_iv_task reads them after its CAS POSTED -> TAKEN (or for a decision it then makes by a CAS on the same
+ * w); the result only the owner of TAKEN / ACTIVE writes, before its CAS to DONE */
+static IV_SCR_BSS struct {
+    volatile uint32_t w;
+    uint32_t gen, tid;                   /* the owner: the script's generation (0 = the core) and the poster's task */
+    int kind, want, async;               /* R6IV_SK_*; the Tv of a job "Tv"; posted from a GUI task (nobody waits) */
+    uint32_t t_req, t_act, t_done;
+    int32_t res;
+    char why[48];
+} iv_scr;
+static IV_SCR_BSS volatile uint32_t iv_scr_seqn = 0;    /* the last seq given (24 bit, never 0) */
+static IV_SCR_BSS uint32_t iv_scr_run = 0;              /* r6_iv_task: the seq it took (0: none) */
+static IV_SCR_BSS int iv_scr_ph = R6IV_SPH_IDLE;        /* the Tv runner's phase (4.1) */
+static IV_SCR_BSS int iv_scr_t0 = 0, iv_scr_tc = 0;     /* TAKEN (5 s pre-check limit); the commit's first try */
+static IV_SCR_BSS int iv_scr_armed = 0, iv_scr_ev = 0;  /* the runner armed Tor 1 (every end then through _r6pw_series_end); event numbers */
+static IV_SCR_BSS int16_t iv_scr_base = 0;              /* the Tv before the write (A23 / T1-N1) */
+static IV_SCR_BSS volatile int iv_act = 0;              /* 2.6: r6_iv_task is about to press / arm (Dekker with iv_intent) */
+static IV_SCR_BSS volatile uint32_t iv_intent = 0;      /* 2.6: the script side holds the intent mark (E8 switch, R6 command) */
+static IV_SCR_BSS volatile int iv_t_intent_end = 0;     /* 2.6: no press / arm before this (R6API_GUI_SETTLE_MS after an E8 switch) */
+static IV_SCR_BSS struct r6_iv_scr_cnt iv_scr_cnt;      /* scr.job (any task: r6_cas32 increments) */
+static IV_SCR_BSS struct r6_iv_scr_shot iv_scr_shots[R6IV_SCR_RING];   /* scr.shot (slots claimed with r6_cas32) */
+static IV_SCR_BSS volatile uint32_t iv_scr_shot_n = 0;
+static IV_SCR_BSS struct r6_iv_scr_tv iv_scr_tvs[R6IV_SCR_RING];       /* scr.tv (r6_iv_task only) */
+static IV_SCR_BSS uint32_t iv_scr_tv_n = 0;
+static IV_SCR_BSS volatile uint32_t iv_ls_sq = 0;       /* r6_last_shot: seqlock (odd while r6_iv_task writes) */
+static IV_SCR_BSS struct r6_iv_scr_out iv_ls;
+static IV_SCR_BSS uint32_t iv_ls_gen = 0;
+static IV_SCR_BSS int iv_ls_async = 0, iv_ls_canc = 0;
+static IV_SCR_BSS volatile uint32_t iv_scr_pics = 0;    /* script pictures taken (res 0; CBR_POST_SHOOT, 7.1) */
+static IV_SCR_BSS uint32_t iv_task_tid = 0;             /* r6_iv_task's id (log tsk.hw, MK8; 0 before its first tick) */
+static void _r6iv_scr_fin(int res, const char * why);   /* r6_iv_task: the result of the job it took */
+static void _r6iv_scr_done(int stop, int detail);    /* iv_end: a script picture ended */
+#endif
 
 /* the switch calls (iv_press) */
 enum { IV_SW1 = 1, IV_SW2 = 2 };
@@ -497,7 +553,11 @@ const struct r6_iv_stats * r6_iv_stats(void) { return &st; }
 const struct r6_iv_last * r6_iv_last(void) { return &L; }
 int r6_iv_running(void) { return st.running || iv_cmd == 1 || iv_cmd == 3 || iv_cmd == 4; }   /* M9.3: 4 = motion */
 const char * r6_iv_stop_name(int s) { return (s >= 0 && s < R6IV_NSTOPS) ? iv_stop_names[s] : "?"; }
+#ifdef CONFIG_R6_IV_SCRIPT
+const char * r6_iv_cam_name(int c) { return c == R6IV_CAM_SCRIPT ? "script job running" : (c >= 0 && c < R6IV_NCAMS) ? iv_cam_names[c] : "?"; }
+#else
 const char * r6_iv_cam_name(int c) { return (c >= 0 && c < R6IV_NCAMS) ? iv_cam_names[c] : "?"; }
+#endif
 const char * r6_iv_canon_name(int c) { return (c >= 0 && c < R6IV_NCANON) ? iv_canon_names[c] : "?"; }
 int r6_iv_gate_cc_settings(void) { return R6IV_GATE_CC_SETTINGS; }
 int r6_iv_tv_min(void) { return R6IV_TV_EV768_MIN; }
@@ -517,6 +577,24 @@ static int iv_ettr_busy(void) { return 0; }
 /* M10.2b: a refusal with its reason (the Bracket details of iv_bkt_check / iv_begin are set before), counted as before */
 static void iv_refuse(int c, int src)
 {
+#ifdef CONFIG_R6_IV_SCRIPT
+    /* M16.1 (spec m16/m161 3.3, SB-19): a script refusal replaces only a previous script entry with the same code (a burst does
+     * not push Interval / ETTR out of the ring; every one is in scr.shot); not counted as a refused Start */
+    if (src == R6IV_REF_SCRIPT)
+    {
+        uint32_t n = iv_ref_n;
+        struct r6_iv_ref * p = &iv_ref_ring[(n - 1) % R6IV_REF_RING];
+        if (n && p->src == R6IV_REF_SCRIPT && p->cam == c) { p->t = get_ms_clock(); return; }
+        p = &iv_ref_ring[n % R6IV_REF_RING];
+        memset(p, 0, sizeof(*p));
+        p->t = get_ms_clock();
+        p->src = src;
+        p->cam = c;
+        p->lock = c == R6IV_CAM_TVW ? iv_refused_pw : 0;
+        iv_ref_n = n + 1;
+        return;
+    }
+#endif
     struct r6_iv_ref * e = &iv_ref_ring[iv_ref_n % R6IV_REF_RING];
     e->t = get_ms_clock();
     e->src = src;
@@ -1149,6 +1227,11 @@ int r6_iv_menu_block(void)
     else if (iv_bulb && !iv_bulb_end_t)                   /* M9.3: up to 30 min */
         NotifyBox(3000, "Interval: bulb %d/%d s.\nAbort: full press, not near the end.\nML menu after the picture.", MAX(get_ms_clock() - iv_t1, 0) / 1000, iv_bulb_s);
     else if (iv_bulb) NotifyBox(3000, "Interval: Canon busy (NR).\nML menu after it.");
+#ifdef CONFIG_R6_IV_SCRIPT
+    /* M16.1 (spec m16/m161 3.3, 4.3, A17): the script's own texts; the next Tv job waits R6IV_MENU_WANT_MS after this (T1-M2) */
+    else if (evb && _r6pw_state()->armed == R6PW_CTX_SCRIPT) NotifyBox(3000, "Lua: Tv write running.\nPress Trash again right after it.");
+    else if (iv_in_pic && st.test == R6IV_TEST_SCRIPT) NotifyBox(3000, "Lua: picture running.\nPress Trash again right after it.");
+#endif
     else if (evb && _r6pw_state()->ev_on) NotifyBox(3000, "Interval: bracket %d/%d running.\nML menu after it.", MIN(bk.k + 1, bk.n), bk.n);
     else if (evb) NotifyBox(3000, "Interval: Tv restore running.\nML menu after it.");   /* review round 1, safety L5 */
     else NotifyBox(3000, "%s: picture running.\nPress Trash again right after it.", nm);
@@ -1175,6 +1258,10 @@ static void iv_end(int stop, int detail, int32_t val)
     st.running = 0;
 #ifdef CONFIG_R6_MOTION
     if (st.mode != R6IV_MODE_INTERVAL) r6_md_end();     /* M9.3: idempotent (iv_end can run twice) */
+#endif
+#ifdef CONFIG_R6_IV_SCRIPT
+    if (st.test == R6IV_TEST_SCRIPT) _r6iv_scr_done(stop, detail);   /* M16.1 (3.3): the picture job's result (idempotent by seq) */
+    if (_r6pw_state()->armed != R6PW_CTX_SCRIPT)   /* M16.1 (2.6, T1-M1): a series end never ends the script runner's arm */
 #endif
     _r6pw_series_end(stop);   /* M10.2: every end of a series / test: event stop (restore now / pending / none), then
                                * disarm or ctx PEND; once per arm (iv_end can run twice) */
@@ -1206,7 +1293,9 @@ static void iv_begin(int now, int test)
     int mode0 = shooting_mode;               /* review round 2: the mode the checks below see */
     int c = iv_ettr_busy() ? R6IV_CAM_ETTR : r6_iv_cam_check();   /* M11.1 (X2): the second barrier in the task */
     if (c == R6IV_CAM_OK && shooting_mode != mode0) c = R6IV_CAM_MODE;
-    int bkm = iv_bkt_mode(), base = 0;
+    /* M16.1 (spec m16/m161 3.3, A24): a script picture (test R6IV_TEST_SCRIPT) takes this path with the same checks in the same
+     * order, without the bracket and the interval fit, one picture at once (no start delay); a refusal goes to its job */
+    int bkm = IV_SCR(test != R6IV_TEST_SCRIPT &&) iv_bkt_mode(), base = 0;
     if (c == R6IV_CAM_OK && bkm)                 /* M10.2: spec 4.3, in the task; base = the stable-M Tv (row 36) */
     {
         int16_t v = 0;
@@ -1214,17 +1303,25 @@ static void iv_begin(int now, int test)
         if (c == R6IV_CAM_OK && (!_r6pw_tv_stable(&v) || v != base)) { iv_refused_pw = R6PW_L_VIEWS; c = R6IV_CAM_TVW; }
     }
     if (c == R6IV_CAM_OK && !bkm && !test && iv_interval_fit(iv_interval_s(), 0, 0) == 2) c = R6IV_CAM_INTERVAL;   /* M8.2 */
+#ifdef CONFIG_R6_IV_SCRIPT
+    if (c != R6IV_CAM_OK && test == R6IV_TEST_SCRIPT)
+    {
+        iv_refuse(c, R6IV_REF_SCRIPT);       /* M16.1 (SB-19): the script's own ring entry; the menu's refusal line stays */
+        _r6iv_scr_fin(R6API_CAM + c, r6_iv_cam_name(c));
+        return;
+    }
+#endif
     if (c != R6IV_CAM_OK)
     {
         iv_refused_cam = c;
         iv_refuse(c, test ? R6IV_REF_TASK_TEST : R6IV_REF_TASK_START);   /* M10.2b: with its reason */
         return;
     }
-    iv_refused_cam = R6IV_CAM_OK;
+    IV_SCR(if (test != R6IV_TEST_SCRIPT)) iv_refused_cam = R6IV_CAM_OK;   /* M16.1: a script picture leaves the menu's line */
     iv_mode0 = mode0;                        /* review F2: the series keeps this mode (M or B, r6_iv_cam_check passed) */
     st.mode = R6IV_MODE_INTERVAL;            /* M9.3 */
     st.test = test;
-    if (test) iv_test_shots0 = st.shots;
+    if (test IV_SCR(== 1)) iv_test_shots0 = st.shots;   /* M16.1: not for a script picture ("Test: 1 picture" line) */
     st.interval_s = test ? 0 : iv_interval_s();   /* test: unused, n_target 1 ends with DONE */
     st.n_target = test ? 1 : iv_count();
     st.n_done = 0;
@@ -1235,7 +1332,7 @@ static void iv_begin(int now, int test)
     st.t_start = now;
     st.cnt_last = total_shots_count;
     st.fn_last = iv_file_number();
-    iv_due = now + (test ? R6IV_TEST_MS : iv_delay_s() * 1000);
+    iv_due = IV_SCR(test == R6IV_TEST_SCRIPT ? now :) now + (test ? R6IV_TEST_MS : iv_delay_s() * 1000);   /* M16.1: at once (E5) */
     iv_wait_ms = 0;
     iv_wait_mask = 0;
     iv_wait_menu = 0;
@@ -2238,6 +2335,476 @@ static void iv_back_tick(int now)
     iv_ev_end_hold();                        /* a Trash press blocked in its window (review round 1, safety L5) */
 }
 
+#ifdef CONFIG_R6_IV_SCRIPT
+/* ======== M16.1 (spec m16/m161 2.5, 2.6, 3.3, 4.1, 4.3): the script jobs ========
+ * One slot (iv_scr) for the job "picture" (command 7: iv_begin with R6IV_TEST_SCRIPT, every Interval check, iv_shoot through the
+ * two shutter callbacks only) and the job "Tv" (command 8: the runner below, Tor 1's context "script"). The facade r6_api.c posts
+ * (any task), r6_iv_task executes; every change of the slot's word is a CAS. Never through iv_cmd (one writer: GuiMainTask). */
+#define IV_W(q, s) ((uint32_t) (q) << 8 | (uint32_t) (s))
+static int _r6iv_scr_ws(uint32_t w) { return w & 0xFF; }
+static uint32_t _r6iv_scr_wq(uint32_t w) { return w >> 8; }
+static int _r6iv_scr_in_task(void) { return streq(get_current_task_name(), "r6_iv_task"); }
+static void _r6iv_scr_inc(volatile uint32_t * p) { uint32_t v; do v = *p; while (!r6_cas32(p, v, v + 1)); }
+extern int lvprobe_snapshot_busy(void);       /* lvprobe.c: a log snapshot runs or waits (SL-5) */
+
+/* 2.6: r6_iv_task, right before a press / an arm / a bracket event: iv_act = 1, dmb, then the script side's mark (Dekker with
+ * _r6iv_scr_intent_begin). 1 = the script side holds it or its settle time runs: postponed like the ML menu (iv_act 0 again) */
+static int _r6iv_scr_act(int now)
+{
+    iv_act = 1;
+    r6_barrier();
+    if (!iv_intent)
+    {
+        r6_barrier();                        /* review R2-7: the deadline after the count (the writer: deadline, dmb, count - 1) */
+        if (now - iv_t_intent_end >= 0) return 0;
+    }
+    iv_act = 0;
+    _r6iv_scr_inc(&iv_scr_cnt.intent_wait);
+    iv_due = now;                            /* postponed, never skipped (as R6IV_CANON_MENU) */
+    return 1;
+}
+
+/* scr.shot and r6_last_shot (seqlock) of a picture job; r6_iv_task or the poster (POSTED -> FREE) */
+static void _r6iv_scr_shot_rec(uint32_t q, int res, int canc)
+{
+    uint32_t k;
+    do k = iv_scr_shot_n; while (!r6_cas32(&iv_scr_shot_n, k, k + 1));
+    struct r6_iv_scr_shot * e = &iv_scr_shots[k % R6IV_SCR_RING];
+    e->seq = q; e->gen = iv_scr.gen; e->t_req = iv_scr.t_req; e->t_done = get_ms_clock(); e->res = res;
+    e->async = iv_scr.async; e->cancelled = canc; e->tv = iv_tv_prop; e->fn = iv_file_number();
+}
+static void _r6iv_scr_ls_put(uint32_t q, int res, int canc)
+{
+    uint32_t s = iv_ls_sq;
+    iv_ls_sq = s | 1;                        /* odd: writing (one writer at a time: the slot's owner) */
+    r6_barrier();
+    iv_ls.res = res; iv_ls.seq = q; iv_ls.t_req = iv_scr.t_req; iv_ls.t_done = get_ms_clock();
+    memcpy(iv_ls.why, iv_scr.why, sizeof(iv_ls.why));
+    iv_ls_gen = iv_scr.gen; iv_ls_async = iv_scr.async; iv_ls_canc = canc;
+    r6_barrier();
+    iv_ls_sq = (s | 1) + 1;
+}
+
+/* r6_iv_task: the job it took ends with res / why (every kind, every path; idempotent: a second call finds no job) */
+static void _r6iv_scr_fin(int res, const char * why)
+{
+    uint32_t q = iv_scr_run;
+    if (!q) return;
+    uint32_t w = iv_scr.w;
+    if (_r6iv_scr_wq(w) != q) { iv_scr_run = 0; return; }   /* never expected */
+    iv_scr_run = 0;
+    int s = _r6iv_scr_ws(w);
+    int canc = res == R6API_CANCELLED || s == R6IV_SS_CANCELLED || s == R6IV_SS_ABANDONED;
+    iv_scr.res = res;
+    snprintf(iv_scr.why, sizeof(iv_scr.why), "%s", why ? why : "");
+    iv_scr.t_done = get_ms_clock();
+    if (iv_scr.kind == R6IV_SK_SHOT)
+    {
+        if (res == R6API_OK) iv_scr_pics++;
+        _r6iv_scr_shot_rec(q, res, canc);
+        _r6iv_scr_ls_put(q, res, canc);
+    }
+    if (res != R6API_OK && res != R6API_CANCELLED) _r6iv_scr_inc(&iv_scr_cnt.refused);
+    if (s == R6IV_SS_TAKEN || s == R6IV_SS_ACTIVE)
+    {
+        r6_barrier();
+        if (r6_cas32(&iv_scr.w, w, IV_W(q, iv_scr.async ? R6IV_SS_FREE : R6IV_SS_DONE))) { _r6iv_scr_inc(&iv_scr_cnt.done); return; }
+        w = iv_scr.w;                        /* the poster cancelled (TAKEN) or gave up (ACTIVE) meanwhile */
+        s = _r6iv_scr_ws(w);
+    }
+    if (s == R6IV_SS_CANCELLED) _r6iv_scr_inc(&iv_scr_cnt.cancelled);
+    else if (s == R6IV_SS_ABANDONED) _r6iv_scr_inc(&iv_scr_cnt.abandoned);
+    if (_r6iv_scr_wq(w) == q && (s == R6IV_SS_CANCELLED || s == R6IV_SS_ABANDONED)) r6_cas32(&iv_scr.w, w, IV_W(q, R6IV_SS_FREE));
+}
+
+/* iv_end of a script picture (3.3): E5's codes; idempotent (iv_end can run twice: _r6iv_scr_fin finds no job then) */
+static void __attribute__((noinline)) _r6iv_scr_done(int stop, int detail)
+{
+    if (!iv_scr_run || iv_scr.kind != R6IV_SK_SHOT) return;
+    char t[48];
+    int res = stop;
+    if (stop == R6IV_STOP_DONE) { res = R6API_OK; snprintf(t, sizeof(t), "ok"); }
+    else if (stop == R6IV_STOP_USER) { res = R6API_CANCELLED; snprintf(t, sizeof(t), "cancelled"); }
+    else if (stop == R6IV_STOP_CAMERA) { res = R6API_CAM + detail; snprintf(t, sizeof(t), "%s", r6_iv_cam_name(detail)); }
+    else if (stop == R6IV_STOP_CANON || stop == R6IV_STOP_WAIT || stop == R6IV_STOP_ABORT)
+        snprintf(t, sizeof(t), "%s (%s)", r6_iv_stop_name(stop), r6_iv_canon_name(detail));
+    else snprintf(t, sizeof(t), "%s", r6_iv_stop_name(stop));
+    _r6iv_scr_fin(res, t);
+}
+
+/* ---- the Tv runner (4.1, 4.3): phases PRE (no arm), WRITTEN, COMMIT; every end after a successful arm goes through
+ * _r6pw_series_end, except the kept commit (T1-H1); every end: iv_act 0, the Trash hold from here, code and text into the slot ---- */
+static void _r6iv_scr_tv_end(int res, const char * why, int phase)
+{
+    const struct r6pw_state * p = _r6pw_state();
+    struct r6_iv_scr_tv * e = &iv_scr_tvs[iv_scr_tv_n % R6IV_SCR_RING];
+    e->t = get_ms_clock();
+    e->base = iv_scr_base;
+    e->want = iv_scr.want;
+    e->res = res;
+    e->lock = (res & R6API_TV_LOCK) && res > 0 ? res & 0xFF : 0;
+    e->calls = iv_scr_armed ? MIN(p->e_calls, 255) : 0;
+    e->phase_end = phase;
+    e->pad = 0;
+    iv_scr_tv_n++;
+    iv_scr_ph = R6IV_SPH_IDLE;
+    iv_scr_armed = 0;
+    iv_act = 0;
+    iv_ev_end_hold();                        /* a Trash press blocked in the window gets its R6IV_MENU_WANT_MS from here (T1-M2) */
+    _r6iv_scr_fin(res, why);
+}
+
+/* an end on a lock row (0x100 | lock), with the K4 text for "Tv writes" OFF */
+static void _r6iv_scr_tv_lock(int l, int phase)
+{
+    char t[48];
+    if (l == R6PW_L_OFF) snprintf(t, sizeof(t), "Tv writes: off (menu.set(\"Interval\", \"Tv writes\", \"ON\"))");
+    else snprintf(t, sizeof(t), "%s", _r6pw_lock_name(l));
+    _r6iv_scr_tv_end(R6API_TV_LOCK | (l & 0xFF), t, phase);
+}
+
+/* an end on a write result (0x200 | result) */
+static void _r6iv_scr_tv_res(int r, int phase)
+{
+    _r6iv_scr_tv_end(R6API_TV_RES | (r & 0xFF), r == R6PW_R_TOOK_OVER ? "Tv changed by user (your value stays)" : _r6pw_res_name(r), phase);
+}
+
+/* after the CAS POSTED -> TAKEN: the base first (A23), the window and grid again (want only from the slot) */
+static void __attribute__((noinline)) _r6iv_scr_tv_begin(int now)
+{
+    if (!_r6iv_scr_in_task()) return;
+    int want = iv_scr.want;
+    int16_t v = 0;
+    iv_scr_armed = 0;
+    iv_scr_base = 0x7FFF;
+    iv_scr_t0 = now;
+    iv_scr_ph = R6IV_SPH_PRE;
+    if ((want & (R6PW_GRID - 1)) || want < R6PW_TV_MIN || want > R6PW_TV_MAX) { _r6iv_scr_tv_lock(R6PW_L_NEW, R6IV_SPH_PRE); return; }
+    /* not M: Tor 1's row "mode" (stable-M below would say "Tv not settled"; QEMU m161t T3) */
+    if (shooting_mode != SHOOTMODE_M || shooting_mode_custom != SHOOTMODE_M) { _r6iv_scr_tv_lock(R6PW_L_MODE, R6IV_SPH_PRE); return; }
+    if (!_r6pw_tv_stable(&v)) { _r6iv_scr_tv_lock(R6PW_L_VIEWS, R6IV_SPH_PRE); return; }
+    iv_scr_base = v;
+    if (v == want) _r6iv_scr_tv_end(R6API_OK, "unchanged", R6IV_SPH_PRE);   /* no arm, no call (row 40 would refuse it) */
+}
+
+/* the free pre-check: the second base read (T1-N1), the intent mark, the arm, the wait rows, the CAS TAKEN -> ACTIVE, the one write */
+static void __attribute__((noinline)) _r6iv_scr_tv_go(int now)
+{
+    if (!_r6iv_scr_in_task()) return;
+    int want = iv_scr.want;
+    int16_t v2 = 0;
+    if (!_r6pw_tv_stable(&v2) || v2 != iv_scr_base) { _r6iv_scr_tv_end(R6API_TV_LOCK | R6PW_L_VIEWS, "Tv changed", R6IV_SPH_PRE); return; }
+    if (_r6iv_scr_act(now))                     /* 2.6: the script side's intent mark: the next tick (inside the 5 s) */
+    {
+        if (now - iv_scr_t0 >= R6IV_BKT_WAIT_MS || now < iv_scr_t0) _r6iv_scr_tv_lock(R6PW_L_GUI, R6IV_SPH_PRE);
+        return;
+    }
+    int l = _r6pw_arm_script(iv_scr_base, want);
+    if (l) { _r6iv_scr_tv_lock(l, R6IV_SPH_PRE); return; }   /* not armed: no series end */
+    iv_scr_armed = 1;
+    _r6pw_ev_begin(++iv_scr_ev);
+    l = _r6pw_wait_ready(want, R6PW_K_SCRIPT);
+    if (l)
+    {
+        int took = _r6pw_state()->last_res == R6PW_R_TOOK_OVER;   /* row 44 with the user's evidence: the dial turn wins */
+        _r6pw_series_end(took ? R6IV_STOP_TVUSER : R6IV_STOP_TVW);
+        if (took) _r6iv_scr_tv_res(R6PW_R_TOOK_OVER, R6IV_SPH_PRE);
+        else _r6iv_scr_tv_lock(l, R6IV_SPH_PRE);
+        return;
+    }
+    uint32_t w = iv_scr.w;                   /* the storno check: CAS TAKEN -> ACTIVE right before the write */
+    if (_r6iv_scr_wq(w) != iv_scr_run || _r6iv_scr_ws(w) != R6IV_SS_TAKEN || !r6_cas32(&iv_scr.w, w, IV_W(iv_scr_run, R6IV_SS_ACTIVE)))
+    {
+        _r6pw_series_end(R6IV_STOP_TVW);
+        _r6iv_scr_tv_end(R6API_CANCELLED, "cancelled", R6IV_SPH_PRE);
+        return;
+    }
+    iv_scr.t_act = get_ms_clock();
+    iv_scr_ph = R6IV_SPH_WRITTEN;
+    int r = _r6pw_write(want, R6PW_K_SCRIPT, 1, iv_scr_ev);   /* all 44 rows, the call, 500 ms */
+    if (r != R6PW_R_OK)
+    {
+        _r6pw_series_end(r == R6PW_R_TOOK_OVER ? R6IV_STOP_TVUSER : R6IV_STOP_TVW);
+        _r6iv_scr_tv_res(r, R6IV_SPH_WRITTEN);
+        return;
+    }
+    iv_scr_ph = R6IV_SPH_COMMIT;
+    iv_scr_tc = get_ms_clock();
+}
+
+/* every tick after the series part (fixed order: sample, Tor 1's tick, the series, the runner; SB-31) */
+static void __attribute__((noinline)) _r6iv_scr_tv_tick(int now)
+{
+    if (!_r6iv_scr_in_task()) return;
+    if (iv_scr_ph == R6IV_SPH_PRE)
+    {
+        uint32_t w = iv_scr.w;
+        if (_r6iv_scr_wq(w) != iv_scr_run || _r6iv_scr_ws(w) != R6IV_SS_TAKEN) { _r6iv_scr_tv_end(R6API_CANCELLED, "cancelled", R6IV_SPH_PRE); return; }
+        if (ml_shutdown_requested || _r6pw_sig()) { _r6iv_scr_tv_end(R6API_BUSY, "shutting down", R6IV_SPH_PRE); return; }   /* SL-10 */
+        int l = 0;
+        _r6pw_locks(iv_scr.want, R6PW_CLASS_ALL, &l);
+        int card = !iv_in_pic && IV_RD(R6IV_RAM_JOBCNT) == 0;   /* pw_card_ok's condition: pw_arm never refuses JOB hard (T1-N2) */
+        if (l && !_r6pw_is_wait_row(l)) { _r6iv_scr_tv_lock(l, R6IV_SPH_PRE); return; }   /* a hard row: no arm */
+        if (!l && card) { _r6iv_scr_tv_go(now); return; }
+        if (now - iv_scr_t0 >= R6IV_BKT_WAIT_MS || now < iv_scr_t0) _r6iv_scr_tv_lock(l ? l : R6PW_L_JOB, R6IV_SPH_PRE);
+        return;                              /* a wait row or the card: the next tick */
+    }
+    if (iv_scr_ph == R6IV_SPH_COMMIT)
+    {
+        int l = _r6pw_commit_script(iv_scr.want);
+        if (l == 0) { _r6iv_scr_tv_end(R6API_OK, "ok", R6IV_SPH_COMMIT); return; }   /* K3: kept (marker gone, base = want, disarmed) */
+        if ((l == R6PW_L_JOB || l == R6PW_L_VIEWS) && now - iv_scr_tc < R6IV_SCR_COMMIT_MS && now >= iv_scr_tc) return;
+        _r6pw_series_end(R6IV_STOP_TVW);
+        _r6iv_scr_tv_lock(l, R6IV_SPH_COMMIT);
+    }
+}
+
+/* the command part of iv_tick: a posted job, every tick (2.5, SL-1): shutdown -> BUSY, an asynchronous job too old -> expired, a
+ * long lock -> BUSY at once, a short one (a menu command queued, R-14 for Tv) -> stays posted, else TAKEN (then the Dekker check
+ * with the log snapshot, SL-5) and: picture -> iv_begin (command 7), Tv -> the runner (command 8) */
+static int _r6iv_scr_exec(int now)
+{
+    if (!iv_task_tid) iv_task_tid = get_current_task_id();   /* the log's tsk.hw (MK8) */
+    uint32_t w = iv_scr.w;
+    if (_r6iv_scr_ws(w) != R6IV_SS_POSTED) return 0;
+    r6_barrier();
+    int kind = iv_scr.kind, async = iv_scr.async, t_req = iv_scr.t_req, canc = 0;
+    const char * why = 0;
+    if (ml_shutdown_requested || _r6pw_sig()) why = "shutting down";
+    else if (async && now - t_req >= R6API_ASYNC_MAX_MS) { canc = 1; why = "expired"; }
+    else if (st.running) why = st.mode != R6IV_MODE_INTERVAL ? "Motion trigger runs" : "Interval runs";
+    else if (iv_back_t) why = "Tv back runs";
+    else if (iv_ettr_busy()) why = "ETTR runs";
+    else if (lvprobe_snapshot_busy()) why = "log snapshot runs";
+    else if (_r6pw_state()->pend) why = "Tv restore pending";       /* any context (T1-N7, V2a-3) */
+    else if (iv_cmd || iv_scr_ph != R6IV_SPH_IDLE) return 0;        /* short: a menu command queued */
+    else if (kind == R6IV_SK_TV && (iv_menu_wanted_ev || now - iv_t_menu_wanted < R6IV_MENU_WANT_MS)) return 0;   /* R-14 (T1-M2) */
+    if (!r6_cas32(&iv_scr.w, w, IV_W(_r6iv_scr_wq(w), R6IV_SS_TAKEN))) return 0;   /* the poster cancelled meanwhile */
+    iv_scr_run = _r6iv_scr_wq(w);
+    if (canc) { _r6iv_scr_inc(&iv_scr_cnt.expired); _r6iv_scr_fin(R6API_CANCELLED, why); return 0; }
+    if (why) { _r6iv_scr_inc(&iv_scr_cnt.busy); _r6iv_scr_fin(R6API_BUSY, why); return 0; }
+    r6_barrier();
+    if (lvprobe_snapshot_busy()) { _r6iv_scr_inc(&iv_scr_cnt.busy); _r6iv_scr_fin(R6API_BUSY, "log snapshot runs"); return 0; }
+    _r6iv_scr_inc(&iv_scr_cnt.taken);
+    if (kind == R6IV_SK_SHOT) return 7;      /* job 7 (3.3): iv_begin(now, R6IV_TEST_SCRIPT) at the command part's one call site */
+    _r6iv_scr_tv_begin(now);                 /* job 8 (4.1) */
+    return 0;
+}
+
+/* the picture job's CAS TAKEN -> ACTIVE right before iv_shoot (G5 pins the place); 0 = cancelled meanwhile */
+static int _r6iv_scr_activate(int now)
+{
+    uint32_t w = iv_scr.w;
+    if (_r6iv_scr_wq(w) != iv_scr_run || _r6iv_scr_ws(w) != R6IV_SS_TAKEN || !r6_cas32(&iv_scr.w, w, IV_W(iv_scr_run, R6IV_SS_ACTIVE))) return 0;
+    iv_scr.t_act = now;
+    return 1;
+}
+
+/* iv_tick's command part: iv_cmd taken atomically (a Stop between the read and the clear is not lost, SL-7) */
+static int _r6iv_scr_cmd_take(void)
+{
+    int c;
+    do c = iv_cmd; while (c && !r6_cas32((volatile uint32_t *) &iv_cmd, c, 0));
+    return c;
+}
+
+/* commands 1 / 3 / 4 / 5 / 6 while a script job is open (2.6, T1-M1): refused in r6_iv_task, "script job running" */
+static void _r6iv_scr_cmd_refused(int now, int c)
+{
+    if (c == 1 || c == 3) { iv_refused_cam = R6IV_CAM_SCRIPT; iv_refuse(R6IV_CAM_SCRIPT, c == 3 ? R6IV_REF_TASK_TEST : R6IV_REF_TASK_START); }
+#ifdef CONFIG_R6_MOTION
+    else if (c == 4) { iv_md_refused = R6IV_CAM_SCRIPT; iv_refuse(R6IV_CAM_SCRIPT, R6IV_REF_MD_TASK); }
+#endif
+    else if (c == 5) iv_back_drop = "script job running";
+#ifdef CONFIG_R6_ETTR
+    else if (c == 6) _r6ettr_run_refused(now, R6ETT_A_BUSY);
+#endif
+}
+
+/* ---- for the facade (any task) ---- */
+int _r6iv_scr_post(int kind, int want, uint32_t gen, int async, uint32_t * seq)
+{
+    uint32_t o, q, w = iv_scr.w;
+    if (_r6iv_scr_ws(w) != R6IV_SS_FREE) return 1;
+    do { o = iv_scr_seqn; q = (o + 1) & 0xFFFFFF; if (!q) q = 1; } while (!r6_cas32(&iv_scr_seqn, o, q));
+    if (!r6_cas32(&iv_scr.w, w, IV_W(q, R6IV_SS_FILL))) return 1;
+    iv_scr.gen = gen;
+    iv_scr.tid = get_current_task_id();
+    iv_scr.kind = kind;
+    iv_scr.want = want;
+    iv_scr.async = async;
+    iv_scr.t_req = get_ms_clock();
+    iv_scr.t_act = iv_scr.t_done = 0;
+    iv_scr.res = 0;
+    iv_scr.why[0] = 0;
+    r6_barrier();
+    r6_cas32(&iv_scr.w, IV_W(q, R6IV_SS_FILL), IV_W(q, R6IV_SS_POSTED));   /* FILL belongs to the poster: always succeeds */
+    _r6iv_scr_inc(&iv_scr_cnt.posted);
+    if (seq) *seq = q;
+    return 0;
+}
+
+int _r6iv_scr_state(uint32_t seq)
+{
+    uint32_t w = iv_scr.w;
+    return _r6iv_scr_wq(w) == seq && _r6iv_scr_ws(w) != R6IV_SS_FREE ? _r6iv_scr_ws(w) : -1;   /* FREE: no job any more (ended after a cancel) */
+}
+
+int _r6iv_scr_take(uint32_t seq, struct r6_iv_scr_out * o)
+{
+    uint32_t w = iv_scr.w;
+    if (w != IV_W(seq, R6IV_SS_DONE)) return 0;
+    r6_barrier();
+    o->res = iv_scr.res;
+    o->seq = seq;
+    o->t_req = iv_scr.t_req;
+    o->t_done = iv_scr.t_done;
+    memcpy(o->why, iv_scr.why, sizeof(o->why));
+    o->why[sizeof(o->why) - 1] = 0;
+    r6_barrier();
+    return r6_cas32(&iv_scr.w, w, IV_W(seq, R6IV_SS_FREE));
+}
+
+/* POSTED -> FREE (the poster's, with a ring entry), TAKEN -> CANCELLED (r6_iv_task ends it), late: ACTIVE -> ABANDONED */
+int _r6iv_scr_cancel(uint32_t seq, int late)
+{
+    for (;;)
+    {
+        uint32_t w = iv_scr.w;
+        int s = _r6iv_scr_ws(w);
+        if (_r6iv_scr_wq(w) != seq) return 0;
+        if (s == R6IV_SS_POSTED)
+        {
+            if (!r6_cas32(&iv_scr.w, w, IV_W(seq, R6IV_SS_FILL))) continue;   /* FILL: ours for the ring entry, then FREE */
+            _r6iv_scr_inc(&iv_scr_cnt.cancelled);
+            if (iv_scr.kind == R6IV_SK_SHOT) { snprintf(iv_scr.why, sizeof(iv_scr.why), "cancelled"); _r6iv_scr_shot_rec(seq, R6API_CANCELLED, 1); _r6iv_scr_ls_put(seq, R6API_CANCELLED, 1); }
+            r6_barrier();
+            iv_scr.w = IV_W(seq, R6IV_SS_FREE);
+            return 1;
+        }
+        if (s == R6IV_SS_TAKEN) { if (!r6_cas32(&iv_scr.w, w, IV_W(seq, R6IV_SS_CANCELLED))) continue; return 1; }
+        if (s == R6IV_SS_ACTIVE && late)
+        {
+            if (!r6_cas32(&iv_scr.w, w, IV_W(seq, R6IV_SS_ABANDONED))) continue;
+            if (late == 1) _r6iv_scr_inc(&iv_scr_cnt.late);   /* the poster's backstop (R6API_LATE), not a script end */
+            return 2;
+        }
+        if (s == R6IV_SS_DONE && late == 2) { if (!r6_cas32(&iv_scr.w, w, IV_W(seq, R6IV_SS_FREE))) continue; return 1; }
+        return 0;
+    }
+}
+
+/* SL-2: the real end of a Lua state (all: every job of gen, also asynchronous ones) or of one of its tasks (only its own waiting job) */
+void _r6iv_scr_end_owner(uint32_t gen, uint32_t tid, int all)
+{
+    uint32_t w = iv_scr.w;
+    int s = _r6iv_scr_ws(w);
+    if (!gen || s == R6IV_SS_FREE || s == R6IV_SS_FILL) return;
+    r6_barrier();
+    if (iv_scr.gen != gen || (!all && (iv_scr.tid != tid || iv_scr.async))) return;
+    _r6iv_scr_cancel(_r6iv_scr_wq(w), 2);           /* POSTED -> FREE, TAKEN -> CANCELLED, ACTIVE -> ABANDONED, DONE -> FREE */
+}
+
+int _r6iv_scr_busy(void) { return _r6iv_scr_ws(iv_scr.w) != R6IV_SS_FREE || iv_scr_ph != R6IV_SPH_IDLE; }
+
+int _r6iv_gui_busy(void)
+{
+#ifdef CONFIG_R6_ETTR
+    if (r6_ettr_menu_lock()) return 1;
+#endif
+    return iv_in_pic || (iv_bulb_ovr && iv_bulb_canon_running()) || _r6pw_ev_on() || iv_act;
+}
+
+int _r6iv_scr_intent_begin(void)
+{
+    uint32_t v;
+    do v = iv_intent; while (!r6_cas32(&iv_intent, v, v + 1));
+    r6_barrier();
+    if (!_r6iv_gui_busy()) return 0;
+    do v = iv_intent; while (!r6_cas32(&iv_intent, v, v - 1));   /* busy: the mark down before any wait (V2a-10) */
+    return 1;
+}
+
+void _r6iv_scr_intent_end(int settle_ms)
+{
+    uint32_t v;
+    if (settle_ms > 0)                       /* review R2-7: the deadline only grows (several script-side writers) */
+    {
+        int t = get_ms_clock() + settle_ms;
+        do v = (uint32_t) iv_t_intent_end; while (t - (int) v > 0 && !r6_cas32((volatile uint32_t *) &iv_t_intent_end, v, (uint32_t) t));
+    }
+    r6_barrier();
+    do v = iv_intent; while (v && !r6_cas32(&iv_intent, v, v - 1));
+}
+
+int _r6iv_tvw_on(void) { return _r6pw_on(); }
+int _r6iv_scr_pw_pend(void) { return _r6pw_state()->pend; }   /* review R3-8: a restore is pending (read only) */
+
+int _r6iv_scr_iv_stop(void)
+{
+    if (!r6_iv_md_running() && ((st.running && st.test != R6IV_TEST_SCRIPT) || iv_cmd == 1 || iv_cmd == 3)) { iv_cmd = 2; return 1; }
+    return 0;
+}
+
+int _r6iv_scr_can_start(int motion) { return !st.running && !iv_cmd; }
+
+/* 3.2.4: M: max(30 s, 3 x Tv + 20 s), Tv doubled while long exposure NR may be on; B: 2 T + 60 s */
+int _r6iv_scr_limit_ms(void)
+{
+    struct r6_iv_cc s;
+    r6_iv_cc_read(&s);
+    if (shooting_mode == SHOOTMODE_BULB)
+    {
+        int t = r6_iv_bulb_t(&s);
+        return t > 0 ? 2 * t * 1000 + 60000 : 30000;
+    }
+    int ev = 0, t = 32000;
+    if (iv_tv_budget_ev(&s, &ev)) t = ev <= 0 ? iv_tv_ub_ms(ev) : 1000;
+    if (ev <= 0 && (!(s.valid & R6IV_V_P) || s.p_lenr != 0)) t *= 2;
+    return MAX(30000, 3 * t + 20000);
+}
+
+int _r6iv_scr_last(struct r6_iv_scr_out * o, uint32_t * gen, int * async, int * cancelled)
+{
+    for (int i = 0; i < 4; i++)
+    {
+        uint32_t s = iv_ls_sq;
+        if (s & 1) { msleep(1); continue; }
+        r6_barrier();
+        *o = iv_ls;
+        *gen = iv_ls_gen; *async = iv_ls_async; *cancelled = iv_ls_canc;
+        r6_barrier();
+        if (iv_ls_sq == s) return s ? 1 : 0;
+    }
+    return -1;
+}
+
+int _r6iv_scr_shot_ring(int i, struct r6_iv_scr_shot * e)
+{
+    uint32_t n = iv_scr_shot_n;
+    int cnt = n < R6IV_SCR_RING ? (int) n : R6IV_SCR_RING;
+    if (e && i >= 0 && i < cnt) *e = iv_scr_shots[(n - cnt + i) % R6IV_SCR_RING];
+    return cnt;
+}
+
+int _r6iv_scr_tv_ring(int i, struct r6_iv_scr_tv * e)
+{
+    uint32_t n = iv_scr_tv_n;
+    int cnt = n < R6IV_SCR_RING ? (int) n : R6IV_SCR_RING;
+    if (e && i >= 0 && i < cnt) *e = iv_scr_tvs[(n - cnt + i) % R6IV_SCR_RING];
+    return cnt;
+}
+
+const struct r6_iv_scr_cnt * _r6iv_scr_counts(void) { return &iv_scr_cnt; }
+uint32_t _r6iv_scr_shots(void) { return iv_scr_pics; }
+int _r6iv_scr_shutdown(void) { return ml_shutdown_requested || _r6pw_sig(); }
+const char * _r6iv_scr_back_why(void) { return iv_back_why; }
+int _r6iv_scr_phase(void) { return iv_scr_ph; }
+uint32_t _r6iv_scr_task_id(void) { return iv_task_tid; }
+/* the facade's copies of two Tor 1 values (r6_api.c names no _r6pw_* nor r6_propw.h, propw_gate 11) */
+_Static_assert(R6API_TV_R_TOOK_OVER == R6PW_R_TOOK_OVER && R6API_TV_L_OFF == R6PW_L_OFF, "r6_api_abi.h: Tor 1 codes");
+#endif
+
 #ifdef CONFIG_R6_MOTION
 /* M9.3: one tick of a motion run (r6_iv_task, every R6MD_TICK_MS): the stops, then the detector; a trigger takes one
  * picture through iv_shoot (Release, Canon ready on this tick's snapshot), else it is dropped (never caught up) */
@@ -2270,18 +2837,33 @@ static void iv_tick_md(int now)
     if (!shoot || !r6_md_stats()->release) { r6_md_after(get_ms_clock(), R6MD_R_VIEW); return; }
     if (k != R6IV_CANON_OK) { r6_md_after(get_ms_clock(), R6MD_R_DROP + k); return; }   /* never caught up */
     iv_due = now;                                     /* slot_late ~0 */
+#ifdef CONFIG_R6_IV_SCRIPT
+    /* M16.1 (spec m16/m161 2.6, SL-6): a script's GUI switch in flight: dropped like a trigger with the ML menu open */
+    if (_r6iv_scr_act(now)) { r6_md_after(get_ms_clock(), R6MD_R_DROP + R6IV_CANON_MENU); return; }
+#endif
     iv_shoot(&iv_s);                                  /* all M8.x checks; may end the run (DONE / any stop) */
+    IV_SCR(iv_act = 0;)
     if (st.running) r6_md_after(get_ms_clock(), R6MD_R_SHOT);
 }
 #endif
 
 static void iv_tick(int now, int dt)
 {
+#ifdef CONFIG_R6_IV_SCRIPT
+    /* M16.1 (spec m16/m161 2.6, T1-M1, SL-7): iv_cmd taken atomically; while a script job is open only a Stop acts, here in the
+     * executor's own task (the menu's check and a script's post run on two tasks) */
+    int c = _r6iv_scr_cmd_take();
+    if (c && c != 2 && _r6iv_scr_busy()) { _r6iv_scr_cmd_refused(now, c); c = 0; }
+    if (!c) c = _r6iv_scr_exec(now);            /* M16.1 (2.5): a posted script job: BUSY / expired / taken; 7 = picture (iv_begin) */
+    if (c)
+    {
+#else
     int c = iv_cmd;
     if (c)
     {
         iv_cmd = 0;
-        if ((c == 1 || c == 3) && !st.running) iv_begin(now, c == 3);
+#endif
+        if ((c == 1 || c == 3 IV_SCR(|| c == 7)) && !st.running) iv_begin(now, IV_SCR(c == 7 ? R6IV_TEST_SCRIPT :) c == 3);
 #ifdef CONFIG_R6_MOTION
         else if (c == 4 && !st.running) iv_begin_md(now, iv_md_shoot_req);    /* M9.3 */
 #endif
@@ -2310,6 +2892,20 @@ static void iv_tick(int now, int dt)
     if (!st.running) return;
 #ifdef CONFIG_R6_MOTION
     if (st.mode != R6IV_MODE_INTERVAL) { iv_tick_md(now); return; }
+#endif
+#ifdef CONFIG_R6_IV_SCRIPT
+    /* M16.1 (2.5, A18): a waiting script picture cancelled by its poster (limit, script / task end, Interval Start): no picture */
+    if (st.test == R6IV_TEST_SCRIPT && iv_scr_run && iv_scr.w == IV_W(iv_scr_run, R6IV_SS_CANCELLED)) { iv_end(R6IV_STOP_USER, 0, 0); return; }
+    /* 2.2 / SL-1: an asynchronous picture not pressed R6API_ASYNC_MAX_MS after its posting expires also while it waits TAKEN (ML menu,
+     * LV, review; QEMU m161p P7b): no picture */
+    if (st.test == R6IV_TEST_SCRIPT && iv_scr_run && iv_scr.async && iv_scr.w == IV_W(iv_scr_run, R6IV_SS_TAKEN)
+        && now - (int) iv_scr.t_req >= R6API_ASYNC_MAX_MS)
+    {
+        _r6iv_scr_inc(&iv_scr_cnt.expired);
+        _r6iv_scr_fin(R6API_CANCELLED, "expired");
+        iv_end(R6IV_STOP_USER, 0, 0);
+        return;
+    }
 #endif
 
     /* stop conditions: every tick, also between slots */
@@ -2356,10 +2952,19 @@ static void iv_tick(int now, int dt)
     if (now - iv_due > R6IV_LATE_MS) { iv_skip_late(now); return; }
     if (bk.mode)                             /* M10.2: an event starts only with Tv stably the base (iv_bkt_between) */
     {
+#ifdef CONFIG_R6_IV_SCRIPT
+        if (!bk.t_mis && _r6iv_scr_act(now)) return;   /* M16.1 (2.6): before the event's arm / writes, the script's intent mark */
+#endif
         if (!bk.t_mis) iv_event(now);
+        IV_SCR(iv_act = 0;)
         return;
     }
+#ifdef CONFIG_R6_IV_SCRIPT
+    if (_r6iv_scr_act(now)) return;             /* M16.1 (2.6, SL-6): a script's GUI switch in flight: postponed */
+    if (st.test == R6IV_TEST_SCRIPT && !_r6iv_scr_activate(now)) { iv_act = 0; iv_end(R6IV_STOP_USER, 0, 0); return; }   /* 2.5 */
+#endif
     iv_shoot(&iv_s);
+    IV_SCR(iv_act = 0;)
 }
 
 /* never ends; the only task that presses (iv_press checks the task name) */
@@ -2378,6 +2983,7 @@ static void r6_iv_task(void * unused)
         _r6pw_tick(now);                      /* M10.2: fixed order (spec 3.10): sample, the write path's tick, the series */
         iv_ev_end_hold();                     /* M10.2 review round 1 (safety L5): a Trash press blocked in a pending restore's window */
         iv_tick(now, dt);
+        IV_SCR(if (iv_scr_ph != R6IV_SPH_IDLE) _r6iv_scr_tv_tick(now);)   /* M16.1 (4.1): the Tv runner after the series part */
         if (iv_held)
         {
             /* never expected: iv_shoot lets go on every path */
@@ -2394,8 +3000,20 @@ void _r6iv_sample(int now) { iv_sample(now); }
 int _r6iv_bkt_armable(void) { return st.running && st.mode == R6IV_MODE_INTERVAL && iv_mode0 == SHOOTMODE_M && bk.mode == 1; }
 
 /* M10.2 provenance (spec 3.10, L15 b): Start, Test, "Tv writes" and "Tv back to ..." act only when ML's menu key
- * handling calls them, never from a module or Lua's menu API */
+ * handling calls them, never from a module or Lua's menu API. M16.1 (spec m16/m161 5.1, Ue7, rule 24): Lua reaches them only
+ * through the facade r6_api.c (GuiMainTask with the origin mark R6GO_SCRIPT, or a key press of a script: R6GO_FAKE) or as the
+ * script jobs 7 / 8; an autorun script can release and write after the start check; the write path itself is not exported */
+#ifdef CONFIG_R6_SCRIPT
+static int __attribute__((noinline)) iv_menu_caller(void)
+{
+    int org = _r6_gui_org();
+    if (!streq(get_current_task_name(), R6IV_MENU_TASK) || org == R6GO_NONE) return 0;   /* no mark: not ML's key handling */
+    _r6api_org_note(100);                    /* scr.org: an R6 action in GuiMainTask (KEY / FAKE / SCRIPT, MB-8) */
+    return 1;
+}
+#else
 static int __attribute__((noinline)) iv_menu_caller(void) { return streq(get_current_task_name(), R6IV_MENU_TASK); }
+#endif
 
 #ifdef CONFIG_R6_ETTR
 /* M11.1 (spec m11/m111 2.2 point 12, 3.10; Rev. 2 S1-04 / S1-07): R6 ETTR's "Apply once" queues command 6 for r6_iv_task.
@@ -2404,7 +3022,7 @@ static int __attribute__((noinline)) iv_menu_caller(void) { return streq(get_cur
 int _r6iv_ettr_cmd(void)
 {
     if (!iv_menu_caller()) return R6IV_CAM_CALLER;
-    if (st.running || iv_cmd || iv_back_t) return R6IV_CAM_BUSY;
+    if (st.running || iv_cmd || iv_back_t IV_SCR(|| _r6iv_scr_busy())) return R6IV_CAM_BUSY;   /* M16.1: a script job (2.6) */
     iv_cmd = 6;
     return R6IV_CAM_OK;
 }
@@ -2416,7 +3034,11 @@ int _r6iv_ettr_cmd(void)
 int r6_iv_md_start(void)
 {
     int shoot = r6_md_shoot_setting();
-    int c = (st.running || iv_cmd) ? R6IV_CAM_BUSY : iv_ettr_busy() ? R6IV_CAM_ETTR : iv_md_check(shoot);   /* M11.1: X2 */
+#ifdef CONFIG_R6_SCRIPT
+    /* M16.1 (spec m16/m161 5.1, Ue7): Motion Start acts only from ML's key handling (GuiMainTask with an origin mark) */
+    if (!iv_menu_caller()) { iv_md_refused = R6IV_CAM_CALLER; iv_refuse(R6IV_CAM_CALLER, R6IV_REF_MD); return R6IV_CAM_CALLER; }
+#endif
+    int c = (st.running || iv_cmd IV_SCR(|| _r6iv_scr_busy())) ? R6IV_CAM_BUSY : iv_ettr_busy() ? R6IV_CAM_ETTR : iv_md_check(shoot);   /* M11.1: X2 */
     if (c != R6IV_CAM_OK)
     {
         iv_md_refused = c;
@@ -2439,6 +3061,19 @@ static MENU_SELECT_FUNC(iv_start_stop)
 {
     if (iv_cmd == 2) return;                 /* Stop pressed, not taken over by the task yet */
     if (r6_iv_md_running()) { iv_refused_cam = R6IV_CAM_BUSY; iv_refuse(R6IV_CAM_BUSY, R6IV_REF_START); return; }   /* M9.3: never stops a motion run */
+#ifdef CONFIG_R6_IV_SCRIPT
+    /* M16.1 (spec m16/m161 2.5, 2.6): a script job is open: a waiting script picture is cancelled (never a start), a running one or
+     * a Tv job refuses */
+    if (_r6iv_scr_busy())
+    {
+        uint32_t w = iv_scr.w;
+        int s = _r6iv_scr_ws(w);
+        if (iv_scr.kind == R6IV_SK_SHOT && (s == R6IV_SS_POSTED || s == R6IV_SS_TAKEN) && _r6iv_scr_cancel(_r6iv_scr_wq(w), 0))
+            NotifyBox(2000, "Interval: Lua picture cancelled.");
+        else { iv_refused_cam = R6IV_CAM_SCRIPT; iv_refuse(R6IV_CAM_SCRIPT, R6IV_REF_START); NotifyBox(2000, "Interval: Lua job running."); }
+        return;
+    }
+#endif
     if (st.running || iv_cmd == 1 || iv_cmd == 3) { iv_cmd = 2; return; }
     int c = !iv_menu_caller() ? R6IV_CAM_CALLER : iv_ettr_busy() ? R6IV_CAM_ETTR : r6_iv_cam_check();   /* M10.2: only ML's
                                                                                                           * menu starts; M11.1: X2 */
@@ -2599,6 +3234,9 @@ static MENU_SELECT_FUNC(iv_test_select)
 {
     if (r6_iv_md_running()) { iv_refused_cam = R6IV_CAM_BUSY; iv_refuse(R6IV_CAM_BUSY, R6IV_REF_TEST); return; }   /* M9.3 */
     if (st.running || iv_cmd != 0) return;
+#ifdef CONFIG_R6_IV_SCRIPT
+    if (_r6iv_scr_busy()) { iv_refused_cam = R6IV_CAM_SCRIPT; iv_refuse(R6IV_CAM_SCRIPT, R6IV_REF_TEST); return; }   /* M16.1 (2.6) */
+#endif
     int c = !iv_menu_caller() ? R6IV_CAM_CALLER : iv_ettr_busy() ? R6IV_CAM_ETTR : r6_iv_cam_check();   /* M10.2: only ML's
                                                                                                           * menu starts; M11.1: X2 */
     if (c == R6IV_CAM_OK && iv_bkt_mode()) c = iv_bkt_check(1, 0);     /* M10.2: spec 4.3 */
@@ -2615,14 +3253,14 @@ static MENU_SELECT_FUNC(iv_test_select)
 static MENU_UPDATE_FUNC(iv_test_update)
 {
     if (iv_bkt_mode()) MENU_SET_NAME("Test: 1 bracket");                /* M10.2 */
-    if (iv_cmd == 3 || (st.running && st.test))
+    if (iv_cmd == 3 || (st.running && st.test IV_SCR(== 1)))            /* M16.1 (3.3, A17): not a script picture */
     {
         char s[32];
         iv_run_status(s, sizeof(s), "in");
         MENU_SET_VALUE("%s", iv_cmd == 3 ? "starting" : s);
         return;
     }
-    if (!st.test || st.stop == R6IV_STOP_NONE)
+    if (!st.test IV_SCR(|| st.test == R6IV_TEST_SCRIPT) || st.stop == R6IV_STOP_NONE)
     {
         MENU_SET_VALUE("-");
         return;
@@ -2861,7 +3499,7 @@ static MENU_SELECT_FUNC(iv_back_select)
         : (p->landed_ae && !p->landed_ok && p->landed_ae2 && !p->landed_ok2) ? "ML's Tv in 2 modes: set them first"
         : shooting_mode != SHOOTMODE_M ? "set M first" : p->armed ? "busy"
         : (st.running || iv_cmd) ? "series running"         /* M10.2 review round 2 (S2-1): two open landed records */
-        : iv_ettr_busy() ? "ETTR running" : 0;           /* M11.1: X2 */
+        : iv_ettr_busy() ? "ETTR running" IV_SCR(: _r6iv_scr_busy() ? "script job running") : 0;   /* M11.1: X2; M16.1 (2.6) */
     iv_back_why = why;
     if (!why) iv_cmd = 5;
 }

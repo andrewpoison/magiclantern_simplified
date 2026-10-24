@@ -112,6 +112,9 @@ static int luaCB_lens_newindex(lua_State * L)
  */
 static int luaCB_lens_focus(lua_State * L)
 {
+#ifdef CONFIG_R6_LUA
+    return luaL_error(L, "lens.focus: not analysed yet (M16.2)");      /* M16.1 (spec m16/m161 7.3) */
+#endif
     LUA_PARAM_INT(num_steps, 1);
     LUA_PARAM_INT_OPTIONAL(step_size, 2, 2);
     LUA_PARAM_BOOL_OPTIONAL(wait, 3, true);
@@ -151,6 +154,9 @@ static int wait_focus_status(int timeout, int value1, int value2)
  */
 static int luaCB_lens_autofocus(lua_State * L)
 {
+#ifdef CONFIG_R6_LUA
+    return luaL_error(L, "lens.autofocus: not analysed yet (M16.2)");  /* M16.1 (spec m16/m161 7.3) */
+#endif
     int focus_command_sent = 0;
 
     if (is_manual_focus())

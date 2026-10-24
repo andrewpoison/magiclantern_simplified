@@ -88,6 +88,9 @@ struct lua_longjmp {
   struct lua_longjmp *previous;
   luai_jmpbuf b;
   volatile int status;  /* error code */
+#ifdef CONFIG_R6_LUA
+  uint32_t r6_tid;      /* M16.1 (spec m16/m161 8.3 B1): the task that set this frame (tasks of a script share one state) */
+#endif
 };
 
 
@@ -111,14 +114,25 @@ static void seterrorobj (lua_State *L, int errcode, StkId oldtop) {
 
 
 l_noret luaD_throw (lua_State *L, int errcode) {
+#ifdef CONFIG_R6_LUA
+  /* M16.1 (spec m16/m161 8.3 B1): a frame of another task (it waits with the semaphore given back, R-13) cannot be entered from
+   * this task: as no frame (the abort way: panic, then abort(), lua_r6_abort ends the load or the task through its anchor) */
+  if (L->errorJmp && L->errorJmp->r6_tid != lua_r6_tid()) r6_lua_stat()->jmp_foreign++;
+  if (L->errorJmp && L->errorJmp->r6_tid == lua_r6_tid()) {  /* thread has an error handler of this task? */
+#else
   if (L->errorJmp) {  /* thread has an error handler? */
+#endif
     L->errorJmp->status = errcode;  /* set status */
     LUAI_THROW(L, L->errorJmp);  /* jump to it */
   }
   else {  /* thread has no error handler */
     global_State *g = G(L);
     L->status = cast_byte(errcode);  /* mark it as dead */
+#ifdef CONFIG_R6_LUA
+    if (g->mainthread->errorJmp && g->mainthread->errorJmp->r6_tid == lua_r6_tid()) {  /* M16.1 (B1): of this task */
+#else
     if (g->mainthread->errorJmp) {  /* main thread has a handler? */
+#endif
       setobjs2s(L, g->mainthread->top++, L->top - 1);  /* copy error obj. */
       luaD_throw(g->mainthread, errcode);  /* re-throw in main thread */
     }
@@ -140,6 +154,9 @@ int luaD_rawrunprotected (lua_State *L, Pfunc f, void *ud) {
   unsigned short oldnCcalls = L->nCcalls;
   struct lua_longjmp lj;
   lj.status = LUA_OK;
+#ifdef CONFIG_R6_LUA
+  lj.r6_tid = lua_r6_tid();   /* M16.1 (B1) */
+#endif
   lj.previous = L->errorJmp;  /* chain new error handler */
   L->errorJmp = &lj;
   LUAI_TRY(L, &lj,

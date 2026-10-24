@@ -35,6 +35,12 @@
  * K_ETTR does not wait for Canon's GUI, a press or Canon's job (the run stops instead), the other wait rows <= 1 s. A
  * kept value ends the arm without a call (_r6pw_commit: the marker goes first, then base := last). With the budget
  * spent, a stop makes no 7th call: the user's own value, else DONE, else the offer at once.
+ *
+ * M16.1 (spec m16/m161 spec_m161.md Rev. 2a 4, CONFIG_R6_PW_SCRIPT; plan E6, K3 answer F1 (a) 2026-10-23): a third write context,
+ * R6PW_CTX_SCRIPT, for one Lua assignment camera.shutter.* = x (the runner in r6_interval.c, script job "Tv"). Same call site, same
+ * id, same 44 rows, same window. Row 5: the arm knows the one value (lo == hi == want), at most R6PW_SCR_CALLS calls per arm with
+ * the restore (D3 included). Rows 7 and 44 as for the bracket ("your dial turn wins", A1). A kept value ends the arm without a call
+ * through its own _r6pw_commit_script (_r6pw_commit stays text-equal, A6). Off (no CONFIG_R6_PW_SCRIPT): token-equal to M16.0.
  */
 
 #include "dryos.h"
@@ -746,7 +752,8 @@ static int pw_mk_parse(const char * l, int * base, int * ctx, int * ae, int * v,
     if (strncmp(l, "R6TV ", 5) || (l[5] != '1' && l[5] != '2') || l[6] != ' ') return 0;
     if (!pw_kv(l, " base=", base)) return 0;
     *base = (int16_t) *base;
-    if (!pw_kv(l, " ctx=", ctx) || (*ctx != R6PW_CTX_BKT && *ctx != R6PW_CTX_BACK && *ctx != R6PW_CTX_ETTR)) *ctx = R6PW_CTX_BKT;
+    if (!pw_kv(l, " ctx=", ctx) || (*ctx != R6PW_CTX_BKT && *ctx != R6PW_CTX_BACK && *ctx != R6PW_CTX_ETTR
+        PW_SCR(&& *ctx != R6PW_CTX_SCRIPT))) *ctx = R6PW_CTX_BKT;   /* M16.1: 5 = a Lua assignment (spec m16/m161 4.2) */
     *ae = *v = *ae2 = *v2 = 0;
     if (l[5] == '2' && (!pw_kv(l, " ae=", ae) || !pw_kv(l, " v=", v))) return 0;
     if (l[5] == '2' && pw_kv(l, " ae2=", ae2) && !pw_kv(l, " v2=", v2)) return 0;
@@ -814,7 +821,15 @@ static int pw_ctx_admits(const struct pw_ev * e)
     }
     if (S.armed == R6PW_CTX_PEND)
         return k == R6PW_K_RESTORE_PEND && want == S.base
-            && (S.e_ctx != R6PW_CTX_ETTR || S.e_calls < R6PW_ETTR_N + 1);   /* M11.1: D3 counts (E6) */
+            && (S.e_ctx != R6PW_CTX_ETTR || S.e_calls < R6PW_ETTR_N + 1)   /* M11.1: D3 counts (E6) */
+            PW_SCR(&& (S.e_ctx != R6PW_CTX_SCRIPT || S.e_calls < R6PW_SCR_CALLS));   /* M16.1: D3 counts for scripts too */
+#ifdef CONFIG_R6_PW_SCRIPT
+    /* M16.1 (spec m16/m161 4.2, A25, T1-N5): a Lua assignment, at most R6PW_SCR_CALLS calls with the restore (D3 included): the
+     * one value the arm knows (lo == hi == want) as the first call, then only a restore to base */
+    if (S.armed == R6PW_CTX_SCRIPT)
+        return S.e_calls < R6PW_SCR_CALLS && ((k == R6PW_K_SCRIPT && want == S.e_lo && S.e_calls == 0)
+            || ((k == R6PW_K_RESTORE_STOP || k == R6PW_K_CLAMPFIX) && want == S.base));
+#endif
     return 0;
 }
 
@@ -892,7 +907,8 @@ static int pw_rows(struct pw_ev * e)
     if (wr && !pw_ctx_admits(e)) return R6PW_L_ARMED;
     if (wr && all && pw_ncalls && (now - (int) pw_t_last < R6PW_SPACING_MS || now < (int) pw_t_last)) return R6PW_L_SPACING;
     /* M11.1: ETTR keeps its marker like the bracket (3.3) */
-    if (wr && ((S.armed == R6PW_CTX_BKT || S.armed == R6PW_CTX_ETTR) ? S.marker != 1 : S.marker < 1)) return R6PW_L_MARKER;
+    if (wr && ((S.armed == R6PW_CTX_BKT || S.armed == R6PW_CTX_ETTR PW_SCR(|| S.armed == R6PW_CTX_SCRIPT)) ? S.marker != 1 : S.marker < 1))
+        return R6PW_L_MARKER;            /* M16.1: a script arm keeps its marker as the bracket */
     /* 8 */
     if (_r6iv_cc_gate(c) != 0 || !(c->valid & R6IV_V_P) || c->cc != g->cc || (g->v & PW_V_ALL) != PW_V_ALL
         || g->cpy != g->ds + 4 || g->rec != g->dsrec || g->ccg != 0x1F) return R6PW_L_PTR;
@@ -965,8 +981,8 @@ static int pw_rows(struct pw_ev * e)
      * (S.last: the base at the event start, the previous member after its write; also in the wait before the write).
      * With user evidence the user's value wins (LAST: TOOK_OVER, no call, the series stops TVUSER, nothing restored);
      * without it the views are unsettled (wait class; a mismatch without evidence ends as a VIEWS stop, 3.6a).
-     * M11.1: K_ETTR as STEP (3.3) */
-    if (wr && (k == R6PW_K_STEP || k == R6PW_K_ETTR) && old != S.last)
+     * M11.1: K_ETTR as STEP (3.3). M16.1 (spec m16/m161 4.2, A1): K_SCRIPT as well, "your dial turn wins" for scripts */
+    if (wr && (k == R6PW_K_STEP || k == R6PW_K_ETTR PW_SCR(|| k == R6PW_K_SCRIPT)) && old != S.last)
     {
         e->evid = pw_user_ev(S.last, &e->u);
         if (e->evid) return R6PW_L_LAST;
@@ -1230,7 +1246,8 @@ static int pw_resolve(struct r6pw_rec * e, int res, int want, const struct pw_wi
     else if (res == R6PW_R_FOREIGN) pw_note(1, "Stopped: Tv changed by user (%s).", _r6pw_tvs(a, w->u));
     else if (res == R6PW_R_INVOLVED)
         pw_note(1, "Tv %s: your dial turn and ML's write\ncrossed. Tv back to %s.", _r6pw_tvs(a, want), _r6pw_tvs(b, S.base));
-    else if (res == R6PW_R_MODE && want != S.base && !(S.armed == R6PW_CTX_ETTR && S.e_calls >= R6PW_ETTR_N + 1))
+    else if (res == R6PW_R_MODE && want != S.base && !(S.armed == R6PW_CTX_ETTR && S.e_calls >= R6PW_ETTR_N + 1)
+        PW_SCR(&& !(S.armed == R6PW_CTX_SCRIPT && S.e_calls >= R6PW_SCR_CALLS)))
         /* M11.1 (Rev. 2 S1-03): only while the restore is still possible (e_calls counts this post); else event_stop
          * gives the offer */
         pw_note(1, "Tv %s set by ML stays in M; it returns\nto %s when you are back in M.", _r6pw_tvs(a, want), _r6pw_tvs(b, S.base));
@@ -1255,7 +1272,8 @@ static int __attribute__((noinline, noipa)) r6pw_write(int want, int kind, int k
     /* row 7, the card part, before the lock pair (review round 1, safety L1: nothing but the step-3 Tv check between
      * the lock pair and the post): the marker file at the first write of every event / before a pending restore;
      * pw_card_ok: no picture, Canon's job count 0 (3.9). The state part of row 7 stays in row order */
-    int mk = ((S.armed == R6PW_CTX_BKT || S.armed == R6PW_CTX_ETTR) && pw_mk_ev != ev) || S.armed == R6PW_CTX_PEND;   /* M11.1: ETTR as BKT */
+    int mk = ((S.armed == R6PW_CTX_BKT || S.armed == R6PW_CTX_ETTR PW_SCR(|| S.armed == R6PW_CTX_SCRIPT)) && pw_mk_ev != ev)
+        || S.armed == R6PW_CTX_PEND;     /* M11.1: ETTR as BKT; M16.1: a script arm as well */
     if (mk && (!pw_card_ok() || pw_mk_read(0, 0) != pw_mk_len)) return pw_rec_end(e, R6PW_R_REFUSED, R6PW_L_MARKER);
     /* 2. n0 before the first lock read (RR2-13), then every row on fresh reads */
     uint32_t n0 = pw_hn;
@@ -1298,7 +1316,7 @@ static int __attribute__((noinline, noipa)) r6pw_write(int want, int kind, int k
     e->d_ret = pw_dms(t_ret, t_call);
     S.calls++;
     /* M11.1 (3.4): only posted calls count (DONE, TOOK_OVER, REFUSED do not); row 5 reads them */
-    if (S.e_ctx == R6PW_CTX_ETTR) S.e_calls++;
+    if (S.e_ctx == R6PW_CTX_ETTR PW_SCR(|| S.e_ctx == R6PW_CTX_SCRIPT)) S.e_calls++;   /* M16.1: a script arm counts (row 5) */
     if (kind == R6PW_K_ETTR) { if (k == R6PW_ETTR_N + 1) S.e_back++; else S.e_steps++; }
     /* 4. the window: every R6PW_POLL_MS up to R6PW_CONFIRM_MS */
     struct pw_win w;
@@ -1443,6 +1461,10 @@ static void pw_pend_start(int why)
             _r6pw_lock_name(S.last_lock), _r6pw_tvs(a, S.last), _r6pw_tvs(b, S.base));
     else if (S.e_ctx == R6PW_CTX_ETTR)            /* M11.1 (3.8) */
         pw_note(1, "ETTR: Tv %s returns to %s\nwhen you are back in LV (2 min).", _r6pw_tvs(a, S.last), _r6pw_tvs(b, S.base));
+#ifdef CONFIG_R6_PW_SCRIPT
+    else if (S.e_ctx == R6PW_CTX_SCRIPT)          /* M16.1 (spec m16/m161 4.2) */
+        pw_note(1, "Lua: Tv %s returns to %s\nwhen you are back in LV (2 min).", _r6pw_tvs(a, S.last), _r6pw_tvs(b, S.base));
+#endif
     else pw_note(1, "Interval: Tv %s returns to %s\nwhen you are back in LV (2 min).", _r6pw_tvs(a, S.last), _r6pw_tvs(b, S.base));
 }
 
@@ -1455,6 +1477,10 @@ static void pw_offer(void)
     S.boot_rec = pw_cs[1].mrec ? pw_cs[1].rec : S.last;
     if (S.e_ctx == R6PW_CTX_ETTR)                 /* M11.1 (3.8) */
         pw_note(1, "ETTR: Tv not restored. Shoot > Interval\n> Tv back to %s, or turn the dial.", _r6pw_tvs(a, S.base));
+#ifdef CONFIG_R6_PW_SCRIPT
+    else if (S.e_ctx == R6PW_CTX_SCRIPT)          /* M16.1 (spec m16/m161 4.2) */
+        pw_note(1, "Lua: Tv not restored. Shoot > Interval\n> Tv back to %s, or turn the dial.", _r6pw_tvs(a, S.base));
+#endif
     else pw_note(1, "Tv not restored. Shoot > Interval >\nTv back to %s, or turn the dial.", _r6pw_tvs(a, S.base));
 }
 
@@ -1515,7 +1541,8 @@ static int pw_done_now(int kind)
 int __attribute__((noinline)) _r6pw_write(int want, int kind, int k, int ev)
 {
     if (!pw_task()) return R6PW_R_REFUSED;
-    if (kind == R6PW_K_STEP || kind == R6PW_K_ETTR) return r6pw_write(want, kind, k, ev);   /* row 5 sorts STEP / ETTR by context */
+    if (kind == R6PW_K_STEP || kind == R6PW_K_ETTR PW_SCR(|| kind == R6PW_K_SCRIPT))
+        return r6pw_write(want, kind, k, ev);   /* row 5 sorts STEP / ETTR / SCRIPT (M16.1) by context */
     if (kind != R6PW_K_RESTORE || want != S.base) return pw_refused(want, kind, R6PW_L_ARMED);
     /* the event's restore (4.4 step 4): wait rows, then the one call; the event is over whatever the result */
     S.busy = 1;
@@ -1535,7 +1562,7 @@ void __attribute__((noinline)) _r6pw_event_stop(int why)
 {
     if (!S.ev_on || !pw_task()) return;  /* M11.1 (Rev. 2 S1-04): a wrong task changes nothing (ev_on stays) */
     S.ev_on = 0;                         /* first: a second call (iv_end twice) does nothing (RR2-12) */
-    if (S.armed != R6PW_CTX_BKT && S.armed != R6PW_CTX_ETTR) return;
+    if (S.armed != R6PW_CTX_BKT && S.armed != R6PW_CTX_ETTR PW_SCR(&& S.armed != R6PW_CTX_SCRIPT)) return;   /* M16.1: scripts */
     int r = S.last_res;
     if (pw_inflight || r6pw_sig()) return;                       /* open: no restore, no pending (3.7); a signal: none */
     if (pw_dead || r == R6PW_R_DEP || r == R6PW_R_FOREIGN) return;   /* D5 / the user's value wins */
@@ -1548,8 +1575,14 @@ void __attribute__((noinline)) _r6pw_event_stop(int why)
     }
     /* M11.1 (E6; Rev. 2 S1-03): the budget is spent: no 7th call, no pending restore (it could never run), no "returns
      * ... (2 min)" text; the user's own value first (the stop needs no call then), then DONE, else the offer. Before the
-     * LANDED / MODE branches, so a full budget never starts a pending restore */
+     * LANDED / MODE branches, so a full budget never starts a pending restore. M16.1 (spec m16/m161 4.2): a script arm's budget
+     * R6PW_SCR_CALLS the same way */
+#ifdef CONFIG_R6_PW_SCRIPT
+    int pw_spent = (S.armed == R6PW_CTX_ETTR && S.e_calls >= R6PW_ETTR_N + 1) || (S.armed == R6PW_CTX_SCRIPT && S.e_calls >= R6PW_SCR_CALLS);
+    if (pw_spent)
+#else
     if (S.armed == R6PW_CTX_ETTR && S.e_calls >= R6PW_ETTR_N + 1)
+#endif
     {
         int16_t u;
         char a[12];
@@ -1595,7 +1628,8 @@ void __attribute__((noinline)) _r6pw_event_stop(int why)
 void _r6pw_series_end(int stop)
 {
     if (!pw_task()) return;                                       /* M11.1 (Rev. 2 S1-04): before any state change */
-    if ((S.armed != R6PW_CTX_BKT && S.armed != R6PW_CTX_ETTR) || S.se_done) return;   /* M11.1: an ETTR run as a series */
+    if ((S.armed != R6PW_CTX_BKT && S.armed != R6PW_CTX_ETTR PW_SCR(&& S.armed != R6PW_CTX_SCRIPT)) || S.se_done)
+        return;                          /* M11.1: an ETTR run as a series; M16.1: a script arm as well (the runner only) */
     S.se_done = 1;
     _r6pw_event_stop(stop);
     if (S.pend) S.armed = R6PW_CTX_PEND;   /* only RESTORE_PEND to base (row 5), the marker stays (row 7) */
@@ -1664,6 +1698,51 @@ int __attribute__((noinline)) _r6pw_commit(int keep)
     return 0;
 }
 
+#ifdef CONFIG_R6_PW_SCRIPT
+/* M16.1 (spec m16/m161 4.2, A6; plan m16_plan.md: the ETTR commit stays text-equal): K3, a Lua assignment keeps ML's value like a
+ * dial turn. The body is _r6pw_commit's, token for token, with R6PW_CTX_SCRIPT for R6PW_CTX_ETTR (propw_gate 10): the marker goes
+ * first, then base := last; no call. Only the script runner of r6_interval.c calls it (propw_gate 11) */
+int __attribute__((noinline)) _r6pw_commit_script(int keep)
+{
+    int16_t v;
+    int l = 0;
+    if (!pw_task()) return R6PW_L_TASK;                               /* a wrong task changes nothing */
+    if (S.armed != R6PW_CTX_SCRIPT || !S.ev_on) l = R6PW_L_ARMED;
+    else if (pw_inflight) l = R6PW_L_OPEN;
+    else if (pw_dead) l = R6PW_L_DEAD;
+    else if (pw_lim) l = R6PW_L_LIMITED;
+    else if (S.pend) l = R6PW_L_PEND;
+    else if (S.offer) l = R6PW_L_OFFER;
+    else if (r6pw_sig()) l = R6PW_L_SIG;                               /* a shutdown signal: no commit, marker kept */
+    else if (S.last_res != R6PW_R_OK || keep != S.last || S.fgn_m || S.rec_moved || S.ovf) l = R6PW_L_LAST;
+    else if ((keep & (R6PW_GRID - 1)) || keep < S.e_lo || keep > S.e_hi) l = R6PW_L_NEW;
+    else
+    {
+        pw_fresh2();
+        if (!pw_stable_m(&v) || v != keep) l = R6PW_L_VIEWS;
+        else if (!pw_card_ok()) l = R6PW_L_JOB;
+        else if (S.marker != 1 || pw_mk_read(0, 0) != pw_mk_len) l = R6PW_L_MARKER;
+        else
+        {
+            pw_mk_delete();
+            if (pw_mk_read(0, 0) >= 0) l = R6PW_L_MARKER;              /* still there: not kept */
+        }
+    }
+    S.commit_lock = l;
+    if (l) return l;
+    S.marker = 0;
+    S.landed_ae = S.landed_ae2 = 0;
+    S.landed_v = S.landed_v2 = 0;
+    S.landed_ok = S.landed_ok2 = 0;
+    S.base = S.last;                                                    /* after the marker is gone */
+    S.armed = 0;
+    S.ev_on = 0;
+    pw_sticky_reset(get_ms_clock(), get_ms_clock());
+    S.commits++;
+    return 0;
+}
+#endif
+
 /* M11.1 (spec m11/m111 3.2): the arm of both series contexts, the bracket (BKT) and R6 ETTR (lo / hi / sv: the run's
  * limits and Sv, 0 for the other contexts), and of "Tv back" (BACK) */
 static int pw_arm(int ctx, int base, int lo, int hi, int sv)
@@ -1677,7 +1756,7 @@ static int pw_arm(int ctx, int base, int lo, int hi, int sv)
     if (S.armed) return R6PW_L_ARMED;
     if (r6pw_sig()) return R6PW_L_SIG;
     if (!pw_card_ok()) return R6PW_L_JOB;
-    if (ctx == R6PW_CTX_BKT || ctx == R6PW_CTX_ETTR)
+    if (ctx == R6PW_CTX_BKT || ctx == R6PW_CTX_ETTR PW_SCR(|| ctx == R6PW_CTX_SCRIPT))   /* M16.1: a script arm as a series */
     {
         if (pw_lim) return R6PW_L_LIMITED;
         if (S.pend) return R6PW_L_PEND;
@@ -1696,6 +1775,17 @@ static int pw_arm(int ctx, int base, int lo, int hi, int sv)
                 || base < lo || base > hi || (s.g.v & PW_V_ALL) != PW_V_ALL || !sv_now || sv_now != sv
                 || lo < MAX(sv, R6PW_SV_ISO100) - R6PW_ETTR_GSV) return R6PW_L_NEW;
         }
+#ifdef CONFIG_R6_PW_SCRIPT
+        if (ctx == R6PW_CTX_SCRIPT)
+        {
+            /* M16.1 (spec m16/m161 4.2, X11 for scripts): the one value (lo == hi == want) and the base on the 1/3 grid inside
+             * Tor 1's window, a valid sheet; independently of the runner's own check. r6_iv_running() is 0 (above) */
+            struct pw_snap s;
+            pw_snap_read(&s);
+            if (((lo | base) & (R6PW_GRID - 1)) || lo < R6PW_TV_MIN || lo > R6PW_TV_MAX || hi != lo || (s.g.v & PW_V_ALL) != PW_V_ALL)
+                return R6PW_L_NEW;
+        }
+#endif
         if (pw_mk_read(0, 0) >= 0) return R6PW_L_MKEPT;   /* a marker file this arm did not write (the boot check reads it) */
         int n = pw_mk_line(l, sizeof(l), base, ctx, 0);    /* "ctx=4" for ETTR */
         /* a failed write can leave the created file (empty or short, e.g. a full card): removed, since no file existed
@@ -1712,8 +1802,8 @@ static int pw_arm(int ctx, int base, int lo, int hi, int sv)
         S.landed_v = S.landed_v2 = 0;
         S.landed_ok = S.landed_ok2 = 0;
         S.mk_ctx = ctx;
-        S.e_lo = ctx == R6PW_CTX_ETTR ? lo : 0;
-        S.e_hi = ctx == R6PW_CTX_ETTR ? hi : 0;
+        S.e_lo = ctx == R6PW_CTX_ETTR PW_SCR(|| ctx == R6PW_CTX_SCRIPT) ? lo : 0;   /* M16.1: row 5 of a script arm */
+        S.e_hi = ctx == R6PW_CTX_ETTR PW_SCR(|| ctx == R6PW_CTX_SCRIPT) ? hi : 0;
         S.e_sv = ctx == R6PW_CTX_ETTR ? sv : 0;
     }
     else if (ctx == R6PW_CTX_BACK)
@@ -1755,7 +1845,8 @@ static int pw_arm(int ctx, int base, int lo, int hi, int sv)
 /* the bracket and "Tv back" (r6_interval.c); M11.1: an ETTR arm only through _r6pw_arm_ettr (its limits and Sv) */
 int _r6pw_arm(int ctx, int base)
 {
-    if (ctx == R6PW_CTX_ETTR) return R6PW_L_ARMED;
+    if (ctx == R6PW_CTX_ETTR PW_SCR(|| ctx == R6PW_CTX_SCRIPT)) return R6PW_L_ARMED;   /* M16.1: a script arm only through
+                                                                                      * _r6pw_arm_script */
     return pw_arm(ctx, base, 0, 0, 0);
 }
 
@@ -1766,6 +1857,16 @@ int _r6pw_arm_ettr(int base, int lo, int hi, int sv)
     if (!pw_task()) return R6PW_L_TASK;
     return pw_arm(R6PW_CTX_ETTR, base, lo, hi, sv);
 }
+
+#ifdef CONFIG_R6_PW_SCRIPT
+/* M16.1 (spec m16/m161 4.2, A25: the form is pinned by propw_gate 6): r6_iv_task, the script runner of r6_interval.c, right before
+ * its one write: the marker R6TV.LCK ctx=5, row 5 admits exactly want (lo == hi == want). No write */
+int _r6pw_arm_script(int base, int want)
+{
+    if (!pw_task()) return R6PW_L_TASK;
+    return pw_arm(R6PW_CTX_SCRIPT, base, want, want, 0);
+}
+#endif
 
 int __attribute__((noinline)) _r6pw_back(void)
 {
@@ -1889,7 +1990,8 @@ static void pw_boot(int now)
     int parts = !mok + !!la + !!lb;
     if (parts == 1 && !mok)
         snprintf(t, sizeof(t), "Tv in M %s, not yours %s:\n%s cut off. Interval >\nTv back, or turn the dial.",
-            _r6pw_tvs(a, r), _r6pw_tvs(b, S.base), S.mk_ctx == R6PW_CTX_ETTR ? "ETTR run" : "ML bracket");   /* M11.1 (3.8) */
+            _r6pw_tvs(a, r), _r6pw_tvs(b, S.base), S.mk_ctx == R6PW_CTX_ETTR ? "ETTR run"
+            : PW_SCR(S.mk_ctx == R6PW_CTX_SCRIPT ? "Lua script" :) "ML bracket");   /* M11.1 (3.8); M16.1: a Lua assignment */
     else if (parts == 1)
     {
         int ae = la ? S.landed_ae : S.landed_ae2, k = la ? la : lb;
@@ -1997,8 +2099,14 @@ static int pw_pend_due(int now)
         return 0;
     }
     /* M11.1 (E6; Rev. 2 S1-03): an ETTR pending restore with the budget spent can never run (row 5): the offer at once.
-     * After the fix in _r6pw_event_stop it cannot arise; this is the second barrier (L2-1 above stays untouched) */
+     * After the fix in _r6pw_event_stop it cannot arise; this is the second barrier (L2-1 above stays untouched). M16.1: a script
+     * arm's budget R6PW_SCR_CALLS the same way */
+#ifdef CONFIG_R6_PW_SCRIPT
+    int pw_spent = (S.e_ctx == R6PW_CTX_ETTR && S.e_calls >= R6PW_ETTR_N + 1) || (S.e_ctx == R6PW_CTX_SCRIPT && S.e_calls >= R6PW_SCR_CALLS);
+    if (pw_spent)
+#else
     if (S.e_ctx == R6PW_CTX_ETTR && S.e_calls >= R6PW_ETTR_N + 1)
+#endif
     {
         pw_offer();
         pw_pend_end();
@@ -2127,7 +2235,7 @@ static const char * const pw_res_names[R6PW_NRES] = {
     "mode", "mode, open", "landed", "crossed", "took over", "late applied", "late seen",
 };
 static const char * const pw_kind_names[R6PW_NKINDS] = { "-", "step", "restore", "restore_stop", "restore_pend", "clampfix", "back",
-                                                         "ettr" };
+                                                         "ettr" PW_SCR(, "script") };   /* M16.1: K_SCRIPT */
 
 const char * _r6pw_lock_name(int l) { return (l >= 0 && l < R6PW_NLOCKS) ? pw_lock_names[l] : "?"; }
 const char * _r6pw_res_name(int r) { return (r >= 0 && r < R6PW_NRES) ? pw_res_names[r] : "?"; }

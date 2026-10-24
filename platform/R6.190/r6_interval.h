@@ -97,6 +97,11 @@ enum r6_iv_cam {
     /* M11.1 (spec m11/m111 3.10, X2) */
     R6IV_CAM_ETTR,           /* an R6 ETTR "Apply once" run is active or requested (r6_ettr_busy) */
     R6IV_NCAMS
+#ifdef CONFIG_R6_IV_SCRIPT
+    /* M16.1: a script job (picture or Tv) is open (spec m16/m161 2.6). Outside the name table (r6_iv_cam_name names it): the
+     * table and the .rodata after it keep their place (G4b) */
+    , R6IV_CAM_SCRIPT = 0x40
+#endif
 };
 
 /* Canon state, read-only. Hard reasons (CCPTR .. REMOTE) stop a series; the others only delay the picture */
@@ -364,8 +369,17 @@ struct r6_iv_bkt {
 const struct r6_iv_bkt * r6_iv_bkt(void);
 /* M10.2b: the newest Start / Test refusals with their reason (log iv.ref; the M10.2 camera log had only iv.refused) */
 #define R6IV_REF_RING 6
+#ifdef CONFIG_R6_IV_SCRIPT
+#define IV_SCR(...) __VA_ARGS__    /* M16.1: every change of r6_interval.c / .h sits in this macro or a CONFIG_R6_IV_SCRIPT block (G2) */
+/* M16.1: the new statics of r6_interval.c in a block of their own (a named .bss: own section anchor, emitted after the old block,
+ * same output section .bss, zeroed like it). The old block keeps every offset, so the protected functions keep their code (G4b) */
+#define IV_SCR_BSS __attribute__((section(".bss")))
+#else
+#define IV_SCR(...)
+#endif
 enum { R6IV_REF_START = 1, R6IV_REF_TEST, R6IV_REF_TASK_START, R6IV_REF_TASK_TEST, R6IV_REF_MD, R6IV_REF_MD_TASK,
-       R6IV_REF_ETTR, R6IV_REF_ETTR_TASK };   /* M11.1: R6 ETTR "Apply once" refused in the menu (7) / dropped before write 1 (8) */
+       R6IV_REF_ETTR, R6IV_REF_ETTR_TASK IV_SCR(, R6IV_REF_SCRIPT) };   /* M11.1: R6 ETTR "Apply once" refused in the menu (7) /
+                                                                      * dropped before write 1 (8); M16.1: a script job (9) */
 struct r6_iv_ref {
     uint32_t t;              /* ms */
     uint8_t src;             /* R6IV_REF_*: the menu's Start / Test, the task's checks of a Start / Test, R6 Motion's Start / task,
@@ -404,6 +418,47 @@ void _r6iv_times(int * t_menu, int * t_lv, int * in_pic);  /* ML menu last seen,
 int _r6iv_holds(int now);
 void _r6iv_sample(int now);                                 /* iv_sample (the waits of r6_propw.c) */
 int _r6iv_bkt_armable(void);                                /* a Bracket series / test runs in M (arm BKT, spec 4.9) */
+
+#ifdef CONFIG_R6_IV_SCRIPT
+/* M16.1 (spec m16/m161 2.5, 2.6, 3.3, 4.1, 4.3): the script jobs of r6_iv_task. One slot, its word w = seq << 8 | state, every
+ * change a CAS (r6_cas32); the poster fills it in FILL, r6_iv_task reads it only after POSTED -> TAKEN. Callers: the facade r6_api.c
+ * (any task), lvprobe.c (the snapshot lock, the log), r6_modsup.c (set_interval_time). Names _r6iv_*: not exported */
+enum { R6IV_SS_FREE = 0, R6IV_SS_POSTED = 1, R6IV_SS_TAKEN = 2, R6IV_SS_ACTIVE = 3, R6IV_SS_DONE = 4, R6IV_SS_CANCELLED = 5,
+       R6IV_SS_FILL = 6, R6IV_SS_ABANDONED = 7 };
+enum { R6IV_SK_SHOT = 1, R6IV_SK_TV = 2 };                  /* the jobs "picture" (command 7) and "Tv" (command 8) */
+#define R6IV_TEST_SCRIPT 2                                  /* st.test of a script picture (1 = "Test: 1 picture") */
+#define R6IV_SCR_RING    16                                 /* scr.shot / scr.tv rings (log) */
+enum { R6IV_SPH_IDLE = 0, R6IV_SPH_PRE, R6IV_SPH_WRITTEN, R6IV_SPH_COMMIT };   /* the Tv runner's phase (4.1) */
+struct r6_iv_scr_out { int32_t res; uint32_t seq; uint32_t t_req, t_done; char why[48]; };   /* a job's result */
+struct r6_iv_scr_shot { uint32_t seq, gen, t_req, t_done; int32_t res; uint8_t async, cancelled; int16_t tv; int32_t fn; };   /* scr.shot */
+struct r6_iv_scr_tv { uint32_t t; int16_t base, want; int32_t res; uint8_t lock, calls, phase_end, pad; };                  /* scr.tv */
+struct r6_iv_scr_cnt { uint32_t posted, taken, cancelled, abandoned, expired, busy, late, intent_wait, done, refused; };     /* scr.job */
+/* the poster (a task of the facade): 0 = posted (*seq its number), else 1 (the slot holds another job: BUSY) */
+int  _r6iv_scr_post(int kind, int want, uint32_t gen, int async, uint32_t * seq);
+int  _r6iv_scr_state(uint32_t seq);                         /* R6IV_SS_* of job seq, -1: the slot holds no job seq any more (FREE too) */
+int  _r6iv_scr_take(uint32_t seq, struct r6_iv_scr_out * o);   /* DONE: copies the result and frees the slot (1), else 0 */
+int  _r6iv_scr_cancel(uint32_t seq, int late);              /* the poster's limit: POSTED -> FREE / TAKEN -> CANCELLED (1);
+                                                             * late: ACTIVE -> ABANDONED (2); 0 = nothing changed */
+void _r6iv_scr_end_owner(uint32_t gen, uint32_t tid, int all);   /* script end (all: every job of gen) / task end (tid, sync) */
+int  _r6iv_scr_busy(void);                                  /* slot != FREE or runner phase != IDLE (2.6) */
+int  _r6iv_gui_busy(void);                                  /* ML picture, Tor 1 window, ETTR run, r6_iv_task's intent (2.6) */
+int  _r6iv_scr_intent_begin(void);                          /* 0 = the intent mark is held (call, then _end), 1 = busy (none) */
+void _r6iv_scr_intent_end(int settle_ms);                   /* drops it; settle_ms > 0: no press / arm for that long (E8) */
+int  _r6iv_tvw_on(void);                                    /* "Tv writes" (read only, the facade's K4 / R6SC_TVW) */
+int  _r6iv_scr_pw_pend(void);                               /* Tor 1's restore is pending (read only; R6SC_TVW OFF, review R3-8) */
+int  _r6iv_scr_iv_stop(void);                               /* R6SC_IV_STOP: 1 = Interval asked to stop, 0 = nothing to stop */
+int  _r6iv_scr_can_start(int motion);                       /* nothing runs, no command queued (R6SC_IV_START / _TEST / _MD_START) */
+int  _r6iv_scr_limit_ms(void);                              /* a picture's limit before / after ACTIVE (spec 3.2.4) */
+int  _r6iv_scr_last(struct r6_iv_scr_out * o, uint32_t * gen, int * async, int * cancelled);   /* the newest picture job (seqlock) */
+int  _r6iv_scr_shot_ring(int i, struct r6_iv_scr_shot * e);   /* i = 0 oldest; returns the count */
+int  _r6iv_scr_tv_ring(int i, struct r6_iv_scr_tv * e);
+const struct r6_iv_scr_cnt * _r6iv_scr_counts(void);
+uint32_t _r6iv_scr_shots(void);                              /* script pictures taken (CBR_POST_SHOOT, 7.1) */
+int  _r6iv_scr_shutdown(void);                              /* ML shutdown or Tor 1's abort latch (SL-10; the facade names no _r6pw_*) */
+const char * _r6iv_scr_back_why(void);                      /* why the last "Tv back to" select was refused (0 = taken) */
+int  _r6iv_scr_phase(void);                                 /* the Tv runner's phase (log) */
+uint32_t _r6iv_scr_task_id(void);                           /* r6_iv_task's id (log tsk.hw; 0 before its first tick) */
+#endif
 
 /* Canon RAM read by r6_interval.c (read-only) */
 #define R6IV_RAM_JOBCNT    0x9DC0      /* live job count [0x9D9C+0x24]: CreateJob checks it (cbz 0xE07C9E5E),

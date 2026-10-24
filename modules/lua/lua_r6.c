@@ -10,6 +10,8 @@
  *  - allocations: Canon's AllocateMemory keeps >= 1 MiB free (R6L_AM_FLOOR), the umm heap may be NULL, the fault hook
  *  - file descriptors 3..18 -> FIO handles (upstream accepted only handles 3..16)
  * Values the QEMU tests change live in the core (r6_lua_cfg, r6_lua_fault): this file has no QEMU-only code (QEMU runs the camera lua.mo).
+ * M16.1 (spec m16/m161 2.7, 5.6, 8.2 Ue3 / Ue4 / Ue9, 8.3 B1): lua_r6_wait (R-13), the facade calls, the library "r6", the anchors of the
+ * Lua tasks (Ue3), the umm lock across both cores (Ue4), "C stack unknown" (Ue9), the task id for the error frames (B1).
  */
 #ifdef CONFIG_R6_LUA   /* the whole file (spec m16/m160 8: every change in modules/lua inside CONFIG_R6_LUA) */
 #include <dryos.h>
@@ -231,8 +233,18 @@ void lua_r6_anchor_sem(int held)
     if (a) a->sem = held;
 }
 
+static struct lua_r6_tanchor * lua_r6_tanchor_find(void);
+
+/* M16.1 (spec m16/m161 8.2 Ue3): a Lua task with an anchor ends through it (lua_run_task: powersave_permit, its jobs cancelled,
+ * free, the task returns); else the task sleeps for good (M16.0) */
 void lua_r6_park(const char * why)
 {
+    struct lua_r6_tanchor * t = lua_r6_tanchor_find();
+    if (t)
+    {
+        lua_r6_inc(&r6_lua_stat()->dead_exit);
+        longjmp(t->jb, 1);
+    }
     while (1) msleep(1000);
 }
 
@@ -252,6 +264,15 @@ void lua_r6_abort(void)
         lua_r6_anchor_pop(a);
         lua_r6_inc(&st->aborts);
         longjmp(a->jb, 1);
+    }
+    /* M16.1 (spec m16/m161 8.1 R-3, 8.2 Ue3): in a Lua task: the script is dead (its state may be broken; the semaphore stays with
+     * this task, callbacks skip the script, its other tasks end at their next take), the task ends through its anchor */
+    struct lua_r6_tanchor * t = lua_r6_tanchor_find();
+    if (t)
+    {
+        lua_r6_mark_dead(t->L);
+        lua_r6_inc(&st->aborts);
+        longjmp(t->jb, 2);
     }
     lua_r6_inc(&st->park);
     lua_r6_park("abort");
@@ -281,7 +302,8 @@ static int lua_r6_left(void)
 void lua_r6_stack_check(lua_State * L)
 {
     int left = lua_r6_left();
-    if (left < 0) return;
+    /* M16.1 (spec m16/m161 8.2 Ue9): the core finds a wrapper task by its trampoline slot first; still unknown: no Lua code here */
+    if (left < 0) luaG_runerror(L, "C stack unknown");
     if (left < lua_r6_c[R6L_SP_HARD])
     {
         r6_lua_stat()->sp_hits++;
@@ -420,6 +442,297 @@ uint32_t lua_r6_fd_del(int fd)
     r6_barrier();
     lua_r6_fdt[i].h = 0;
     return h;
+}
+
+/* ======== M16.1 (spec m16/m161; CONFIG_R6_LUA) ======== */
+
+uint32_t lua_r6_tid(void) { return get_current_task_id(); }
+
+/* ---- 2.7 (R-13): every wait with the script's semaphore given back ---- */
+int lua_r6_wait(lua_State * L, int (*fn)(void *), void * arg)
+{
+    /* only a waiting task gives it back: a GUI task never waits (2.2), PropMgr / r6_iv_task get R6API_TASK from the facade; another
+     * task of this script in task.yield, key.wait or such a wait (cant_yield): the semaphore stays held (F10). Review R2-3 (the same
+     * class): a task without an anchor (a callback in clock_task, lua_prop_task, shoot_task) keeps it too: its take after the wait
+     * would park that task for good if the script died meanwhile */
+    if (r6_script_task_class(0) != R6TC_SYNC || lua_get_cant_yield(L) || !lua_r6_may_wait(L)) return fn(arg);
+    int t1 = lua_gettop(L);
+    lua_set_cant_yield(L, 1);
+    lua_give_semaphore(L, NULL);
+    int r = fn(arg);
+    lua_take_semaphore(L, 0, NULL);          /* a dead script: lua_r6_park (Ue3) */
+    lua_set_cant_yield(L, 0);
+    if (lua_gettop(L) != t1) luaL_error(L, "Lua stack changed while waiting (another task of this script)");
+    return r;
+}
+
+static int lua_r6_do_fn(void * p)
+{
+    struct lua_r6_call * c = p;
+    int n = sizeof(c->why);
+    switch (c->op)
+    {
+        case LR6_SHOOT:    c->r = r6_take_a_pic_ex(c->gen, c->a, 0, &c->seq, c->why, n); break;
+        case LR6_BURST:    c->r = r6_script_burst(c->gen, c->a, &c->done, c->why, n); break;
+        case LR6_BULB:     c->r = r6_script_bulb(c->gen, c->a, c->why, n); break;
+        case LR6_WAITJOBS: c->r = r6_script_wait_jobs(c->a); break;
+        case LR6_TV:       c->r = r6_script_tv(c->gen, c->a, c->why, n); break;
+        case LR6_CMD:      c->r = r6_script_cmd(c->gen, c->a, c->b, c->why, n); break;
+        case LR6_GUI:      c->r = r6_script_gui(c->gen, c->a, c->b, c->c, c->why, n); break;
+        case LR6_MENUSET:  c->r = r6_script_menu_set(c->gen, c->s1, c->s2, c->s3, c->a, c->why, n); break;
+        case LR6_LVWAIT:   c->r = wait_lv_frames(c->a) ? R6API_OK : R6API_TIMEOUT; break;
+        default:           c->r = R6API_ARG; snprintf(c->why, n, "unknown call"); break;
+    }
+    return c->r;
+}
+
+int lua_r6_do(lua_State * L, struct lua_r6_call * c)
+{
+    c->gen = lua_r6_gen(L);
+    c->why[0] = 0;
+    return lua_r6_wait(L, lua_r6_do_fn, c);
+}
+
+/* ---- Ue3: the anchors of the Lua tasks ---- */
+#define LUA_R6_NTA 16
+static struct lua_r6_tanchor * volatile lua_r6_ta[LUA_R6_NTA];
+static volatile uint32_t lua_r6_ta_tid[LUA_R6_NTA];
+
+int lua_r6_tanchor_set(struct lua_r6_tanchor * a, lua_State * L)
+{
+    uint32_t tid = get_current_task_id();
+    a->L = L;
+    for (int i = 0; tid && i < LUA_R6_NTA; i++)
+    {
+        if (r6_cas32(&lua_r6_ta_tid[i], 0, tid))
+        {
+            lua_r6_ta[i] = a;
+            r6_barrier();
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void lua_r6_tanchor_clear(struct lua_r6_tanchor * a)
+{
+    for (int i = 0; i < LUA_R6_NTA; i++)
+    {
+        if (lua_r6_ta[i] == a)
+        {
+            lua_r6_ta[i] = 0;
+            r6_barrier();
+            lua_r6_ta_tid[i] = 0;
+            return;
+        }
+    }
+}
+
+static struct lua_r6_tanchor * lua_r6_tanchor_find(void)
+{
+    uint32_t tid = get_current_task_id();
+    for (int i = 0; tid && i < LUA_R6_NTA; i++)
+    {
+        struct lua_r6_tanchor * a = lua_r6_ta[i];
+        if (lua_r6_ta_tid[i] == tid && a) return a;
+    }
+    return 0;
+}
+
+/* review R2-3: 1 = this task may wait with the semaphore given back: an anchor of L ends the wait if the script dies meanwhile (the
+ * main chunk: load_script's anchor; a task.create task: its task anchor); a callback (GuiMainTask, menu_task, clock_task, lua_prop_task,
+ * shoot_task) has none and would park for good */
+int lua_r6_may_wait(lua_State * L)
+{
+    struct lua_r6_tanchor * t = lua_r6_tanchor_find();
+    if (t) return t->L == L;
+    struct lua_r6_anchor * a = lua_r6_anchor_find();
+    return a && a->L == L;
+}
+
+/* review R2-8: umm_init once across both cores (umm_malloc.c): 0 free, 1 building, 2 built; the loser of the CAS finds umm_heap NULL */
+static volatile uint32_t lua_r6_umm_once = 0;
+int lua_r6_umm_once_begin(void) { return r6_cas32(&lua_r6_umm_once, 0, 1); }
+void lua_r6_umm_once_end(int built)
+{
+    r6_barrier();                                    /* umm_heap (published by umm_init) before the state */
+    lua_r6_umm_once = built ? 2 : 0;                 /* no block: a later call tries again */
+}
+
+/* ---- Ue4 (SB-01, SL-12): the umm critical section. umm's macros nest (_umm_realloc calls _umm_free / _umm_malloc inside it):
+ * cli, then the owner word: 0 = free, else the core's id + 1. The same core nests (depth + 1); the other core spins until the owner
+ * lets go (it holds the lock for one umm operation, nothing in it blocks). EXIT: depth - 1, at 0 a barrier and the owner 0, then sei ---- */
+static volatile uint32_t lua_r6_umm_own = 0;
+static volatile uint32_t lua_r6_umm_depth = 0;
+_Static_assert(sizeof(lua_r6_umm_own) == 4, "the umm owner word is one word for r6_cas32");
+#define LUA_R6_UMM_FREE 0u
+_Static_assert(LUA_R6_UMM_FREE == 0u, "a .bss word 0 must mean free (SL-12: never 'CPU0 owns it')");
+
+uint32_t lua_r6_umm_enter(void)
+{
+    uint32_t old = cli();
+    uint32_t me = (uint32_t) r6_cpu_id() + 1;
+    if (lua_r6_umm_own == me)
+    {
+        uint32_t d = ++lua_r6_umm_depth;
+        if (d > r6_lua_stat()->umm_depth_max) r6_lua_stat()->umm_depth_max = d;
+        return old;
+    }
+    if (!r6_cas32(&lua_r6_umm_own, LUA_R6_UMM_FREE, me))
+    {
+        struct r6_lua_stat * st = r6_lua_stat();
+        do st->umm_spin++; while (!r6_cas32(&lua_r6_umm_own, LUA_R6_UMM_FREE, me));
+    }
+    lua_r6_umm_depth = 1;
+    if (1 > r6_lua_stat()->umm_depth_max) r6_lua_stat()->umm_depth_max = 1;
+    return old;
+}
+
+void lua_r6_umm_exit(uint32_t old)
+{
+    if (lua_r6_umm_depth && --lua_r6_umm_depth == 0)
+    {
+        r6_barrier();
+        lua_r6_umm_own = LUA_R6_UMM_FREE;
+    }
+    sei(old);
+}
+
+/* ---- 5.6: the library "r6" ---- */
+static const struct { const char * name; int cmd; } lua_r6_cmds[] = {
+    { "iv_start", R6SC_IV_START }, { "iv_stop", R6SC_IV_STOP }, { "iv_test", R6SC_IV_TEST }, { "tv_writes", R6SC_TVW },
+    { "tv_back", R6SC_TVBACK }, { "md_start", R6SC_MD_START }, { "md_stop", R6SC_MD_STOP }, { "ettr_apply", R6SC_ETTR_APPLY },
+    { "astro_mode", R6SC_AST_MODE }, { "astro_test", R6SC_AST_TEST },
+};
+
+/* r6.cmd(name, arg) -> ok, text, code */
+static int luaCB_r6_cmd(lua_State * L)
+{
+    LUA_PARAM_STRING(name, 1);
+    int arg = lua_isboolean(L, 2) ? lua_toboolean(L, 2) : (int) luaL_optinteger(L, 2, 0);
+    int cmd = -1;
+    for (unsigned i = 0; i < sizeof(lua_r6_cmds) / sizeof(lua_r6_cmds[0]); i++)
+        if (!strcmp(name, lua_r6_cmds[i].name)) cmd = lua_r6_cmds[i].cmd;
+    if (cmd < 0) return luaL_error(L, "r6.cmd: unknown command '%s'", name);
+    struct lua_r6_call c = { .op = LR6_CMD, .a = cmd, .b = arg };
+    int r = lua_r6_do(L, &c);
+    if (r == R6API_OK && cmd == R6SC_TVW) lua_r6_flag(L, LUA_R6F_TVW, arg != 0);
+    lua_pushboolean(L, r == R6API_OK);
+    lua_pushstring(L, c.why);
+    lua_pushinteger(L, r);
+    return 3;
+}
+
+static void lua_r6_setint(lua_State * L, const char * k, int v) { lua_pushinteger(L, v); lua_setfield(L, -2, k); }
+static void lua_r6_setbool(lua_State * L, const char * k, int v) { lua_pushboolean(L, v); lua_setfield(L, -2, k); }
+static void lua_r6_setstr(lua_State * L, const char * k, const char * v) { lua_pushstring(L, v); lua_setfield(L, -2, k); }
+
+/* r6.last_shot() -> {seq, res, text, t, t_req, gen, async, cancelled}, or nil and "none" / "busy" (SL-13) */
+static int luaCB_r6_last_shot(lua_State * L)
+{
+    struct r6_shot_res r;
+    int k = r6_last_shot(&r);
+    if (k <= 0)
+    {
+        lua_pushnil(L);
+        lua_pushstring(L, k < 0 ? "busy" : "none");
+        return 2;
+    }
+    lua_newtable(L);
+    lua_r6_setint(L, "seq", r.seq);
+    lua_r6_setint(L, "res", r.res);
+    lua_r6_setstr(L, "text", r.why);
+    lua_r6_setint(L, "t", r.t_done);
+    lua_r6_setint(L, "t_req", r.t_req);
+    lua_r6_setint(L, "gen", r.gen);
+    lua_r6_setbool(L, "async", r.async);
+    lua_r6_setbool(L, "cancelled", r.cancelled);
+    return 1;
+}
+
+/* r6.expo() -> {tv, av, iso, ec} in Code768 (iso: Canon's Sv768), or nil */
+static int luaCB_r6_expo(lua_State * L)
+{
+    struct r6_expo e;
+    if (!r6_script_expo(&e)) { lua_pushnil(L); return 1; }
+    lua_newtable(L);
+    lua_r6_setint(L, "tv", e.tv);
+    lua_r6_setint(L, "av", e.av);
+    lua_r6_setint(L, "iso", e.sv);
+    lua_r6_setint(L, "ec", e.comp);
+    return 1;
+}
+
+/* r6.sysmem() -> {ok, why, largest, free, used, peak} (C2: ok false with the reason, no zeros as values) */
+static int luaCB_r6_sysmem(lua_State * L)
+{
+    struct r6_sysmem m;
+    int ok = r6_script_sysmem(&m);
+    lua_newtable(L);
+    lua_r6_setbool(L, "ok", ok);
+    lua_r6_setstr(L, "why", m.why);
+    if (ok)
+    {
+        lua_r6_setint(L, "largest", m.largest);
+        lua_r6_setint(L, "free", m.free);
+        lua_r6_setint(L, "used", m.used);
+        lua_r6_setint(L, "peak", m.peak);
+    }
+    return 1;
+}
+
+/* r6.tasks() -> {created, mem, unknown, busy, arg, ended, ring = { {name, prio, stack, res, largest, min, t}, ... }} */
+static int luaCB_r6_tasks(lua_State * L)
+{
+    uint32_t c[6];
+    r6_task_counts(c);
+    lua_newtable(L);
+    lua_r6_setint(L, "created", c[0]);
+    lua_r6_setint(L, "mem", c[1]);
+    lua_r6_setint(L, "unknown", c[2]);
+    lua_r6_setint(L, "busy", c[3]);
+    lua_r6_setint(L, "arg", c[4]);
+    lua_r6_setint(L, "ended", c[5]);
+    lua_newtable(L);
+    struct r6tk_dec d;
+    int n = r6_task_ring(0, &d);
+    for (int i = 0; i < n && i < R6TK_RING; i++)
+    {
+        if (r6_task_ring(i, &d) <= i) break;
+        char nm[17];
+        memcpy(nm, d.name, 16);
+        nm[16] = 0;
+        lua_newtable(L);
+        lua_r6_setstr(L, "name", nm);
+        lua_r6_setint(L, "prio", d.prio);
+        lua_r6_setint(L, "stack", d.stack);
+        lua_r6_setint(L, "res", d.res);
+        lua_r6_setint(L, "largest", d.largest);
+        lua_r6_setint(L, "min", d.min);
+        lua_r6_setint(L, "t", d.t_ms);
+        lua_rawseti(L, -2, i + 1);
+    }
+    lua_setfield(L, -2, "ring");
+    return 1;
+}
+
+static const luaL_Reg r6lib[] =
+{
+    { "cmd", luaCB_r6_cmd },
+    { "last_shot", luaCB_r6_last_shot },
+    { "expo", luaCB_r6_expo },
+    { "sysmem", luaCB_r6_sysmem },
+    { "tasks", luaCB_r6_tasks },
+    { NULL, NULL }
+};
+
+int luaopen_r6(lua_State * L)
+{
+    lua_newtable(L);
+    luaL_setfuncs(L, r6lib, 0);
+    lua_pushinteger(L, R6API_VER);
+    lua_setfield(L, -2, "version");
+    return 1;
 }
 
 #endif /* CONFIG_R6_LUA */

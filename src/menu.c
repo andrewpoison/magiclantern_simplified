@@ -26,6 +26,9 @@
 extern int lv_follow_canon_get(void);   /* propvalues.c (R6) */
 extern int get_global_draw_setting(void);   /* zebra.c */
 #endif
+#ifdef CONFIG_R6_SCRIPT
+#include "r6_api.h"                      /* R6.190 M16.1: the menu.set fall-back guard (_r6api_menu_r6), _r6_menu_entry */
+#endif
 #include "math.h"
 #include "version.h"
 #include "bmp.h"
@@ -5594,9 +5597,19 @@ gui_stop_menu( )
         give_semaphore(gui_sem);
 }
 
+#ifdef CONFIG_R6_SCRIPT
+/* R6.190 M16.1 (spec m16/m161 2.3, MB-3): select_menu_by_name and the menu_open way count here, so the R6 block of
+ * handle_common_events_by_feature sees a cursor that a Lua keypress handler moved inside the same event (R6GO_FAKE then) */
+static volatile uint32_t __attribute__((section(".bss"))) r6_menu_sel_n = 0;   /* own anchor block: the old offsets stay (G4b) */
+uint32_t _r6_menu_sel_seq(void) { return r6_menu_sel_n; }
+#endif
+
 void
 gui_open_menu( )
 {
+#ifdef CONFIG_R6_SCRIPT
+    r6_menu_sel_n++;
+#endif
     if (!gui_menu_shown())
         give_semaphore(gui_sem);
 }
@@ -6031,6 +6044,9 @@ static void select_menu_recursive(struct menu * selected_menu, const char * entr
 EXCLUDES(menu_sem)
 void select_menu_by_name(char* name, const char* entry_name)
 {
+#ifdef CONFIG_R6_SCRIPT
+    r6_menu_sel_n++;                     /* M16.1 (MB-3): a moved cursor makes the rest of the event R6GO_FAKE */
+#endif
     take_semaphore(menu_sem, 0);
 
     /* select the first menu that matches the name, if any given */
@@ -6104,6 +6120,11 @@ static struct menu_entry * entry_find_by_name(const char* menu_name, const char*
 
     return ans;
 }
+
+#ifdef CONFIG_R6_SCRIPT
+/* R6.190 M16.1 (spec m16/m161 5.1, 5.2): the facade r6_api.c resolves the R6 entries by name (once at init, and per menu.set) */
+struct menu_entry * _r6_menu_entry(const char * menu, const char * entry) { return entry_find_by_name(menu, entry); }
+#endif
 
 static EXCLUDES(menu_sem)
 void select_menu_by_icon(int icon)
@@ -6908,6 +6929,11 @@ int menu_set_str_value_from_script(const char* name, const char* entry_name, cha
         printf("Menu not found: %s -> %s\n", name, entry_name);
         return INT_MIN;
     }
+#ifdef CONFIG_R6_SCRIPT
+    /* R6.190 M16.1 (spec m16/m161 5.2, MB-5): the fall-back guard. Lua's menu.set reaches R6 entries only through the facade
+     * (r6_script_menu_set in lua_menu.c); any other way into the nine R6 menus is never executed here (upstream "not set") */
+    if (_r6api_menu_r6(entry)) { printf("menu.set('%s', '%s'): R6 entry, only through the facade\n", name, entry_name); return 0; }
+#endif
 
     /* FIXME: trying to print INT_MIN crashes Canon's vsnprintf?! */
     printf(
@@ -7108,6 +7134,9 @@ int menu_set_value_from_script(const char* name, const char* entry_name, int val
         printf("Menu not found: %s -> %s\n", name, entry_name);
         return INT_MIN;
     }
+#ifdef CONFIG_R6_SCRIPT
+    if (_r6api_menu_r6(entry)) { printf("menu.set('%s', '%s'): R6 entry, only through the facade\n", name, entry_name); return 0; }   /* M16.1 (5.2) */
+#endif
     
     if( entry->select ) // special item, we need some heuristics
     {

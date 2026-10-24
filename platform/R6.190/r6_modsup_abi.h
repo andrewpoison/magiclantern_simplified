@@ -101,6 +101,15 @@ struct r6_lua_stat
     uint32_t cpu_kind[R6LK_N];                  /* cores seen by the stack guard per task kind at each new low of sp_min */
     uint32_t prop_skip;                         /* property events passed over an entry without an active handler of a living
                                                  * script (closed: LUA_NOREF, dead; review R2-01 / R2-04) */
+#if defined(CONFIG_R6_SCRIPT) || defined(CONFIG_R6_LUA)
+    /* M16.1 (spec m16/m161 8.2, 8.3, 11; appended: the M16.0 fields keep their offsets; the core has CONFIG_R6_SCRIPT, lua.mo
+     * CONFIG_R6_LUA, both see the same layout) */
+    uint32_t umm_spin, umm_depth_max;           /* Ue4: spins of the cross-core umm lock; deepest nesting */
+    uint32_t prop_deny, prop_unreg;             /* 7.4: handlers set on a denied / an unregistered id (hints given) */
+    uint32_t scripts;                           /* living Lua states (load_script .. lua_close) */
+    uint32_t jmp_foreign, dead_exit;            /* B1: a longjmp frame of another task (abort way); Ue3: dead tasks ended */
+    uint32_t t_init, t_load, t_autorun;         /* MK11: lua_init, lua_load_task started, the first autorun started (ms; 0 never) */
+#endif
 };
 struct r6_lua_stat * r6_lua_stat(void);
 

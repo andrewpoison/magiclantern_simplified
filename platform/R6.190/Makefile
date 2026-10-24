@@ -35,6 +35,9 @@ ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_acore.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_aclock.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_temp.o
 ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_modsup.o
+# M16.1 (spec m16/m161 2, 5.3 MB-7): the script facade, the LAST R6 object: its menu resolution (.init_funcs in link order) runs
+# after every R6 menu_add
+ML_SRC_EXTRA_OBJS += $(BUILD_DIR)/r6_api.o
 
 # M16.0 (spec m16/m160 3.3): in R6_190.sym, task_create points to r6_task_try_create (the R6 task model for modules);
 # without r6_task_try_create in the ELF the build fails

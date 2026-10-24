@@ -617,20 +617,20 @@ ST_FUNC void relocate_section(TCCState *s1, Section *s)
 #ifdef TCC_HAS_RUNTIME_PLTGOT
                 if (s1->output_type == TCC_OUTPUT_MEMORY) {
                     if ((x & 3) || x >= 0x2000000 || x < -0x2000000)
-                        if (!(x & 3) || !blx_avail || !is_call) {
+                        if (!(x & 3) || !blx_avail || !is_call || x >= 0x2000000 || x < -0x2000000) {
                             x += add_jmp_table(s1, val) - val; /* add veneer */
                             is_thumb = 0; /* Veneer uses ARM instructions */
                         }
                 }
 #endif
                 if ((x & 3) || x >= 0x2000000 || x < -0x2000000)
-                    if (!(x & 3) || !blx_avail || !is_call)
+                    if (!(x & 3) || !blx_avail || !is_call || x >= 0x2000000 || x < -0x2000000)
                         tcc_error("can't relocate value at %x",addr);
                 x >>= 2;
                 x &= 0xffffff;
                 /* Only reached if blx is avail and it is a call */
                 if (is_thumb) {
-                    x |= h << 24;
+                    x |= h << 23;
                     (*(int *)ptr) = 0xfa << 24; /* bl -> blx */
                 }
                 (*(int *)ptr) |= x;
@@ -935,7 +935,7 @@ ST_FUNC int get_plt_got_size_for_relocate_section(TCCState *s1, Section *s)
 #ifdef TCC_HAS_RUNTIME_PLTGOT
                 if (s1->output_type == TCC_OUTPUT_MEMORY) {
                     if ((x & 3) || x >= 0x2000000 || x < -0x2000000)
-                        if (!(x & 3) || !blx_avail || !is_call) {
+                        if (!(x & 3) || !blx_avail || !is_call || x >= 0x2000000 || x < -0x2000000) {
                             extra_ram += JMP_TABLE_ENTRY_SIZE;
                         }
                 }

@@ -5,7 +5,11 @@
  * Only r6_interval.c (bracket, "Tv back to ...", the press block), r6_ettr.c (M11.1 "Apply once", spec m11/m111 3) and
  * lvprobe.c (log) use this header. Every name is
  * _r6pw_* (platform/Makefile keeps names "_[a-zA-Z]*" out of magiclantern.sym, K29): nothing here is exported to
- * modules or Lua. Every function that can lead to a write checks that it runs in r6_iv_task. */
+ * modules or Lua. Every function that can lead to a write checks that it runs in r6_iv_task.
+ * M16.1 (spec m16/m161 4.2, rule 24, CONFIG_R6_PW_SCRIPT): the write context "script" for Lua's camera.shutter.* = x. Lua reaches
+ * it only through the facade r6_api.c, which posts a script job "Tv" to r6_iv_task (command 8); the runner in r6_interval.c is
+ * its only user (_r6pw_arm_script, _r6pw_commit_script); an autorun script can write after the boot check (row 2). The write
+ * path itself stays unexported. */
 
 #include <stdint.h>
 
@@ -29,6 +33,13 @@
 #define R6PW_CTX_BACK       2      /* "Tv back to ..." (an offer is open) */
 #define R6PW_CTX_PEND       3      /* a stopped series whose restore is pending (only RESTORE_PEND to base, 3.8) */
 #define R6PW_CTX_ETTR       4      /* M11.1: R6 ETTR "Apply once" (spec m11/m111 3) */
+#ifdef CONFIG_R6_PW_SCRIPT
+#define R6PW_CTX_SCRIPT     5      /* M16.1: a Lua assignment camera.shutter.* = x (spec m16/m161 4) */
+#define R6PW_SCR_CALLS      2      /* M16.1: _prop_request_change calls per assignment, D3 included (row 5) */
+#define PW_SCR(...) __VA_ARGS__    /* M16.1: every change of r6_propw.c / .h sits in this macro or a CONFIG_R6_PW_SCRIPT block (G2) */
+#else
+#define PW_SCR(...)
+#endif
 
 /* M11.1 (spec m11/m111 3.1; answers E3 / E6 of 2026-10-07): one ETTR command, row 5 checks it a second time */
 #define R6PW_ETTR_N         5      /* answer E6: steps per command; with the one way back at most N + 1 calls, D3 included */
@@ -46,7 +57,8 @@
 
 /* kinds of one write (3.12) */
 enum { R6PW_K_NONE = 0, R6PW_K_STEP, R6PW_K_RESTORE, R6PW_K_RESTORE_STOP, R6PW_K_RESTORE_PEND, R6PW_K_CLAMPFIX,
-       R6PW_K_BACK, R6PW_K_ETTR, R6PW_NKINDS };   /* M11.1: K_ETTR = 7, appended: pw_restore_kind (3..6) excludes it */
+       R6PW_K_BACK, R6PW_K_ETTR, PW_SCR(R6PW_K_SCRIPT,) R6PW_NKINDS };   /* M11.1: K_ETTR = 7, appended: pw_restore_kind (3..6)
+                                                                         * excludes it; M16.1: K_SCRIPT = 8, appended as well */
 
 /* results (3.7) */
 enum { R6PW_R_NONE = 0, R6PW_R_OK, R6PW_R_REFUSED, R6PW_R_DONE, R6PW_R_NOCONF, R6PW_R_SIG, R6PW_R_FOREIGN,
@@ -166,6 +178,11 @@ int _r6pw_ev_on(void);                         /* an event or its restore runs (
 int _r6pw_arm_ettr(int base, int lo, int hi, int sv);   /* 0 = armed (marker R6TV.LCK ctx=4), else enum r6pw_lock */
 int _r6pw_commit(int keep);                    /* 0 = kept (marker gone, base = keep, disarmed), else the lock that holds it */
 int _r6pw_is_wait_row(int lock);               /* read only: a wait row of _r6pw_wait_ready (pw_wait_row) */
+#ifdef CONFIG_R6_PW_SCRIPT
+/* M16.1 (spec m16/m161 4.2, 4.3): r6_iv_task, the script runner of r6_interval.c only (propw_gate 11 / 12); neither writes */
+int _r6pw_arm_script(int base, int want);      /* 0 = armed (marker R6TV.LCK ctx=5, row 5 admits exactly want), else enum r6pw_lock */
+int _r6pw_commit_script(int keep);             /* as _r6pw_commit for the context "script": 0 = kept, else the lock */
+#endif
 /* any task, read only */
 int _r6pw_locks(int want, int cls, int * lock);   /* 0 = all rows of the class hold, else the first failing row */
 int _r6pw_press_ok(void);                      /* 0 while a Tv request is open: no ML press (3.7) */

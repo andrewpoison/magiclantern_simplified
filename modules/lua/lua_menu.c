@@ -13,6 +13,9 @@
 #include <property.h>
 
 #include "lua_common.h"
+#ifdef CONFIG_R6_LUA
+#include "lua_r6.h"             /* M16.1 (spec m16/m161 5.2): r6_script_menu_set, the script flags */
+#endif
 
 extern int menu_redraw_blocked;
 static int luaCB_menu_instance_index(lua_State * L);
@@ -45,6 +48,164 @@ int docall (lua_State *L, int narg, int nres) {
     return status;
 }
 
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 8.3 B5): the menu callbacks run everything after the take in one lua_pcall (the reads of the references,
+ * lua_tostring's conversions, the MENU_SET_* texts): no error on L is unprotected in GuiMainTask / menu_redraw_task */
+struct lua_r6_mcb { struct script_menu_entry * se; struct menu_entry * entry; struct menu_display_info * info; int delta; };
+
+static int lua_r6_menu_select_body(lua_State * L)
+{
+    struct lua_r6_mcb * c = lua_touserdata(L, 1);
+    struct script_menu_entry * script_entry = c->se;
+    lua_settop(L, 0);
+    if(lua_rawgeti(L, LUA_REGISTRYINDEX, script_entry->select_ref) == LUA_TFUNCTION)
+    {
+        lua_rawgeti(L, LUA_REGISTRYINDEX, script_entry->self_ref);
+        lua_pushinteger(L, c->delta);
+        if(docall(L, 2, 0))
+        {
+            fprintf(stderr, "[%s] script error:\n %s\n", lua_get_script_filename(L), lua_tostring(L, -1));
+            lua_save_last_error(L);
+        }
+    }
+    else
+    {
+        fprintf(stderr, "[%s] select is not a function\n", lua_get_script_filename(L));
+    }
+    return 0;
+}
+
+static MENU_SELECT_FUNC(script_menu_select)
+{
+    struct script_menu_entry * script_entry = priv;
+    if(script_entry && script_entry->L && script_entry->select_ref != LUA_NOREF)
+    {
+        lua_State * L = script_entry->L;
+        struct semaphore * sem = NULL;
+        if (lua_take_semaphore(L, 500, &sem) == 0)
+        {
+            ASSERT(sem);
+            int top = lua_gettop(L);
+            struct lua_r6_mcb c = { script_entry, 0, 0, delta };
+            lua_pushcfunction(L, lua_r6_menu_select_body);
+            lua_pushlightuserdata(L, &c);
+            if (docall(L, 1, 0))
+                fprintf(stderr, "[%s] menu.select failed: %s\n", lua_get_script_filename(L), lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "(no message)");
+            lua_settop(L, top);
+            give_semaphore(sem);
+        }
+        else if (lua_r6_alive(L) > 0)
+        {
+            printf("[%s] semaphore timeout: menu.select (%dms)\n", lua_get_script_filename(L), 500);
+        }
+    }
+}
+
+static int lua_r6_menu_update_body(lua_State * L)
+{
+    struct lua_r6_mcb * c = lua_touserdata(L, 1);
+    struct script_menu_entry * script_entry = c->se;
+    struct menu_entry * entry = c->entry;
+    struct menu_display_info * info = c->info;
+    (void) entry;
+    lua_settop(L, 0);
+    if (script_entry->menu_entry->children ||
+        script_entry->menu_entry->icon_type == IT_ACTION)
+    {
+        /* by default, menus with submenus do not display a value */
+        /* same for menus with ICON_TYPE.ACTION */
+        MENU_SET_VALUE("");
+    }
+    if(script_entry->update_ref != LUA_NOREF)
+    {
+        if(lua_rawgeti(L, LUA_REGISTRYINDEX, script_entry->update_ref) == LUA_TFUNCTION)
+        {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, script_entry->self_ref);
+            if(!docall(L, 1, 1) && lua_isstring(L, -1))
+            {
+                MENU_SET_VALUE("%s", lua_tostring(L, -1));
+            }
+        }
+        else if(lua_isstring(L, -1))
+        {
+            MENU_SET_VALUE("%s", lua_tostring(L, -1));
+        }
+        lua_pop(L,1);
+    }
+    if(script_entry->info_ref != LUA_NOREF)
+    {
+        if(lua_rawgeti(L, LUA_REGISTRYINDEX, script_entry->info_ref) == LUA_TFUNCTION)
+        {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, script_entry->self_ref);
+            if(!docall(L, 1, 1) && lua_isstring(L, -1))
+            {
+                MENU_SET_WARNING(MENU_WARN_INFO, "%s", lua_tostring(L, -1));
+            }
+        }
+        else if(lua_isstring(L, -1))
+        {
+            MENU_SET_WARNING(MENU_WARN_INFO, "%s", lua_tostring(L, -1));
+        }
+        lua_pop(L,1);
+    }
+    if(script_entry->rinfo_ref != LUA_NOREF)
+    {
+        if(lua_rawgeti(L, LUA_REGISTRYINDEX, script_entry->rinfo_ref) == LUA_TFUNCTION)
+        {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, script_entry->self_ref);
+            if(!docall(L, 1, 1) && lua_isstring(L, -1))
+            {
+                MENU_SET_RINFO("%s", lua_tostring(L, -1));
+            }
+        }
+        else if(lua_isstring(L, -1))
+        {
+            MENU_SET_RINFO("%s", lua_tostring(L, -1));
+        }
+        lua_pop(L,1);
+    }
+    if(script_entry->warning_ref != LUA_NOREF)
+    {
+        if(lua_rawgeti(L, LUA_REGISTRYINDEX, script_entry->warning_ref) == LUA_TFUNCTION)
+        {
+            lua_rawgeti(L, LUA_REGISTRYINDEX, script_entry->self_ref);
+            if(!docall(L, 1, 1) && lua_isstring(L, -1))
+            {
+                MENU_SET_WARNING(MENU_WARN_NOT_WORKING, "%s", lua_tostring(L, -1));
+            }
+        }
+        lua_pop(L,1);
+    }
+    return 0;
+}
+
+static MENU_UPDATE_FUNC(script_menu_update)
+{
+    struct script_menu_entry * script_entry = entry->priv;
+    if(script_entry && script_entry->L)
+    {
+        lua_State * L = script_entry->L;
+        struct semaphore * sem = NULL;
+        if (lua_take_semaphore(L, 100, &sem) == 0)
+        {
+            ASSERT(sem);
+            int top = lua_gettop(L);
+            struct lua_r6_mcb c = { script_entry, entry, info, 0 };
+            lua_pushcfunction(L, lua_r6_menu_update_body);
+            lua_pushlightuserdata(L, &c);
+            if (docall(L, 1, 0))
+                fprintf(stderr, "[%s] menu.update failed: %s\n", lua_get_script_filename(L), lua_type(L, -1) == LUA_TSTRING ? lua_tostring(L, -1) : "(no message)");
+            lua_settop(L, top);
+            give_semaphore(sem);
+        }
+        else if (lua_r6_alive(L) > 0)
+        {
+            printf("[%s] semaphore timeout: menu.update (%dms)\n", lua_get_script_filename(L), 100);
+        }
+    }
+}
+
+#else
 static MENU_SELECT_FUNC(script_menu_select)
 {
     struct script_menu_entry * script_entry = priv;
@@ -165,6 +326,8 @@ static MENU_UPDATE_FUNC(script_menu_update)
     }
 }
 
+#endif
+
 static int lua_hasfield(lua_State * L, int idx, const char * name, int expected_type)
 {
     int result = lua_getfield(L, -1, name) == expected_type;
@@ -233,6 +396,32 @@ static int luaCB_menu_set(lua_State * L)
     LUA_PARAM_STRING(menu, 1);
     LUA_PARAM_STRING(entry, 2);
     int result = INT_MIN;
+#ifdef CONFIG_R6_LUA
+    /* M16.1 (spec m16/m161 5.2, MB-5): the R6 menus first (fail-closed per area, the commands in GuiMainTask, 2.7); R6API_PASS:
+     * not an R6 entry, the upstream way below. 0 -> true; QUEUED -> true, text, code; a refusal before the picture -> false, text,
+     * code (3.2); else a Lua error with the facade's text */
+    {
+        int isint = lua_isinteger(L, 3);
+        if (!isint && !lua_isstring(L, 3)) return luaL_argerror(L, 3, "expected string for param 'value'");
+        struct lua_r6_call k = { .op = LR6_MENUSET, .s1 = menu, .s2 = entry, .s3 = isint ? 0 : lua_tostring(L, 3),
+                                 .a = isint ? (int) lua_tointeger(L, 3) : INT_MIN };
+        int r = lua_r6_do(L, &k);
+        if (r != R6API_PASS)
+        {
+            if (r == R6API_OK && !strcmp(entry, "Tv writes"))
+                lua_r6_flag(L, LUA_R6F_TVW, isint ? k.a != 0 : (!strcmp(k.s3, "ON") || !strcmp(k.s3, "1")));
+            if (r == R6API_OK) { lua_pushboolean(L, 1); return 1; }
+            if (r == R6API_QUEUED || (r >= R6API_CAM && r < R6API_QUEUED))
+            {
+                lua_pushboolean(L, r == R6API_QUEUED);
+                lua_pushstring(L, k.why);
+                lua_pushinteger(L, r);
+                return 3;
+            }
+            return luaL_error(L, "menu.set('%s', '%s'): %s", menu, entry, k.why);
+        }
+    }
+#endif
     if(lua_isinteger(L, 3))
     {
         LUA_PARAM_INT(value, 3);
@@ -295,6 +484,9 @@ static int luaCB_menu_block(lua_State * L)
 {
     LUA_PARAM_BOOL(enabled, 1);
     menu_redraw_blocked = enabled;
+#ifdef CONFIG_R6_LUA
+    lua_r6_flag(L, LUA_R6F_BLOCK, enabled);    /* M16.1 (spec m16/m161 8.1 R-4): undone at the real end of the script */
+#endif
     return 0;
 }
 

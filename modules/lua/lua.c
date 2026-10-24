@@ -66,6 +66,10 @@ struct lua_script
 #ifdef CONFIG_R6_LUA
     int r6_dead;                /* M16.0 (spec 4.6): aborted with something registered: no more Lua code on this state */
     int r6_once;                /* M16.0 (spec 4.3): hints printed once per script (bits) */
+    uint32_t r6_gen;            /* M16.1 (spec m16/m161 8.2 Ue11): the generation of the running state (facade jobs, entries) */
+    int r6_closed;              /* M16.1 (Ue10): lua_close ran: a callback that takes the semaphore later must not use L */
+    int r6_flags;               /* M16.1: LUA_R6F_* (the hints and cleanups at the real end, R-4) */
+    int r6_psave;               /* M16.1 (R-4): powersave_prohibit of its tasks not yet permitted */
 #endif
     struct lua_script * next;
 };
@@ -94,28 +98,65 @@ struct script_event_entry
     int function_ref;
     lua_State * L;
     int mask;
+#ifdef CONFIG_R6_LUA
+    uint32_t r6_gen;            /* M16.1 (spec m16/m161 8.2 Ue11): the generation that set function_ref */
+#endif
 };
 
 static int lua_loaded = 0;
 int last_keypress = 0;
 int waiting_for_keypress = -1;  /* 0 = all, -1 = none, other = wait for a specific key */
 
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 8.2 Ue10 / Ue11): the script of L without lua_script()'s ASSERT (an old entry of a closed state); NULL = none */
+static struct lua_script * lua_r6_script(lua_State * L)
+{
+    for (struct lua_script * script = lua_scripts; L && script; script = script->next)
+    {
+        if (script->L == L) return script;
+    }
+    return NULL;
+}
+
 int lua_take_semaphore(lua_State * L, int timeout, struct semaphore ** assoc_semaphore)
 {
-    struct lua_script * script = lua_script(L);
+    struct lua_script * script = lua_r6_script(L);
+    /* M16.1 (Ue10 / Ue11): no living state any more (closed; an entry of an old generation): as a failed take; a caller without
+     * a limit (task.yield, key.wait, a task's start, a wait of the facade) ends through its task anchor (Ue3) or sleeps */
+    if (!script)
+    {
+        if (timeout) return -1;
+        lua_r6_park("closed script");
+    }
 
     if (assoc_semaphore) *assoc_semaphore = script->sem;
-#ifdef CONFIG_R6_LUA
     /* M16.0 (spec 4.6): a dead script (aborted with something registered): callbacks skip it at once; the callers that wait
-     * without a limit (task.yield, key.wait, a task's start) and ignore the result stay here, as on its taken semaphore */
+     * without a limit (task.yield, key.wait, a task's start) and ignore the result stay here, as on its taken semaphore
+     * (M16.1 Ue3: or end through their task anchor) */
     if (script->r6_dead)
     {
         if (timeout) return -1;
         lua_r6_park("dead script");
     }
-#endif
+    int r = take_semaphore(script->sem, timeout);
+    /* Ue10: the state was closed (or replaced) while this caller waited: give it back, a failed take */
+    if (r == 0 && (script->L != L || script->r6_closed))
+    {
+        give_semaphore(script->sem);
+        if (timeout) return -1;
+        lua_r6_park("closed script");
+    }
+    return r;
+}
+#else
+int lua_take_semaphore(lua_State * L, int timeout, struct semaphore ** assoc_semaphore)
+{
+    struct lua_script * script = lua_script(L);
+
+    if (assoc_semaphore) *assoc_semaphore = script->sem;
     return take_semaphore(script->sem, timeout);
 }
+#endif
 
 #ifdef CONFIG_R6_LUA
 /* M16.0 (spec 4.3): 1 the first time this bit is asked for the script of L */
@@ -136,6 +177,30 @@ int lua_r6_alive(lua_State * L)
         if (script->L == L) return script->r6_dead ? 0 : 1;
     }
     return -1;
+}
+
+/* M16.1 (spec m16/m161 8.2 Ue11): the generation of a script run (never 0) */
+static volatile uint32_t lua_r6_gen_n = 0;
+uint32_t lua_r6_gen(lua_State * L)
+{
+    struct lua_script * script = lua_r6_script(L);
+    return script ? script->r6_gen : 0;
+}
+
+void lua_r6_flag(lua_State * L, int flag, int on)
+{
+    struct lua_script * script = lua_r6_script(L);
+    if (!script) return;
+    if (on) script->r6_flags |= flag;
+    else script->r6_flags &= ~flag;
+}
+
+int lua_r6_psave(lua_State * L, int d)
+{
+    struct lua_script * script = lua_r6_script(L);
+    if (!script || (d < 0 && script->r6_psave <= 0)) return 0;   /* review R2-10: R-4 (lua_r6_end) permitted it already */
+    script->r6_psave += d;
+    return 1;
 }
 #endif
 
@@ -210,6 +275,71 @@ char * copy_string(const char * str)
  */
 
 
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 8.3 B5): everything after the take in one lua_pcall (lua_rawgeti .. the result), so no error on L is
+ * unprotected in the caller's task (GuiMainTask, clock_task, shoot_task ...); Ue11: an entry without a state or of another
+ * generation is skipped */
+struct lua_r6_cbr { int ref; unsigned int ctx; int ret_false; };
+static int lua_r6_cbr_body(lua_State * L)
+{
+    struct lua_r6_cbr * c = lua_touserdata(L, 1);
+    lua_settop(L, 0);
+    if (lua_rawgeti(L, LUA_REGISTRYINDEX, c->ref) != LUA_TFUNCTION) return luaL_error(L, "event handler is not a function");
+    lua_pushinteger(L, c->ctx);
+    lua_call(L, 1, 1);
+    c->ret_false = lua_isboolean(L, -1) && !lua_toboolean(L, -1);
+    return 0;
+}
+
+/* the protected call of one handler, the caller holds the semaphore: 0 ok, 1 returned false, -1 error (printed, saved) */
+static int lua_r6_cbr_call(lua_State * L, int ref, unsigned int ctx, const char * what)
+{
+    int top = lua_gettop(L);
+    struct lua_r6_cbr c = { ref, ctx, 0 };
+    int ret = 0;
+    lua_pushcfunction(L, lua_r6_cbr_body);
+    lua_pushlightuserdata(L, &c);
+    if (docall(L, 1, 0))
+    {
+        int s = lua_type(L, -1) == LUA_TSTRING;
+        fprintf(stderr, "[%s] %s error:\n %s\n", lua_get_script_filename(L), what, s ? lua_tostring(L, -1) : "(no message)");
+        if (s) lua_save_last_error(L);
+        ret = -1;
+    }
+    else if (c.ret_false) ret = 1;
+    lua_settop(L, top);
+    return ret;
+}
+
+static unsigned int lua_do_cbr(unsigned int ctx, struct script_event_entry * event_entries, const char * event_name, int timeout, int sucess, int failure)
+{
+    //no events registered by lua scripts
+    if(!event_entries || !lua_loaded) return sucess;
+
+    unsigned int result = sucess;
+    struct script_event_entry * current;
+    for(current = event_entries; current; current = current->next)
+    {
+        lua_State * L = current->L;
+        if (!L || current->function_ref == LUA_NOREF) continue;
+        struct semaphore * sem = NULL;
+        if (lua_take_semaphore(L, timeout, &sem) == 0)
+        {
+            int r = 0;
+            if (current->function_ref != LUA_NOREF && current->L == L && current->r6_gen == lua_r6_gen(L))
+                r = lua_r6_cbr_call(L, current->function_ref, ctx, "cbr");
+            give_semaphore(sem);
+            if (r < 0) { result = CBR_RET_ERROR; break; }
+            if (r > 0) { result = failure; break; }
+        }
+        else if (lua_r6_alive(L) > 0)       /* a dead or closed script is skipped without a line */
+        {
+            printf("[%s] semaphore timeout: %s (%dms)\n", lua_get_script_filename(L), event_name, timeout);
+        }
+    }
+    return result;
+}
+#else
 static unsigned int lua_do_cbr(unsigned int ctx, struct script_event_entry * event_entries, const char * event_name, int timeout, int sucess, int failure)
 {
     //no events registered by lua scripts
@@ -258,15 +388,14 @@ static unsigned int lua_do_cbr(unsigned int ctx, struct script_event_entry * eve
             }
             else
             {
-#ifdef CONFIG_R6_LUA
-                if (!lua_script(L)->r6_dead)    /* M16.0 (spec 4.6): a dead script is skipped without a line */
-#endif
                 printf("[%s] semaphore timeout: %s (%dms)\n", lua_get_script_filename(L), event_name, timeout);
             }
         }
     }
     return result;
 }
+
+#endif
 
 #define LUA_CBR_FUNC(name, arg, timeout)\
 static struct script_event_entry * name##_cbr_scripts = NULL;\
@@ -310,6 +439,10 @@ static unsigned int lua_keypress_cbr(unsigned int ctx)
                 /* note: key.wait() will clear the buffer before starting to wait
                  * also msg_queue_post is not blocking, therefore, sending this
                  * to scripts not waiting for a key press should be harmless. */
+#ifdef CONFIG_R6_LUA
+                /* M16.1: a script that never ran has no queue yet (load_script creates it): DryOS asserts on NULL (KerQueue.c 522) */
+                if (!script->key_mq) continue;
+#endif
                 msg_queue_post(script->key_mq, last_keypress);
             }
 
@@ -360,6 +493,9 @@ static void set_event_script_entry(struct script_event_entry ** root, lua_State 
                 luaL_unref(L, LUA_REGISTRYINDEX, current->function_ref);
             }
             current->function_ref = function_ref;
+#ifdef CONFIG_R6_LUA
+            current->r6_gen = lua_r6_gen(L);
+#endif
             update_event_cant_unload(root, L);
             return;
         }
@@ -374,6 +510,9 @@ static void set_event_script_entry(struct script_event_entry ** root, lua_State 
             new_entry->next = *root;
             new_entry->L = L;
             new_entry->function_ref = function_ref;
+#ifdef CONFIG_R6_LUA
+            new_entry->r6_gen = lua_r6_gen(L);
+#endif
             *root = new_entry;
         }
         else
@@ -383,6 +522,51 @@ static void set_event_script_entry(struct script_event_entry ** root, lua_State 
     }
     update_event_cant_unload(root, L);
 }
+
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 8.2 Ue11): no event entry keeps a state that is closed now */
+static void lua_r6_forget(lua_State * L)
+{
+    struct script_event_entry * lists[] = { pre_shoot_cbr_scripts, post_shoot_cbr_scripts, shoot_task_cbr_scripts, seconds_clock_cbr_scripts,
+        custom_picture_taking_cbr_scripts, intervalometer_cbr_scripts, config_save_cbr_scripts, keypress_cbr_scripts };
+    for (unsigned k = 0; k < COUNT(lists); k++)
+    {
+        for (struct script_event_entry * e = lists[k]; e; e = e->next)
+        {
+            if (e->L != L) continue;
+            e->function_ref = LUA_NOREF;
+            e->L = NULL;
+        }
+    }
+}
+
+/* the config_save handler of this script only (its semaphore is held by the caller; upstream called every script's, through
+ * lua_do_cbr, which would wait for this very semaphore) */
+static int lua_r6_config_save(lua_State * L)
+{
+    for (struct script_event_entry * e = config_save_cbr_scripts; e; e = e->next)
+    {
+        if (e->L == L && e->function_ref != LUA_NOREF && e->r6_gen == lua_r6_gen(L))
+            return lua_r6_cbr_call(L, e->function_ref, 0, "config_save") < 0 ? -1 : 0;
+    }
+    return 0;
+}
+
+/* R-4 / SL-2: only at the real end of the Lua state (lua_close in load_script, lua_r6_after_abort, a dead script): the jobs of its
+ * generation (also asynchronous ones), the hints (REC sent, Tv writes left ON), menu.block undone, open prohibits permitted */
+extern int menu_redraw_blocked;
+static void lua_r6_end(struct lua_script * script)
+{
+    if (script->r6_flags & LUA_R6F_BLOCK) menu_redraw_blocked = 0;
+    while (script->r6_psave > 0)
+    {
+        powersave_permit();
+        script->r6_psave--;
+    }
+    r6_script_end(script->r6_gen, !!(script->r6_flags & LUA_R6F_REC), !!(script->r6_flags & LUA_R6F_TVW));
+    script->r6_flags = 0;
+}
+#endif
 
 static int luaCB_event_index(lua_State * L)
 {
@@ -520,6 +704,9 @@ static const luaL_Reg alllibs[] =
     {"FONT", luaopen_FONT},
     {"COLOR", luaopen_COLOR},
     {"KEY", luaopen_KEY},
+#ifdef CONFIG_R6_LUA
+    {"r6", luaopen_r6},         /* M16.1 (spec m16/m161 5.6) */
+#endif
     {NULL,NULL}
 };
 
@@ -646,6 +833,7 @@ static lua_State * load_lua_state(int argc, char** argv)
     /* M16.0 (spec 5.2, 4.6, 4.8): no memory for the state: NULL to load_script; else the abort anchor knows it */
     if (!L) return NULL;
     lua_r6_anchor_L(L);
+    r6_lua_stat()->scripts++;   /* M16.1 (spec m16/m161 11): living states, lua_close counts down */
     r6_lua_fault(R6LF_MARK_1);
 #endif
     luaL_requiref(L, "_G", luaopen_base, 1);
@@ -844,11 +1032,34 @@ static void load_script(struct lua_script * script)
 
     script->load_time = get_seconds_clock();
     script->state = SCRIPT_STATE_LOADING_OR_RUNNING;
+#ifdef CONFIG_R6_LUA
+    /* M16.1 (spec m16/m161 8.2 Ue10): every run holds the semaphore from here until the main chunk ended (and, for a simple
+     * script, lua_close ran); upstream took it only at its creation. A new generation for this run (Ue11) */
+    if (script->sem)
+    {
+        take_semaphore(script->sem, 0);
+        lua_r6_anchor_sem(1);
+    }
+    script->r6_closed = 0;
+    script->r6_flags = 0;
+    script->r6_psave = 0;
+    {
+        /* review R2-9: load_script runs in lua_load_task and lua_user_load_task at the same time: the generation from this CAS */
+        uint32_t o, g;
+        do { o = lua_r6_gen_n; g = o + 1; if (!g) g = 1; } while (!r6_cas32(&lua_r6_gen_n, o, g));
+        script->r6_gen = g;
+    }
+#endif
     lua_State* L = script->L = load_lua_state(script->argc, script->argv);
 #ifdef CONFIG_R6_LUA
     /* M16.0 (spec 5.2): no memory for the Lua state (upstream used NULL): before the semaphore and the queue exist */
     if (!L)
     {
+        if (script->sem)            /* M16.1 (Ue10): a re-run gives back what it took */
+        {
+            give_semaphore(script->sem);
+            lua_r6_anchor_sem(0);
+        }
         fprintf(stderr, "[%s] not enough memory (Lua state)\n", script->filename);
         lua_clear_last_error(script);
         script->last_error = copy_string("not enough memory (Lua state)");
@@ -906,10 +1117,45 @@ static void load_script(struct lua_script * script)
         lua_save_last_error(L);
     }
 
-    give_semaphore(script->sem);
 #ifdef CONFIG_R6_LUA
-    lua_r6_anchor_sem(0);
-#endif
+    /* M16.1 (spec m16/m161 2.5 SL-2): the main chunk's own open jobs (a picture it waited for with a backstop) */
+    r6_script_task_end(script->r6_gen);
+
+    /* M16.1 (Ue10): the semaphore stays held until the state is closed or runs in the background (upstream gave it first: a
+     * callback could run on the state while load_script closed it). The config_save handler: only this script's, directly */
+    if (config_save_cbr_scripts && (script->cant_unload & (1 << config_save_cbr_scripts->mask)))
+    {
+        printf("[%s] saving config...\n", script->filename);
+        lua_r6_config_save(L);
+        lua_set_cant_unload(script->L, 0, config_save_cbr_scripts->mask);
+    }
+
+    if (script->cant_unload)
+    {
+        script->state = SCRIPT_STATE_RUNNING_IN_BACKGROUND;
+        script->menu_entry->icon_type = IT_BOOL;
+        printf("[%s] running in background.\n", script->filename);
+        give_semaphore(script->sem);
+        lua_r6_anchor_sem(0);
+    }
+    else
+    {
+        set_event_script_entry(&config_save_cbr_scripts, L, LUA_NOREF);
+        lua_r6_end(script);                 /* R-4 / SL-2: the real end of this state */
+        script->r6_closed = 1;
+        lua_r6_forget(L);                   /* Ue11 */
+        lua_close(L);
+        r6_lua_stat()->scripts--;
+        script->L = NULL;
+        script->menu_entry->icon_type = IT_ACTION;
+        script->state = SCRIPT_STATE_NOT_RUNNING;
+        script->load_time = 0;
+        printf("[%s] script finished.\n\n", script->filename);
+        give_semaphore(script->sem);
+        lua_r6_anchor_sem(0);
+    }
+#else
+    give_semaphore(script->sem);
 
     /* allow simple scripts to use config_save events */
     if (config_save_cbr_scripts && (script->cant_unload & (1 << config_save_cbr_scripts->mask)))
@@ -957,6 +1203,7 @@ static void load_script(struct lua_script * script)
         script->load_time = 0;
         printf("[%s] script finished.\n\n", script->filename);
     }
+#endif
 
     /* print available memory */
     lua_print_free_mem();
@@ -967,6 +1214,21 @@ static void load_script(struct lua_script * script)
 
 #ifdef CONFIG_R6_LUA
 #undef load_script
+/* M16.1 (spec m16/m161 8.1 R-3, 8.2 Ue3; lua_r6_abort in a Lua task): the script is dead from here on; its state is not closed (the
+ * task held the semaphore and keeps it), callbacks skip it, its other tasks end at their next take */
+void lua_r6_mark_dead(lua_State * L)
+{
+    struct lua_script * script = lua_r6_script(L);
+    if (!script || script->r6_dead) return;
+    script->r6_dead = 1;
+    r6_lua_stat()->dead++;
+    script->state = SCRIPT_STATE_RUNNING_IN_BACKGROUND;    /* no new start from the menu */
+    lua_clear_last_error(script);
+    script->last_error = copy_string("aborted in a task; restart the camera to run it again");
+    fprintf(stderr, "[%s] aborted in a task; restart the camera to run it again.\n", script->filename);
+    lua_r6_end(script);
+}
+
 /* M16.0 (spec 4.6): after abort() jumped back here - an unprotected Lua error (memory in luaL_requiref, createargtable, pushargs,
  * lua_tostring after docall). Nothing registered: lua_close (finalizers run protected), the script can run again; else "dead":
  * no more Lua code on this state, its semaphore stays as it is */
@@ -979,7 +1241,11 @@ static void lua_r6_after_abort(struct lua_r6_anchor * a)
     lua_clear_last_error(script);
     if (!L || (script->cant_unload == 0 && script->tasks_started == 0))
     {
+        if (L) lua_r6_end(script);          /* M16.1 (R-4, SL-2) */
+        script->r6_closed = 1;              /* M16.1 (Ue10) */
+        if (L) lua_r6_forget(L);            /* M16.1 (Ue11) */
         if (L) lua_close(L);
+        if (L) st->scripts--;
         if (L) st->abort_close++;
         if (a->sem) give_semaphore(script->sem);    /* first run: created locked by this task */
         script->L = NULL;
@@ -994,6 +1260,7 @@ static void lua_r6_after_abort(struct lua_r6_anchor * a)
         script->L = L;                          /* callbacks of the script still find it (and skip it) */
         script->r6_dead = 1;
         st->dead++;
+        lua_r6_end(script);                     /* M16.1 (R-4, SL-2): the dead branch is a real end too */
         script->state = SCRIPT_STATE_RUNNING_IN_BACKGROUND;    /* no new start from the menu */
         script->last_error = copy_string("aborted; restart the camera to run it again");
         fprintf(stderr, "[%s] aborted; restart the camera to run it again.\n", script->filename);
@@ -1444,6 +1711,9 @@ static void lua_do_autoload()
                 console_show();
             }
             script->autorun = 1;
+#ifdef CONFIG_R6_LUA
+            if (!r6_lua_stat()->t_autorun) r6_lua_stat()->t_autorun = MAX(get_ms_clock(), 1);   /* M16.1 (MK11) */
+#endif
             load_script(script);
             msleep(100);
         }
@@ -1452,6 +1722,9 @@ static void lua_do_autoload()
 
 static void lua_load_task(int unused)
 {
+#ifdef CONFIG_R6_LUA
+    r6_lua_stat()->t_load = MAX(get_ms_clock(), 1);   /* M16.1 (MK11): lua_load_task runs */
+#endif
     int console_was_visible = console_visible;
 
     /* wait until other modules (hopefully) finish loading */
@@ -1617,6 +1890,7 @@ static unsigned int lua_init()
     /* M16.0 (spec 3.5, 4.1): the core table; lua_load_task through the R6 task model, stack R6L_STACK_LOAD; the property queue
      * once, here (review R2-02) */
     lua_r6_init();
+    r6_lua_stat()->t_init = MAX(get_ms_clock(), 1);   /* M16.1 (MK11) */
     lua_r6_prop_init();
     if (!lua_r6_load_start()) menu_add("Scripts", lua_r6_nomem_menu, COUNT(lua_r6_nomem_menu));
 #else

@@ -11,6 +11,11 @@
 #include <string.h>
 
 #include "lua_common.h"
+#ifdef CONFIG_R6_LUA
+#include <module.h>
+#include <lens.h>
+#include "lua_r6.h"             /* M16.1 (spec m16/m161 6.4): the core facade r6_api_abi.h */
+#endif
 
 extern int last_keypress;
 extern int waiting_for_keypress;
@@ -21,12 +26,34 @@ int module_send_keypress(int module_key);
  @tparam constants.KEY key the key to press.
  @function press
  */
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 6.4): FULLSHUTTER is a script picture (camera.shoot(false); returns code, text, seq); every other key a
+ * press / release pair through fake_simple_button from the caller's task (R6GO_FAKE in GuiMainTask); errors from the facade */
+static int luaCB_key_press(lua_State * L)
+{
+    LUA_PARAM_INT(key, 1);
+    if (key == MODULE_KEY_PRESS_FULLSHUTTER)
+    {
+        struct lua_r6_call k = { .op = LR6_SHOOT, .a = AF_DISABLE };
+        int r = lua_r6_do(L, &k);
+        lua_pushinteger(L, r);
+        lua_pushstring(L, k.why);
+        lua_pushinteger(L, k.seq);
+        return 3;
+    }
+    struct lua_r6_call k = { .op = LR6_GUI, .a = R6SG_KEY, .b = key };
+    if (lua_r6_do(L, &k)) return luaL_error(L, "key.press: %s", k.why);
+    if (key == MODULE_KEY_REC) lua_r6_flag(L, LUA_R6F_REC, 1);   /* review R3-2: REC sent (6.3 / 6.4): r6_script_end's hint (R-4) */
+    return 0;
+}
+#else
 static int luaCB_key_press(lua_State * L)
 {
     LUA_PARAM_INT(key, 1);
     module_send_keypress(key);
     return 0;
 }
+#endif
 
 /***
  Wait for a key to be pressed.
@@ -44,6 +71,11 @@ static int luaCB_key_wait(lua_State * L)
     LUA_PARAM_INT_OPTIONAL(key, 1, 0);
     LUA_PARAM_INT_OPTIONAL(timeout, 2, 0);
     uint32_t pressed_key = 0;
+#ifdef CONFIG_R6_LUA
+    /* review R2-3: only where an anchor ends the wait (the main chunk, a task.create task); in a GuiMainTask callback the key that ends
+     * it could never arrive (GuiMainTask delivers it), other callbacks would block their task */
+    if (!lua_r6_may_wait(L)) return luaL_error(L, "key.wait: only in the main chunk or a task.create task");
+#endif
 
     if (lua_get_cant_yield(L))
     {
@@ -58,6 +90,11 @@ static int luaCB_key_wait(lua_State * L)
     int t1 = lua_gettop(L);         /* current stack top */
     int v1 = lua_tointeger(L, t1);  /* duration (integer) */
 
+#ifdef CONFIG_R6_LUA
+    /* M16.1 (spec m16/m161 2.7 SL-9): as task.yield: cant_yield while the semaphore is given back (upstream left it 0: a wait of
+     * another task of this script would give it back too, and this task would return into the VM over that task's frame) */
+    lua_set_cant_yield(L, 1);
+#endif
     /* let other script tasks run */
     lua_give_semaphore(L, NULL);
 
@@ -66,6 +103,9 @@ static int luaCB_key_wait(lua_State * L)
 
     /* other script tasks no longer allowed */
     lua_take_semaphore(L, 0, NULL);
+#ifdef CONFIG_R6_LUA
+    lua_set_cant_yield(L, 0);
+#endif
 
     /* check the stack */
     int t2 = lua_gettop(L);

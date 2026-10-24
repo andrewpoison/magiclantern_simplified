@@ -138,6 +138,9 @@
 #ifdef CONFIG_R6_INTERVAL
 #include "lens.h"
 #include "r6_interval.h"
+#ifdef CONFIG_R6_IV_SCRIPT
+#include "r6_modsup_abi.h"               /* M16.1: r6_barrier (the snapshot lock with the script slot, spec m16/m161 2.5) */
+#endif
 #endif
 #ifdef CONFIG_R6_PROPW_TV
 #include "r6_propw.h"
@@ -1789,6 +1792,11 @@ static void __attribute__((noinline)) lp_iv_log(struct lp_buf * b)   /* M10.2b: 
         for (int i = 0; i < nref; i++)
         {
             r6_iv_refusal(i, &r);
+#ifdef CONFIG_R6_IV_SCRIPT
+            if (r.src == R6IV_REF_SCRIPT)                                /* M16.1 (SB-19): a script picture's refusal (9) */
+                lp_nosp(r6_iv_cam_name(r.cam), wn, sizeof(wn));
+            else
+#endif
 #ifdef CONFIG_R6_ETTR
             if (r.src >= R6IV_REF_ETTR)                                  /* M11.1: R6 ETTR's command (7) / run (8) */
                 lp_nosp(r.cam == R6ETT_A_TVW ? _r6pw_lock_name(r.lock) : r6_ettr_a_name(r.cam), wn, sizeof(wn));
@@ -3236,7 +3244,11 @@ extern int r6_mem_info(const void * ptr, struct r6_mem_rec * out);   /* src/mem.
 extern void tskmon_stack_check(uint32_t task_id);                    /* src/tskmon.c (ML) */
 extern void tskmon_stack_get_max(uint32_t task_id, uint32_t * used, uint32_t * free);
 
+#ifdef CONFIG_R6_SCRIPT
+#define LP_SNAP_STACK   0x2000    /* M16.1 (spec m16/m161 8.2 Ue13): 8 KB beside living Lua tasks (camera: 1,888..2,000 B used) */
+#else
 #define LP_SNAP_STACK   0x3000    /* the snapshot task's stack (spec 4, Rev. 2 S3): 12 KB instead of run_in_separate_task's 32 KB */
+#endif
 #define LP_SNAP_PRIO    0x1a      /* as run_in_separate_task's "run_test" */
 #define LP_AM_FLOOR     0x100000  /* a buffer from Canon's AllocateMemory heap only while >= 1 MiB stays free there (spec 5, S4;
                                    * mem.c: "at 1MB free, 'dispcheck' may stop working") */
@@ -3344,7 +3356,11 @@ static void lp_bs_line(struct lp_buf * b, const char * key, const struct lp_bufs
 #define LP_SYS_LO       (LP_SYS_START + LP_SYS_HDR)               /* first byte a free node may start at */
 #define LP_SYS_HI       (LP_SYS_START + LP_SYS_LEN)               /* end of the pool (exclusive) */
 #define LP_SYS_RD(a)    (*(volatile const uint32_t *) (a))        /* the only Canon load of the M14.1c code */
+#ifdef CONFIG_R6_SCRIPT
+_Static_assert(LP_SYS_NEED == 8200 && LP_SYS_MIN == 12304, "M16.1 (Ue13): the 8 KB snapshot task's block and the threshold");
+#else
 _Static_assert(LP_SYS_NEED == 0x3008 && LP_SYS_MIN == 0x4010, "M14.1c: the snapshot task's block and the threshold (spec 3, 5)");
+#endif
 #define LP_SYS_OK       0
 #define LP_SYS_LAYOUT   1             /* a fixed header field differs: no node is read, no further attempt */
 #define LP_SYS_NODE     2             /* a node pointer or size outside the rules */
@@ -3530,6 +3546,107 @@ static void lp_snap_lines(struct lp_buf * b)
 #define LP_ASZ LP_AST_SIZE
 #endif
 
+#ifdef CONFIG_R6_SCRIPT
+#include "r6_api.h"
+#include "module.h"
+/* M16.1 (spec m16/m161 11): the lines of the script era, ML's own records only (no new Canon read but sys_mem, Tor 0h); at most
+ * ~6.5 KB with full rings (logworst.py) */
+static void __attribute__((noinline)) lp_scr_log(struct lp_buf * b)
+{
+    static const char * const mods[5] = { "arkanoid", "bench", "file_man", "img_name", "lua" };
+    lp_printf(b, "# M16.1 (spec m16/m161 11): mod, snap.sys_at, tk, lua, tsk, scr\n");
+    for (int i = 0; i < 5; i++)
+    {
+        int k = module_get_number((char *) mods[i]), loaded = 0;
+        for (int m = module_get_next_loaded(-1); k >= 0 && m >= 0; m = module_get_next_loaded(m)) if (m == k) loaded = 1;
+        lp_printf(b, "mod.st=%s,%s\n", mods[i], k < 0 ? "absent" : loaded ? "loaded" : "off");
+    }
+    const struct r6_lua_stat * ls = r6_lua_stat();
+    lp_printf(b, "mod.t=%d,%d,%d\n", (int) ls->t_init, (int) ls->t_load, (int) ls->t_autorun);   /* lua_init, lua_load_task, autorun (ms) */
+    struct lp_sys sa;
+    lp_sys_read(&sa);                     /* C2: sys_mem at the capture (also for the delayed snapshot) */
+    sa.t = get_ms_clock();
+    lp_sys_line(b, "snap.sys_at", &sa, 0);
+    uint32_t c[6];
+    r6_task_counts(c);
+    lp_printf(b, "tk.cnt=%d,%d,%d,%d,%d,%d,%d\n", (int) c[0], (int) c[1], (int) c[2], (int) c[3], (int) c[4], (int) c[5], (int) _r6tk_odd());
+    lp_printf(b, "# tk.dec[i]=t,name,prio,stack,need,min,largest,free,used,res,why,tramp,seq; tk.end[i]=t0,t1,name,stack,used,free,seq\n");
+    struct r6tk_dec d;
+    int nd = r6_task_ring(0, &d);
+    for (int i = 0; i < nd; i++)
+    {
+        r6_task_ring(i, &d);
+        d.name[15] = 0;
+        lp_printf(b, "tk.dec[%d]=%d,%s,0x%x,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", i, (int) d.t_ms, d.name, d.prio, (int) d.stack, (int) d.need,
+            (int) d.min, (int) d.largest, (int) d.free, (int) d.used, d.res, d.why, d.tramp, d.seq);
+    }
+    struct r6tk_end te;
+    int ne = r6_task_end_ring(0, &te);
+    for (int i = 0; i < ne; i++)
+    {
+        r6_task_end_ring(i, &te);
+        te.name[15] = 0;
+        lp_printf(b, "tk.end[%d]=%d,%d,%s,%d,%d,%d,%d\n", i, (int) te.t0, (int) te.t1, te.name, (int) te.stack, (int) te.used, (int) te.free, te.seq);
+    }
+    lp_printf(b, "lua.st=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,0x%x,0x%x,%d,%d,%d,%d,%d,%d,%d,%d\n", (int) ls->ring_ok, (int) ls->ring_drop,
+        (int) ls->ring_bad, (int) ls->aborts, (int) ls->abort_close, (int) ls->dead, (int) ls->park, (int) ls->sp_hits, (int) ls->sp_unknown,
+        (int) ls->umm_free, (int) ls->umm_min, (int) ls->am_refused, (int) ls->am_unk, (int) ls->mallocs, (int) ls->prio_clamped,
+        (int) ls->stack_clamped, (int) ls->cpu_prod, (int) ls->cpu_cons, (int) ls->prop_skip, (int) ls->umm_spin, (int) ls->umm_depth_max,
+        (int) ls->prop_deny, (int) ls->prop_unreg, (int) ls->scripts, (int) ls->jmp_foreign, (int) ls->dead_exit);
+    lp_printf(b, "lua.sp=%d,%d,%d,%d,%d,0x%x,0x%x,0x%x,0x%x,0x%x\n", (int) ls->sp_min[0], (int) ls->sp_min[1], (int) ls->sp_min[2],
+        (int) ls->sp_min[3], (int) ls->sp_min[4], (int) ls->cpu_kind[0], (int) ls->cpu_kind[1], (int) ls->cpu_kind[2], (int) ls->cpu_kind[3],
+        (int) ls->cpu_kind[4]);
+    /* tskmon's high-water marks of the tasks ML knows the id of (the wrapper's living tasks; GuiMainTask, clock_task and r6_iv_task
+     * as the facade saw them); shoot_task, menu_task, menu_redraw_task, module_task: no id without a new read (MK8 partly) */
+    uint32_t tids[3];
+    _r6api_tids(tids);
+    static const char * const tn[3] = { "GuiMainTask", "clock_task", "r6_iv_task" };
+    for (int i = 0; i < 3 + R6TK_TRAMP; i++)
+    {
+        uint32_t tid = 0, stk = 0, used = 0, fr = 0;
+        char nm[16];
+        if (i < 3) { tid = tids[i]; snprintf(nm, sizeof(nm), "%s", tn[i]); }
+        else if (!_r6tk_live(i - 3, &tid, &stk, nm)) continue;
+        if (!tid) continue;
+        tskmon_stack_check(tid);
+        tskmon_stack_get_max(tid, &used, &fr);
+        lp_printf(b, "tsk.hw=%s,%d,%d,%d\n", nm, (int) stk, (int) used, (int) fr);
+    }
+    uint32_t sc[8];
+    _r6api_counts(sc);
+    lp_printf(b, "scr.cnt=%d,%d,%d,%d,%d,%d,%d,%d\n", (int) sc[0], (int) sc[1], (int) sc[2], (int) sc[3], (int) sc[4], (int) sc[5], (int) sc[6], (int) sc[7]);
+    lp_printf(b, "# scr.org[i]=t,task(1 GUI,2 menu,3 lua,4 iv),org(1 key,2 fake,3 script),cmd,arg,res\n");
+    struct r6api_org og;
+    int no = _r6api_org_ring(0, &og);
+    for (int i = 0; i < no; i++)
+    {
+        _r6api_org_ring(i, &og);
+        lp_printf(b, "scr.org[%d]=%d,%d,%d,%d,%d,%d\n", i, (int) og.t, og.task, og.org, og.cmd, (int) og.arg, (int) og.res);
+    }
+    const struct r6_iv_scr_cnt * j = _r6iv_scr_counts();
+    lp_printf(b, "scr.job=%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,ph%d\n", (int) j->posted, (int) j->taken, (int) j->cancelled, (int) j->abandoned,
+        (int) j->expired, (int) j->busy, (int) j->late, (int) j->intent_wait, (int) _r6api_ast_ref(), (int) j->done, (int) j->refused, _r6iv_scr_phase());
+    lp_printf(b, "# scr.shot[i]=seq,gen,t_req,t_done,res,async,cancelled,tv,fn; scr.tv[i]=t,base,want,res,lock,calls,phase_end\n");
+    struct r6_iv_scr_shot sh;
+    int ns = _r6iv_scr_shot_ring(0, &sh);
+    for (int i = 0; i < ns; i++)
+    {
+        _r6iv_scr_shot_ring(i, &sh);
+        lp_printf(b, "scr.shot[%d]=%d,%d,%d,%d,%d,%d,%d,0x%04x,%d\n", i, (int) sh.seq, (int) sh.gen, (int) sh.t_req, (int) sh.t_done, (int) sh.res,
+            sh.async, sh.cancelled, sh.tv & 0xFFFF, (int) sh.fn);
+    }
+    struct r6_iv_scr_tv tv;
+    int nt = _r6iv_scr_tv_ring(0, &tv);
+    for (int i = 0; i < nt; i++)
+    {
+        _r6iv_scr_tv_ring(i, &tv);
+        lp_printf(b, "scr.tv[%d]=%d,0x%04x,0x%04x,0x%x,%d,%d,%d\n", i, (int) tv.t, tv.base & 0xFFFF, tv.want & 0xFFFF, (int) tv.res, tv.lock,
+            tv.calls, tv.phase_end);
+    }
+    lp_printf(b, "scr.tvw=%d,%d\n", _r6api_tvw_end(), _r6iv_tvw_on());
+}
+#endif
+
 /* M12.0 (spec m12/m120 4.3 step 2, Rev. 2 F9): the capture of a snapshot, both modes. Reads only: no card access, no
  * notice, no beep, no redraw, no XimrExe, no winsys_sem (gate_m120_ro.sh checks its call tree in the ELF); MMIO only
  * through r6_astro_ast's probe read and only while "Display regs" is ON. ettr.file / astro carry "?????" placeholders,
@@ -3578,6 +3695,9 @@ static void __attribute__((noinline)) lp_capture(struct lp_buf * b, struct lp_bu
             r6_ettr_mode() ? r6_ettr_stats()->adv.st : R6ETT_S_NONE);
         lp_ph_ett = b->trunc ? -1 : off;
     }
+#endif
+#ifdef CONFIG_R6_SCRIPT
+    lp_scr_log(b);                        /* M16.1 (spec m16/m161 11): modules, task model, Lua, the script jobs */
 #endif
 #ifdef CONFIG_R6_ASTRO
     /* M12.0 (spec 4.1 / 4.2): the AST text (its fresh probe read) and the main log line from the same read */
@@ -3782,6 +3902,7 @@ int lvprobe_snapshot_run(int delay_ms)
 {
     if (lp_snap_busy) return 0;
     lp_snap_busy = 1;
+    IV_SCR(r6_barrier();)                 /* M16.1 (SL-5): set before r6_iv_task's check of it is seen */
 #ifdef CONFIG_R6_SNAPMEM
     lp_snap_kind = 0;
 #endif
@@ -3801,6 +3922,11 @@ static void lp_snapshot_task(int unused)
 {
 #ifdef CONFIG_R6_INTERVAL
     msleep(4000);            /* menu closed; user shows the LV screen */
+#ifdef CONFIG_R6_IV_SCRIPT
+    if (_r6iv_scr_busy())    /* M16.1 (spec m16/m161 2.6, A21): never in a script job (Tv window, picture) */
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "skipped (script)");
+    else
+#endif
     if (r6_iv_running())     /* M8.0: no card write while a series runs */
         snprintf(lp_snap_msg, sizeof(lp_snap_msg), "skipped (interval)");
 #ifdef CONFIG_R6_ETTR
@@ -3822,6 +3948,11 @@ static void lp_snapdelay_task(int unused)
 {
     int d = LP_DELAY_MS - (get_ms_clock() - lp_t_sel);
     if (d > 0) msleep(d);
+#ifdef CONFIG_R6_IV_SCRIPT
+    if (_r6iv_scr_busy())    /* M16.1 (2.6, A21) */
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "skipped (script)");
+    else
+#endif
     if (r6_iv_running())
         snprintf(lp_snap_msg, sizeof(lp_snap_msg), "skipped (interval)");
     else if (r6_ettr_busy())
@@ -3887,6 +4018,16 @@ static void __attribute__((noinline)) lp_snap_start(int delayed)
 #endif
         return;
     }
+#ifdef CONFIG_R6_SCRIPT
+    if (!ok)                              /* M16.1 (spec m16/m161 8.2 C16): unknown: no task (the M14.1b way only without scripts) */
+    {
+        lp_snap_res = LP_SR_NOTASK;
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "task memory unknown, try again");
+        lp_snap_busy = 0;
+        if (r6lk) r6tk_unlock();
+        return;
+    }
+#endif
 #ifdef CONFIG_R6_MODSUP
     if (r6busy)                           /* review R1-04: the lock is held by a wrapper creator (see above) */
     {
@@ -4168,7 +4309,19 @@ void lvprobe_status_enable(int mode)
     if ((lp_status_on || lp_x_on) && !lp_status_task_started)     /* M9.1: also for the expo log alone */
     {
         lp_status_task_started = 1;
+#ifdef CONFIG_R6_SCRIPT
+        /* M16.1 (spec m16/m161 8.2 Ue5): through the wrapper (Canon's task memory checked right before task_create); refused: a
+         * hint, the line stays OFF, the menu stays usable */
+        if (r6_task_try_create("lvprobe_status", 0x1e, 0x2000, (void *) lp_status_task, 0) == R6TK_REFUSED)
+        {
+            lp_status_task_started = 0;
+            lp_status_on = 0;
+            lp_x_on = 0;
+            NotifyBox(2000, "Status line: no task memory");
+        }
+#else
         task_create("lvprobe_status", 0x1e, 0x2000, lp_status_task, 0);
+#endif
     }
 }
 
@@ -4184,7 +4337,10 @@ void lvprobe_expo_enable(int on)
 #ifdef CONFIG_R6_ETTR
 /* M11.0: R6 ETTR samples FaceYuv 2 x 2 only while the Expo log is ON (docs/m11_plan.md 2.1) */
 int lvprobe_expo_on(void) { return lp_x_on; }
-/* M11.1: "Apply once" is refused while a log snapshot runs or waits (spec m11/m111 2.2 point 6, 3.11) */
+#endif
+#if defined(CONFIG_R6_ETTR) || defined(CONFIG_R6_IV_SCRIPT)
+/* M11.1: "Apply once" is refused while a log snapshot runs or waits (spec m11/m111 2.2 point 6, 3.11); M16.1 (V2a-7): the script
+ * jobs as well */
 int lvprobe_snapshot_busy(void) { return lp_snap_busy; }
 #endif
 
@@ -4245,6 +4401,13 @@ static MENU_SELECT_FUNC(lp_snapshot_select)
         return;
     }
 #ifdef CONFIG_R6_INTERVAL
+#ifdef CONFIG_R6_IV_SCRIPT
+    if (_r6iv_scr_busy())    /* M16.1 (2.6, A21) */
+    {
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "script job running");
+        return;
+    }
+#endif
     if (r6_iv_running())     /* M8.0: no card write while a series runs */
     {
         snprintf(lp_snap_msg, sizeof(lp_snap_msg), "interval running");
@@ -4259,6 +4422,7 @@ static MENU_SELECT_FUNC(lp_snapshot_select)
     }
 #endif
     lp_snap_busy = 1;
+    IV_SCR(r6_barrier();)                 /* M16.1 (SL-5) */
     snprintf(lp_snap_msg, sizeof(lp_snap_msg), "starting");
 #ifdef CONFIG_R6_SNAPMEM
     lp_snap_start(0);                     /* M14.1b (spec 4) */
@@ -4281,6 +4445,13 @@ static MENU_SELECT_FUNC(lp_snapdelay_select)
         snprintf(lp_snap_msg, sizeof(lp_snap_msg), "busy");
         return;
     }
+#ifdef CONFIG_R6_IV_SCRIPT
+    if (_r6iv_scr_busy())    /* M16.1 (2.6, A21) */
+    {
+        snprintf(lp_snap_msg, sizeof(lp_snap_msg), "script job running");
+        return;
+    }
+#endif
     if (r6_iv_running())
     {
         snprintf(lp_snap_msg, sizeof(lp_snap_msg), "interval running");
@@ -4292,6 +4463,7 @@ static MENU_SELECT_FUNC(lp_snapdelay_select)
         return;
     }
     lp_snap_busy = 1;
+    IV_SCR(r6_barrier();)                 /* M16.1 (SL-5) */
     lp_t_sel = get_ms_clock();
     snprintf(lp_snap_msg, sizeof(lp_snap_msg), "starting (10 s)");
 #ifdef CONFIG_R6_SNAPMEM

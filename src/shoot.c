@@ -56,6 +56,9 @@
 #include "battery.h"
 #include "tskmon.h"
 #include "module.h"
+#ifdef CONFIG_R6_SCRIPT
+#include "r6_api.h"                      /* R6.190 M16.1: take_a_pic -> the script job "picture" of r6_iv_task, the seconds hook */
+#endif
 
 static struct recursive_lock * shoot_task_rlock = NULL;
 
@@ -431,6 +434,9 @@ seconds_clock_task( void* unused )
         {
 #if defined(CONFIG_MODULES)
             module_exec_cbr(CBR_SECONDS_CLOCK);
+#endif
+#ifdef CONFIG_R6_SCRIPT
+            _r6api_second();             /* R6.190 M16.1 (spec m16/m161 7.1): CBR_INTERVALOMETER / CBR_POST_SHOOT */
 #endif
             do_this_every_second();
             prev_s_clock = seconds_clock;
@@ -2716,6 +2722,11 @@ int set_drive_single()
 int
 bulb_take_pic(int duration)
 {
+#ifdef CONFIG_R6_SCRIPT
+    /* R6.190 M16.1 (spec m16/m161 3.1, A11, SB-13): the second bolt; scripts use camera.bulb (Canon's bulb timer, D1) */
+    printf("[R6] no Release (M8.0b); use take_a_pic\n");
+    return 1;
+#endif
     AcquireRecursiveLock(shoot_task_rlock, 0);
 
     int canceled = 0;
@@ -4352,6 +4363,12 @@ void interval_create_script(int f0)
 // returns zero if successful, nonzero otherwise (user canceled, module error, etc)
 int take_a_pic(int should_af)
 {
+#ifdef CONFIG_R6_SCRIPT
+    /* R6.190 M16.1 (spec m16/m161 3.1, E5): every picture of the core and of scripts goes to r6_iv_task (the script job
+     * "picture": every Interval check, the two shutter callbacks); never call("Release") (the M8.0b hang); shoot_task_rlock is
+     * not held, no lens_wait_readytotakepic, CBR_CUSTOM_PICTURE_TAKING never fires on the R6. gen 0: the core */
+    return r6_take_a_pic_ex(0, should_af, 0, NULL, NULL, 0);
+#endif
     AcquireRecursiveLock(shoot_task_rlock, 0);
 
     int canceled = 0;

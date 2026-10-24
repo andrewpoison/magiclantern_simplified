@@ -37,6 +37,11 @@ static unsigned property_list[256];
 #ifdef CONFIG_R6_MODSUP
 static int r6_prop_full = 0;           /* M16.0 (spec m16/m160 5.4): handlers refused, the tables full */
 #endif
+#ifdef CONFIG_R6_SCRIPT
+static int __attribute__((section(".bss"))) r6_prop_nreg = 0;   /* own anchor block: the old offsets stay (G4b) */
+                                       /* M16.1 (spec m16/m161 7.4): property_list[0 .. r6_prop_nreg) went to Canon's one
+                                        * prop_register_slave (the R6 has no CONFIG_UNREGISTER_PROP: later ids are never delivered) */
+#endif
 
 /* the token is needed for unregistering handlers and property cleanup */
 static void global_token_handler(void * token)
@@ -183,6 +188,9 @@ prop_register_handlers()
 {
     if (global_token == NULL)
     {
+#ifdef CONFIG_R6_SCRIPT
+        r6_prop_nreg = actual_num_properties;   /* M16.1 (7.4): what Canon gets now */
+#endif
         prop_register_slave(
             property_list,
             actual_num_properties,
@@ -192,6 +200,26 @@ prop_register_handlers()
         );
     }
 }
+
+#ifdef CONFIG_R6_SCRIPT
+/* R6.190 M16.1 (spec m16/m161 7.4; rule 12 unchanged, K7 in M16.2): a handler on id can fire only if Canon delivers id:
+ * 2 = in prop_handler_deny (never added), 3 = prop_add_handler would refuse it now (the tables are full, M16.0 5.4; R2-09),
+ * 1 = registered at start, 0 = not registered (its handler is added and never fires) */
+int _r6_prop_state(uint32_t id)
+{
+#ifdef CONFIG_DIGIC_678X
+    for (uint32_t i = 0; i < sizeof(prop_handler_deny) / sizeof(*prop_handler_deny); i++)
+        if (prop_handler_deny[i] == id) return 2;
+#endif
+    int dup = 0;
+    for (int i = 0; i < actual_num_properties && i < (int) COUNT(property_list); i++)
+        if (property_list[i] == id) { dup = 1; break; }
+    if (actual_num_handlers >= (int) COUNT(property_handlers) || (!dup && actual_num_properties >= (int) COUNT(property_list))) return 3;
+    for (int i = 0; i < r6_prop_nreg && i < (int) COUNT(property_list); i++)
+        if (property_list[i] == id) return 1;
+    return 0;
+}
+#endif
 
 /* reset handler setup to the state after startup */
 void

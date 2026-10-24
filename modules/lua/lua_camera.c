@@ -17,6 +17,9 @@
 #include <zebra.h>
 
 #include "lua_common.h"
+#ifdef CONFIG_R6_LUA
+#include "lua_r6.h"             /* M16.1 (spec m16/m161 3.4, 4.1, 4.5, 6.1): the core facade r6_api_abi.h */
+#endif
 
 static int luaCB_shutter_index(lua_State * L);
 static int luaCB_shutter_newindex(lua_State * L);
@@ -98,6 +101,75 @@ static const char * lua_camera_gui_fields[] =
     "idle",
     NULL
 };
+
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 4.5): Canon's own Tv / Av / Sv / compensation (Code768, the settings sheet of r6_script_expo) as ML raw
+ * values (2.4); not readable: lens_info as upstream, one console line per script */
+static int lua_r6_expo_raw(lua_State * L, int what)
+{
+    struct r6_expo e;
+    if (r6_script_expo(&e))
+    {
+        if (what == 0) return r6_c768_to_raw(e.tv, 56);
+        if (what == 1) return e.sv ? r6_c768_to_raw(e.sv - 3840, 72) : 0;
+        return r6_c768_to_raw(e.comp, 0);
+    }
+    if (lua_r6_once(L, LUA_R6_ONCE_EXPO)) printf("[%s] camera: Canon's exposure values not readable, lens_info used\n", lua_get_script_filename(L));
+    return what == 0 ? lens_info.raw_shutter : what == 1 ? lens_info.raw_iso : lens_info.ae;
+}
+
+/* 4.1 / 2.4: the Code768 of a shutter assignment (raw: 1/3 grid; apex / ms / value: the nearest third, no clamping); window
+ * 1/8000 .. 30 s; the errors come from here (no job) */
+static int lua_r6_tv_code(lua_State * L, const char * key, int * c)
+{
+    if (!strcmp(key, "raw"))
+    {
+        LUA_PARAM_INT(value, 3);
+        int k = r6_raw_to_c768(value, 56, c);
+        if (k == 1) return luaL_error(L, "set 'camera.shutter.raw' failed: 1/2 step");
+        if (k) return luaL_error(L, "set 'camera.shutter.raw' failed: not on the 1/3 grid");
+    }
+    else
+    {
+        LUA_PARAM_NUMBER(value, 3);
+        float apex = value;
+        if (strcmp(key, "apex"))
+        {
+            float t = !strcmp(key, "ms") ? value / 1000.0f : value;
+            if (!(t > 0)) return luaL_error(L, "set 'camera.shutter.%s' failed: outside 1/8000 .. 30 s", key);
+            apex = -log2f(t);
+        }
+        /* review R1-5: lua.mo is built with -ffast-math (isnan / isfinite fold away, !(t > 0) lets NaN through): NaN and inf by their
+         * bits, then the range as a float before roundf (a huge value saturates or wraps into the window as an int) */
+        uint32_t bits;
+        memcpy(&bits, &apex, sizeof(bits));
+        if ((bits & 0x7F800000u) == 0x7F800000u || !(apex > -5.2f && apex < 13.2f))
+            return luaL_error(L, "set 'camera.shutter.%s' failed: outside 1/8000 .. 30 s", key);
+        *c = (int) roundf(apex * 3.0f) * 256;
+    }
+    if (*c < -3840 || *c > 9984) return luaL_error(L, "set 'camera.shutter.%s' failed: outside 1/8000 .. 30 s", key);
+    return 0;
+}
+
+/* 4.1: a Tv assignment through the facade (a job "Tv" of r6_iv_task, Tor 1 context "script"), with 2.7 */
+static int lua_r6_tv_set(lua_State * L, const char * key)
+{
+    int c = 0;
+    lua_r6_tv_code(L, key, &c);
+    struct lua_r6_call k = { .op = LR6_TV, .a = c };
+    int r = lua_r6_do(L, &k);
+    if (r == R6API_OK) return 0;
+    if (r == (R6API_TV_RES | R6API_TV_R_TOOK_OVER)) return luaL_error(L, "Tv changed by user (your value stays)");
+    if (r == (R6API_TV_LOCK | R6API_TV_L_OFF)) return luaL_error(L, "Tv writes: off (menu.set(\"Interval\", \"Tv writes\", \"ON\"))");
+    return luaL_error(L, "set 'camera.shutter.%s' failed: %s", key, k.why);
+}
+
+/* 7.3: setters without an analysed R6 way */
+static int lua_r6_m162(lua_State * L, const char * name)
+{
+    return luaL_error(L, "%s: not analysed yet (M16.2)", name);
+}
+#endif
 
 static int luaCB_camera_index(lua_State * L)
 {
@@ -247,7 +319,17 @@ static int luaCB_camera_index(lua_State * L)
     ///
     /// TODO: Celsius.
     // @tfield int temperature readonly
+#ifdef CONFIG_R6_LUA
+    /* M16.1 (spec m16/m161 7.2): TempSvc sensor A in degC as Canon rounds it for EXIF; no valid value: nil */
+    else if(!strcmp(key, "temperature"))
+    {
+        int dc = 0;
+        if (r6_script_temp(&dc)) lua_pushnumber(L, dc / 10.0);
+        else lua_pushnil(L);
+    }
+#else
     else if(!strcmp(key, "temperature")) lua_pushinteger(L, efic_temp);
+#endif
     /// Gets a @{gui} object that controls Canon GUI state (PLAY, MENU, QR, various dialogs)
     // @tfield gui gui
     else if(!strcmp(key, "gui"))
@@ -272,6 +354,17 @@ static int luaCB_camera_newindex(lua_State * L)
 {
     LUA_PARAM_STRING_OPTIONAL(key, 2, "");
     int status = 1;
+#ifdef CONFIG_R6_LUA
+    /* M16.1 (spec m16/m161 4.1, 7.3): camera.shutter = seconds through the facade; the other setters are not analysed yet */
+    if (!strcmp(key, "shutter")) return lua_r6_tv_set(L, "value");
+    if (!strcmp(key, "aperture") || !strcmp(key, "iso") || !strcmp(key, "ec") || !strcmp(key, "flash") || !strcmp(key, "flash_ec")
+        || !strcmp(key, "kelvin"))
+    {
+        char n[24];
+        snprintf(n, sizeof(n), "camera.%s", key);
+        return lua_r6_m162(L, n);
+    }
+#endif
     
     if(!strcmp(key, "shutter"))
     {
@@ -333,6 +426,20 @@ static int luaCB_camera_newindex(lua_State * L)
  @tparam[opt=false] bool should_af whether or not to use autofocus.
  @function shoot
  */
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 3.4): a job "picture" of r6_iv_task (the Interval way, its checks); AF true is refused (K5); from a GUI
+ * task queued (2000, r6.last_shot). Returns code, text, seq (SL-13) */
+static int luaCB_camera_shoot(lua_State * L)
+{
+    LUA_PARAM_BOOL_OPTIONAL(should_af, 1, 0);
+    struct lua_r6_call k = { .op = LR6_SHOOT, .a = should_af ? AF_ENABLE : AF_DISABLE };
+    int r = lua_r6_do(L, &k);
+    lua_pushinteger(L, r);
+    lua_pushstring(L, k.why);
+    lua_pushinteger(L, k.seq);
+    return 3;
+}
+#else
 static int luaCB_camera_shoot(lua_State * L)
 {
     LUA_PARAM_BOOL_OPTIONAL(should_af, 1, 0);
@@ -340,6 +447,7 @@ static int luaCB_camera_shoot(lua_State * L)
     lua_pushinteger(L, result);
     return 1;
 }
+#endif
 
 /***
  Wait until the camera is idle (not processing pictures).
@@ -348,6 +456,17 @@ static int luaCB_camera_shoot(lua_State * L)
  while image compression and saving happen in background.
  @function wait
  */
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 3.4): until no script job, no ML picture and Canon's job counter 0, at most 60 s (2.7); a GUI task: error */
+static int luaCB_camera_wait(lua_State * L)
+{
+    struct lua_r6_call k = { .op = LR6_WAITJOBS, .a = 60000 };
+    int r = lua_r6_do(L, &k);
+    if (r == R6API_TIMEOUT) return luaL_error(L, "camera.wait: timeout (60 s)");
+    if (r) return luaL_error(L, "camera.wait: not from a GUI task (use task.create)");
+    return 0;
+}
+#else
 static int luaCB_camera_wait(lua_State * L)
 {
     while (lens_info.job_state) {
@@ -355,6 +474,7 @@ static int luaCB_camera_wait(lua_State * L)
     }
     return 0;
 }
+#endif
 
 /***
  Take N pictures in burst mode.
@@ -365,29 +485,65 @@ static int luaCB_camera_wait(lua_State * L)
  @tparam int num_pictures how many pictures to take.
  @function burst
  */
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 3.4): n script pictures, about 1 per second, stop at the first code != 0; returns made, code, text */
+static int luaCB_camera_burst(lua_State * L)
+{
+    LUA_PARAM_INT(num_pictures, 1);
+    struct lua_r6_call k = { .op = LR6_BURST, .a = num_pictures };
+    int r = lua_r6_do(L, &k);
+    lua_pushinteger(L, k.done);
+    lua_pushinteger(L, r);
+    lua_pushstring(L, k.why);
+    return 3;
+}
+#else
 static int luaCB_camera_burst(lua_State * L)
 {
     LUA_PARAM_INT(num_pictures, 1);
     take_fast_pictures(num_pictures);
     return 0;
 }
+#endif
 
 /***
  Take a picture in bulb mode.
  @tparam float duration bulb duration in seconds.
  @function bulb
  */
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 3.4): only in B with Canon's bulb timer = duration (+- 0.5 s, 31 s .. 30 min), the D1 way of M9.2;
+ * returns code, text */
+static int luaCB_camera_bulb(lua_State * L)
+{
+    LUA_PARAM_NUMBER(duration, 1);
+    struct lua_r6_call k = { .op = LR6_BULB, .a = (int) roundf(duration) };
+    int r = lua_r6_do(L, &k);
+    if (r == R6API_ARG) return luaL_error(L, "camera.bulb: %s", k.why);
+    lua_pushinteger(L, r);
+    lua_pushstring(L, k.why);
+    return 2;
+}
+#else
 static int luaCB_camera_bulb(lua_State * L)
 {
     LUA_PARAM_NUMBER(duration, 1);
     bulb_take_pic(duration * 1000);
     return 0;
 }
+#endif
 
 /***
  Restart the camera.
  @function reboot
  */
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 7.3, K6): not analysed yet */
+static int luaCB_camera_reboot(lua_State * L)
+{
+    return lua_r6_m162(L, "camera.reboot");
+}
+#else
 static int luaCB_camera_reboot(lua_State * L)
 {
     int reboot = 0;
@@ -396,10 +552,25 @@ static int luaCB_camera_reboot(lua_State * L)
 
     /* shutdown is probably done in a similar way, but I had no success with nearby properties */
 }
+#endif
 
 /// Represents the camera's shutter speed setting
 //@type shutter
 
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 4.5): Canon's Tv (Code768) as the ML raw value */
+static int luaCB_shutter_index(lua_State * L)
+{
+    LUA_PARAM_STRING_OPTIONAL(key, 2, "");
+    if (strcmp(key, "raw") && strcmp(key, "apex") && strcmp(key, "ms") && strcmp(key, "value")) { lua_rawget(L, 1); return 1; }
+    int raw = lua_r6_expo_raw(L, 0);
+    if(!strcmp(key,"raw")) lua_pushinteger(L, raw);
+    else if(!strcmp(key,"apex")) lua_pushnumber(L, (APEX1000_RAW2TV(raw)/1000.0));
+    else if(!strcmp(key,"ms")) lua_pushinteger(L, raw2shutter_ms(raw));
+    else lua_pushnumber(L, raw2shutterf(raw));
+    return 1;
+}
+#else
 static int luaCB_shutter_index(lua_State * L)
 {
     LUA_PARAM_STRING_OPTIONAL(key, 2, "");
@@ -418,10 +589,23 @@ static int luaCB_shutter_index(lua_State * L)
     else lua_rawget(L, 1);
     return 1;
 }
+#endif
 
 /// Pretty prints the current shutter speed as a string.
 //@treturn string
 //@function __tostring
+#ifdef CONFIG_R6_LUA
+static int luaCB_shutter_tostring(lua_State * L)
+{
+    int raw = lua_r6_expo_raw(L, 0);
+    char s[16];
+    int old = cli();
+    snprintf(s, sizeof(s), "%s", lens_format_shutter(raw));
+    sei(old);
+    lua_pushstring(L, s);
+    return 1;
+}
+#else
 static int luaCB_shutter_tostring(lua_State * L)
 {
     int old = cli();
@@ -429,7 +613,18 @@ static int luaCB_shutter_tostring(lua_State * L)
     sei(old);
     return 1;
 }
+#endif
 
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 4.1): raw / apex / ms / value through the facade (Tor 1 context "script") */
+static int luaCB_shutter_newindex(lua_State * L)
+{
+    LUA_PARAM_STRING_OPTIONAL(key, 2, "");
+    if (!strcmp(key, "raw") || !strcmp(key, "apex") || !strcmp(key, "ms") || !strcmp(key, "value")) return lua_r6_tv_set(L, key);
+    lua_rawset(L, 1);
+    return 0;
+}
+#else
 static int luaCB_shutter_newindex(lua_State * L)
 {
     LUA_PARAM_STRING_OPTIONAL(key, 2, "");
@@ -465,6 +660,7 @@ static int luaCB_shutter_newindex(lua_State * L)
     if(!status) return luaL_error(L, "set 'camera.shutter.%s' failed", key);
     return 0;
 }
+#endif
 
 /// Represents the lens's aperture.
 //@type aperture
@@ -576,6 +772,15 @@ static int luaCB_max_aperture_tostring(lua_State * L)
     return 1;
 }
 
+#ifdef CONFIG_R6_LUA
+static int luaCB_aperture_newindex(lua_State * L)
+{
+    LUA_PARAM_STRING_OPTIONAL(key, 2, "");
+    if (!strcmp(key, "raw") || !strcmp(key, "apex") || !strcmp(key, "value")) return lua_r6_m162(L, "camera.aperture");
+    lua_rawset(L, 1);
+    return 0;
+}
+#else
 static int luaCB_aperture_newindex(lua_State * L)
 {
     LUA_PARAM_STRING_OPTIONAL(key, 2, "");
@@ -609,10 +814,24 @@ static int luaCB_aperture_newindex(lua_State * L)
     if(!status) return luaL_error(L, "set 'camera.aperture.%s' failed", key);
     return 0;
 }
+#endif
 
 /// Represents the camera ISO.
 //@type iso
 
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 4.5): Canon's Sv (Code768) as the ML raw value */
+static int luaCB_iso_index(lua_State * L)
+{
+    LUA_PARAM_STRING_OPTIONAL(key, 2, "");
+    if (strcmp(key, "raw") && strcmp(key, "apex") && strcmp(key, "value")) { lua_rawget(L, 1); return 1; }
+    int raw = lua_r6_expo_raw(L, 1);
+    if(!strcmp(key,"raw")) lua_pushinteger(L, raw);
+    else if(!strcmp(key,"apex")) lua_pushnumber(L, (APEX1000_RAW2SV(raw) / 1000.0));
+    else lua_pushinteger(L, raw2iso(raw));
+    return 1;
+}
+#else
 static int luaCB_iso_index(lua_State * L)
 {
     LUA_PARAM_STRING_OPTIONAL(key, 2, "");
@@ -628,10 +847,23 @@ static int luaCB_iso_index(lua_State * L)
     else lua_rawget(L, 1);
     return 1;
 }
+#endif
 
 /// Pretty prints the current ISO as a string.
 //@treturn string
 //@function __tostring
+#ifdef CONFIG_R6_LUA
+static int luaCB_iso_tostring(lua_State * L)
+{
+    int raw = lua_r6_expo_raw(L, 1);
+    char s[16];
+    int old = cli();
+    snprintf(s, sizeof(s), "%s", lens_format_iso(raw));
+    sei(old);
+    lua_pushstring(L, s);
+    return 1;
+}
+#else
 static int luaCB_iso_tostring(lua_State * L)
 {
     int old = cli();
@@ -639,7 +871,17 @@ static int luaCB_iso_tostring(lua_State * L)
     sei(old);
     return 1;
 }
+#endif
 
+#ifdef CONFIG_R6_LUA
+static int luaCB_iso_newindex(lua_State * L)
+{
+    LUA_PARAM_STRING_OPTIONAL(key, 2, "");
+    if (!strcmp(key, "raw") || !strcmp(key, "apex") || !strcmp(key, "value")) return lua_r6_m162(L, "camera.iso");
+    lua_rawset(L, 1);
+    return 0;
+}
+#else
 static int luaCB_iso_newindex(lua_State * L)
 {
     LUA_PARAM_STRING_OPTIONAL(key, 2, "");
@@ -667,10 +909,23 @@ static int luaCB_iso_newindex(lua_State * L)
     if(!status) return luaL_error(L, "set 'camera.iso.%s' failed", key);
     return 0;
 }
+#endif
 
 /// Represents the exposure compensation.
 //@type ec
 
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 4.5): Canon's compensation (Code768) as the ML raw value */
+static int luaCB_ec_index(lua_State * L)
+{
+    LUA_PARAM_STRING_OPTIONAL(key, 2, "");
+    if (strcmp(key, "raw") && strcmp(key, "value")) { lua_rawget(L, 1); return 1; }
+    int raw = lua_r6_expo_raw(L, 2);
+    if(!strcmp(key,"raw")) lua_pushinteger(L, raw);
+    else lua_pushnumber(L, APEX1000_RAW2EC(raw) / 1000.0);
+    return 1;
+}
+#else
 static int luaCB_ec_index(lua_State * L)
 {
     LUA_PARAM_STRING_OPTIONAL(key, 2, "");
@@ -684,17 +939,34 @@ static int luaCB_ec_index(lua_State * L)
     return 1;
     
 }
+#endif
 
 /// Pretty prints the exposure compensation as a string.
 //@treturn string
 //@function __tostring
+#ifdef CONFIG_R6_LUA
+static int luaCB_ec_tostring(lua_State * L)
+{
+    int ec = APEX10_RAW2EC(lua_r6_expo_raw(L, 2));
+#else
 static int luaCB_ec_tostring(lua_State * L)
 {
     int ec = APEX10_RAW2EC(lens_info.ae);
+#endif
+
     lua_pushfstring(L, "%s%d.%d", FMT_FIXEDPOINT1(ec));
     return 1;
 }
 
+#ifdef CONFIG_R6_LUA
+static int luaCB_ec_newindex(lua_State * L)
+{
+    LUA_PARAM_STRING_OPTIONAL(key, 2, "");
+    if (!strcmp(key, "raw") || !strcmp(key, "value")) return lua_r6_m162(L, "camera.ec");
+    lua_rawset(L, 1);
+    return 0;
+}
+#else
 static int luaCB_ec_newindex(lua_State * L)
 {
     LUA_PARAM_STRING_OPTIONAL(key, 2, "");
@@ -716,6 +988,7 @@ static int luaCB_ec_newindex(lua_State * L)
     if(!status) return luaL_error(L, "set 'camera.ec.%s' failed", key);
     return 0;
 }
+#endif
 
 static int luaCB_fec_index(lua_State * L)
 {
@@ -734,6 +1007,15 @@ static int luaCB_fec_tostring(lua_State * L)
     return 1;
 }
 
+#ifdef CONFIG_R6_LUA
+static int luaCB_fec_newindex(lua_State * L)
+{
+    LUA_PARAM_STRING_OPTIONAL(key, 2, "");
+    if (!strcmp(key, "raw") || !strcmp(key, "value")) return lua_r6_m162(L, "camera.flash_ec");
+    lua_rawset(L, 1);
+    return 0;
+}
+#else
 static int luaCB_fec_newindex(lua_State * L)
 {
     LUA_PARAM_STRING_OPTIONAL(key, 2, "");
@@ -755,6 +1037,7 @@ static int luaCB_fec_newindex(lua_State * L)
     if(!status) return luaL_error(L, "set 'camera.fec.%s' failed", key);
     return 0;
 }
+#endif
 
 /// Canon GUI controls (PLAY, MENU, QR and so on) 
 //@type gui
@@ -820,6 +1103,21 @@ static int luaCB_gui_tostring(lua_State * L)
     return 0;
 }
 
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 6.1): SetGUIRequestMode through the facade (the intent mark, the settle time, 2.7; GUI tasks: error) */
+static int luaCB_gui_newindex(lua_State * L)
+{
+    LUA_PARAM_STRING_OPTIONAL(key, 2, "");
+    int op = -1, v = 0;
+    if (!strcmp(key, "mode")) { LUA_PARAM_INT(value, 3); op = R6SG_MODE; v = value; }
+    else if (!strcmp(key, "play")) { LUA_PARAM_BOOL(value, 3); op = R6SG_PLAY; v = value; }
+    else if (!strcmp(key, "menu")) { LUA_PARAM_BOOL(value, 3); op = R6SG_MENU; v = value; }
+    if (op < 0) return 0;
+    struct lua_r6_call k = { .op = LR6_GUI, .a = op, .b = v };
+    if (lua_r6_do(L, &k)) return luaL_error(L, "set 'camera.gui.%s' failed: %s", key, k.why);
+    return 0;
+}
+#else
 static int luaCB_gui_newindex(lua_State * L)
 {
     LUA_PARAM_STRING_OPTIONAL(key, 2, "");
@@ -848,6 +1146,7 @@ static int luaCB_gui_newindex(lua_State * L)
     if(!status) return luaL_error(L, "set 'camera.gui.%s' failed", key);
     return 0;
 }
+#endif
 
 static const char * lua_camera_fields[] =
 {

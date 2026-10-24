@@ -143,7 +143,9 @@
  * user's Tv is restored after every bracket (only while Canon's Tv is still ML's value); a marker file
  * ML/SETTINGS/R6TV.LCK while ML's value may be set, with a notice and "Tv back to ..." at the next start; main switch
  * "Tv writes" saved, default OFF; never a write at startup. CONFIG_PROP_REQUEST_CHANGE stays undefined and
- * prop_write_allow[] stays empty; nothing of the write path is exported to modules or Lua. */
+ * prop_write_allow[] stays empty; nothing of the write path is exported to modules or Lua. M16.1 (rule 24): Lua reaches
+ * Tv only through the facade r6_api.c (script job "Tv", command 8 of r6_iv_task, CONFIG_R6_PW_SCRIPT below); an autorun
+ * script can write after the boot check (row 2); the write path itself stays unexported. */
 #define CONFIG_R6_PROPW_TV
 
 /* M9.1: Overlay > "Grids & masks" (r6_grid.c, docs/m9_plan.md 1.3): thirds /
@@ -249,6 +251,31 @@
  * limits and fault hook, the stack rest of the running task, NULL checks of the module loader, a bound of the property handler
  * table. No Canon write, no new Canon address, no new stub. Needs CONFIG_R6_TASKMEM. */
 #define CONFIG_R6_MODSUP
+
+/* R6.190 M16.1 (plan docs/m16_plan.md M16.1, rules 1..27 and K1..K9 confirmed 2026-10-18, K3 answer F1 (a) 2026-10-23; spec
+ * m16/m161 spec_m161.md Rev. 2a 1.3): Lua with camera control, only through the camera-tested R6 paths.
+ *  CONFIG_R6_PW_SCRIPT  Tor 1's write context "script" (r6_propw.c / .h): R6PW_CTX_SCRIPT 5, R6PW_K_SCRIPT 8, at most 2 calls per
+ *                       assignment, row 44 for scripts too ("your dial turn wins"), the commit _r6pw_commit_script; r6pw_post and
+ *                       _r6pw_commit unchanged. Off: r6_propw token-equal to M16.0.
+ *  CONFIG_R6_IV_SCRIPT  the script jobs of r6_iv_task (r6_interval.c / .h): job "picture" (command 7: iv_begin with every Interval
+ *                       check, iv_shoot through CC_SW1 / CC_SW2 only) and job "Tv" (command 8: the runner of Tor 1's context
+ *                       "script"), one slot with a seq|state word and CAS, the intent mark against the GUI race, R-14 for Tv.
+ *  CONFIG_R6_SCRIPT     the facade r6_api.c (R6 menu commands in GuiMainTask with an origin mark, menu.set fail-closed, the Astro
+ *                       hulls with the start check, E8 in the caller's task), the hooks in src/ (take_a_pic, the second bolt
+ *                       against call("Release"), menu.set fallback, the origin mark, property state), the LVP lines.
+ * No new Canon address, no new stub; SetGUIRequestMode / gui_enqueue_message (GUI_Control) from the facade (rule 2, 11). */
+#define CONFIG_R6_PW_SCRIPT
+#define CONFIG_R6_IV_SCRIPT
+#define CONFIG_R6_SCRIPT
+#if defined(CONFIG_R6_PW_SCRIPT) && !defined(CONFIG_R6_PROPW_TV)
+#error "M16.1: CONFIG_R6_PW_SCRIPT needs CONFIG_R6_PROPW_TV"
+#endif
+#if defined(CONFIG_R6_IV_SCRIPT) && (!defined(CONFIG_R6_PW_SCRIPT) || !defined(CONFIG_R6_INTERVAL))
+#error "M16.1: CONFIG_R6_IV_SCRIPT needs CONFIG_R6_PW_SCRIPT and CONFIG_R6_INTERVAL"
+#endif
+#if defined(CONFIG_R6_SCRIPT) && (!defined(CONFIG_R6_MODSUP) || !defined(CONFIG_R6_IV_SCRIPT))
+#error "M16.1: CONFIG_R6_SCRIPT needs CONFIG_R6_MODSUP and CONFIG_R6_IV_SCRIPT"
+#endif
 
 #define CONFIG_TASK_STRUCT_V2_SMP
 #define CONFIG_TASK_ATTR_STRUCT_V5

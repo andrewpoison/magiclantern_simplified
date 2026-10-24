@@ -33,6 +33,9 @@ struct lua_prop
     int self_ref;
     unsigned prop_id;
     int prop_handler_ref;
+#ifdef CONFIG_R6_LUA
+    uint32_t r6_gen;                    /* M16.1 (spec m16/m161 7.4 Ue11): the script generation of L when the entry was made */
+#endif
 };
 
 struct lua_prop_msg
@@ -123,7 +126,7 @@ static void lua_prop_task(int unused)
             for(lua_prop = prop_handlers; lua_prop; lua_prop = lua_prop->next)
             {
                 if (lua_prop->prop_id != m.id) continue;
-                if (lua_prop->prop_handler_ref != LUA_NOREF && lua_r6_alive(lua_prop->L) > 0) break;
+                if (lua_prop->prop_handler_ref != LUA_NOREF && lua_r6_alive(lua_prop->L) > 0 && lua_prop->r6_gen == lua_r6_gen(lua_prop->L)) break;
                 st->prop_skip++;
             }
             if (lua_prop)
@@ -188,9 +191,39 @@ static int lua_register_prop_handler(unsigned prop_id)
     {
         if(current->prop_id == prop_id) return 0;
     }
+    /* M16.1 (spec m16/m161 7.4 R2-09): prop_add_handler would refuse it (both core tables have 256 entries, M16.0 5.4) */
+    if (r6_script_prop_state(prop_id) == 3)
+    {
+        snprintf(lua_r6_prop_why, sizeof(lua_r6_prop_why), "the core's handler tables are full");
+        return -1;
+    }
     prop_add_handler(prop_id, &lua_prophandler);
     prop_update_registration();
     return 0;
+}
+
+/* M16.1 (spec m16/m161 7.4, K7 in M16.2): a handler on an id Canon never delivers to ML (denied on the R6, or not registered by the
+ * core at start: the R6 registers once, CONFIG_UNREGISTER_PROP is missing) is added as upstream and never fires: once per script
+ * and id a NotifyBox (2 s) and a console line, counted; no Lua error (upstream scripts go on) */
+#define LUA_R6_PHINT 32
+static struct { uint32_t gen, id; } lua_r6_phint[LUA_R6_PHINT];
+static int lua_r6_phint_n = 0;
+static void lua_r6_prop_hint(lua_State * L, unsigned prop_id)
+{
+    int st = r6_script_prop_state(prop_id);
+    if (st != 0 && st != 2) return;
+    uint32_t gen = lua_r6_gen(L);
+    for (int i = 0; i < lua_r6_phint_n && i < LUA_R6_PHINT; i++)
+        if (lua_r6_phint[i].gen == gen && lua_r6_phint[i].id == prop_id) return;
+    int k = lua_r6_phint_n++ % LUA_R6_PHINT;
+    lua_r6_phint[k].gen = gen;
+    lua_r6_phint[k].id = prop_id;
+    if (st == 2) r6_lua_stat()->prop_deny++;
+    else r6_lua_stat()->prop_unreg++;
+    char t[64];
+    snprintf(t, sizeof(t), st == 2 ? "property %x: denied on R6 (K7, M16.2)" : "property %x: not registered by ML (M16.2)", prop_id);
+    printf("[%s] %s\n", lua_get_script_filename(L), t);
+    NotifyBox(2000, "%s", t);
 }
 #else
 //TODO: create a new task per script so that scripts don't block each other's prop handlers, necessary?
@@ -734,7 +767,11 @@ static int luaCB_property_index(lua_State * L)
             struct lua_prop * current;
             for(current = prop_handlers; current; current = current->next)
             {
+#ifdef CONFIG_R6_LUA
+                if(current->L == L && current->prop_id == prop_id && current->r6_gen == lua_r6_gen(L))   /* M16.1 (7.4 Ue11) */
+#else
                 if(current->L == L && current->prop_id == prop_id)
+#endif
                 {
                     if (current->prop_handler_ref != LUA_NOREF) lua_rawgeti(L, LUA_REGISTRYINDEX, current->prop_handler_ref);
                     break;
@@ -763,7 +800,11 @@ static void update_cant_unload(lua_State * L)
     struct lua_prop * current;
     for(current = prop_handlers; current; current = current->next)
     {
+#ifdef CONFIG_R6_LUA
+        if(current->L == L && current->prop_handler_ref != LUA_NOREF && current->r6_gen == lua_r6_gen(L))   /* M16.1 (7.4 Ue11) */
+#else
         if(current->L == L && current->prop_handler_ref != LUA_NOREF)
+#endif
         {
             any_active_handlers = 1;
             break;
@@ -786,7 +827,11 @@ static int luaCB_property_newindex(lua_State * L)
             struct lua_prop * current;
             for(current = prop_handlers; current; current = current->next)
             {
+#ifdef CONFIG_R6_LUA
+                if(current->L == L && current->prop_id == prop_id && current->r6_gen == lua_r6_gen(L))   /* M16.1 (7.4 Ue11): not a closed run's entry */
+#else
                 if(current->L == L && current->prop_id == prop_id)
+#endif
                 {
                     if (current->prop_handler_ref != LUA_NOREF)
                     {
@@ -826,6 +871,7 @@ static int luaCB_property_newindex(lua_State * L)
                 current->self_ref = LUA_NOREF;
                 current->L = L;
                 current->prop_id = prop_id;
+                current->r6_gen = lua_r6_gen(L);                /* M16.1 (spec m16/m161 7.4 Ue11) */
                 current->next = prop_handlers;
                 r6_barrier();
                 prop_handlers = current;
@@ -834,6 +880,7 @@ static int luaCB_property_newindex(lua_State * L)
                 current->prop_handler_ref = luaL_ref(L, LUA_REGISTRYINDEX);
                 lua_pushvalue(L, 1);
                 current->self_ref = luaL_ref(L, LUA_REGISTRYINDEX);
+                lua_r6_prop_hint(L, prop_id);   /* M16.1 (spec m16/m161 7.4) */
 #else
                 //script created a prop handler so it can't be unloaded
                 lua_set_cant_unload(L, 1, LUA_PROP_UNLOAD_MASK);

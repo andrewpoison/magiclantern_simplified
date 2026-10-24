@@ -16,6 +16,9 @@
 #include <powersave.h>
 
 #include "lua_common.h"
+#ifdef CONFIG_R6_LUA
+#include "lua_r6.h"             /* M16.1 (spec m16/m161): the core facade r6_api_abi.h */
+#endif
 
 
 struct lvinfo_item_entry
@@ -32,13 +35,22 @@ static int luaCB_lv_index(lua_State * L)
     LUA_PARAM_STRING_OPTIONAL(key, 2, "");
     /// Whether or not LV is enabled (may be running or paused).
     // @tfield bool enabled
+#ifdef CONFIG_R6_LUA
+    /* M16.1 (spec m16/m161 6.2): live view by ML's own frame clock (r6_lv_running), as the Interval checks */
+    if(!strcmp(key, "enabled")) lua_pushboolean(L, r6_lv_running());
+#else
     if(!strcmp(key, "enabled")) lua_pushboolean(L, lv || LV_PAUSED);
+#endif
     /// Whether or not LV is paused (shutter open, but sensor inactive; useful for powersaving).
     // @tfield bool paused
     else if(!strcmp(key, "paused")) lua_pushboolean(L, LV_PAUSED);
     /// Whether or not LV is running (that is, enabled and not paused).
     // @tfield bool running
+#ifdef CONFIG_R6_LUA
+    else if(!strcmp(key, "running")) lua_pushboolean(L, r6_lv_running());
+#else
     else if(!strcmp(key, "running")) lua_pushboolean(L, lv);
+#endif
     /// Get/set LiveView zoom factor (1, 5, 10).
     // @tfield bool zoom
     else if(!strcmp(key, "zoom")) lua_pushinteger(L, lv_dispsize);
@@ -62,6 +74,23 @@ static int luaCB_lv_index(lua_State * L)
     return 1;
 }
 
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 6.2): enabled is read only; zoom n (1, 5, 10) by magnify presses from the caller's task (2.7) */
+static int luaCB_lv_newindex(lua_State * L)
+{
+    LUA_PARAM_STRING_OPTIONAL(key, 2, "");
+    if (!strcmp(key, "enabled")) return luaL_error(L, "lv.enabled: read only on R6 (lv.start / lv.stop)");
+    if (!strcmp(key, "zoom"))
+    {
+        LUA_PARAM_INT(value, 3);
+        struct lua_r6_call k = { .op = LR6_GUI, .a = R6SG_ZOOM, .b = value };
+        if (lua_r6_do(L, &k)) return luaL_error(L, "lv.zoom: %s", k.why);
+        return 0;
+    }
+    lua_rawset(L, 1);
+    return 0;
+}
+#else
 static int luaCB_lv_newindex(lua_State * L)
 {
     LUA_PARAM_STRING_OPTIONAL(key, 2, "");
@@ -93,57 +122,103 @@ static int luaCB_lv_newindex(lua_State * L)
     }
     return 0;
 }
+#endif
 
 /***
  Enter LiveView.
  @function start
  */
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 6.2): SetGUIRequestMode(0), then 3 frames, at most 5 s (the facade, 2.6, 2.7) */
+static int luaCB_lv_start(lua_State * L)
+{
+    struct lua_r6_call k = { .op = LR6_GUI, .a = R6SG_LV_START };
+    if (lua_r6_do(L, &k)) return luaL_error(L, "lv.start: %s", k.why);
+    return 0;
+}
+#else
 static int luaCB_lv_start(lua_State * L)
 {
     force_liveview();
     return 0;
 }
+#endif
 
 /***
  Pause LiveView (but leave shutter open).
  @function pause
  */
+#ifdef CONFIG_R6_LUA
+static int luaCB_lv_pause(lua_State * L)
+{
+    return luaL_error(L, "lv.pause: not analysed yet (M16.2)");    /* M16.1 (spec m16/m161 7.3) */
+}
+#else
 static int luaCB_lv_pause(lua_State * L)
 {
     PauseLiveView();
     return 0;
 }
+#endif
 
 /***
  Resume LiveView.
  @function resume
  */
+#ifdef CONFIG_R6_LUA
+static int luaCB_lv_resume(lua_State * L)
+{
+    return luaL_error(L, "lv.resume: not analysed yet (M16.2)");   /* M16.1 (spec m16/m161 7.3) */
+}
+#else
 static int luaCB_lv_resume(lua_State * L)
 {
     ResumeLiveView();
     return 0;
 }
+#endif
 
 /***
  Exit LiveView.
  @function stop
  */
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 6.2): SetGUIRequestMode(0x2002), live view gone within 5 s */
+static int luaCB_lv_stop(lua_State * L)
+{
+    struct lua_r6_call k = { .op = LR6_GUI, .a = R6SG_LV_STOP };
+    if (lua_r6_do(L, &k)) return luaL_error(L, "lv.stop: %s", k.why);
+    return 0;
+}
+#else
 static int luaCB_lv_stop(lua_State * L)
 {
     close_liveview();
     return 0;
 }
+#endif
 
 /***
  Wait for N frames in LiveView.
  @tparam int num_frames
  @function wait
  */
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 2.7, SL-11): as M16.0, with the semaphore given back; a GUI task: an error */
+static int luaCB_lv_wait(lua_State * L)
+{
+    LUA_PARAM_INT(num_frames, 1);
+
+    if (r6_script_task_class(0) != R6TC_SYNC) return luaL_error(L, "lv.wait: not from a GUI task (use task.create)");
+    struct lua_r6_call k = { .op = LR6_LVWAIT, .a = num_frames };
+    int ok = lua_r6_do(L, &k) == R6API_OK;
+#else
 static int luaCB_lv_wait(lua_State * L)
 {
     LUA_PARAM_INT(num_frames, 1);
 
     int ok = wait_lv_frames(num_frames);
+#endif
 
     if (!ok)
     {
@@ -185,6 +260,9 @@ static LVINFO_UPDATE_FUNC(lua_lvinfo_update)
         give_semaphore(sem);
     }
     else
+#ifdef CONFIG_R6_LUA
+    if (lua_r6_alive(L) > 0)            /* review R2-11: a dead or closed script fails at once: no line per redraw */
+#endif
     {
         printf("[%s] semaphore timeout: lv.info.update (%dms)\n", lua_get_script_filename(L), 50);
     }

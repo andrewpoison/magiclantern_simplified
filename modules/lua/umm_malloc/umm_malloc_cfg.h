@@ -79,8 +79,22 @@ extern void * lua_r6_umm_heap(size_t size);
  * called from within umm_malloc()
  */
 
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 8.2 Ue4, SB-01, SL-12): cli alone protects one core only; lua.mo runs on both. A recursive lock across both
+ * cores (lua_r6.c: cli, then the owner word 0 = free / cpu + 1; nesting on one core, the other core spins). Nothing in the section
+ * blocks (DBG_LOG_LEVEL 0, umm_init outside) */
+extern uint32_t lua_r6_umm_enter(void);
+extern void lua_r6_umm_exit(uint32_t old);
+/* review R2-8: umm_init once across both cores (lua_r6.c) */
+extern int lua_r6_umm_once_begin(void);
+extern void lua_r6_umm_once_end(int built);
+extern void r6_barrier(void);
+#define UMM_CRITICAL_ENTRY() uint32_t old_int = lua_r6_umm_enter();
+#define UMM_CRITICAL_EXIT()  lua_r6_umm_exit(old_int);
+#else
 #define UMM_CRITICAL_ENTRY() uint32_t old_int = cli();
 #define UMM_CRITICAL_EXIT()  sei(old_int);
+#endif
 
 /*
  * -D UMM_INTEGRITY_CHECK :

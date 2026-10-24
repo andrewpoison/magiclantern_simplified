@@ -1,6 +1,8 @@
 /*
  * R6.190 M16.0 (spec m16/m160 3.5, 4, 5; CONFIG_R6_LUA): lua.mo's part of the Lua / module groundwork (lua_r6.c).
  * The core interface (task model, limits, fault hook, counters, atomics) is platform/R6.190/r6_modsup_abi.h.
+ * M16.1 (spec m16/m161 2, 5.6, 8.2, 8.3): the camera control goes only through the core facade r6_api_abi.h (pictures and Tv as
+ * jobs of r6_iv_task, R6 menu commands in GuiMainTask, E8 in the caller's task); every wait gives the script's semaphore back.
  */
 #ifndef _lua_r6_h_
 #define _lua_r6_h_
@@ -10,6 +12,7 @@
 #include <setjmp.h>
 #include "lua/lua.h"
 #include "../../platform/R6.190/r6_modsup_abi.h"
+#include "../../platform/R6.190/r6_api_abi.h"
 
 struct msg_queue;
 
@@ -70,5 +73,50 @@ int      lua_r6_fd_add(uint32_t h, uint32_t size);          /* -1: table full */
 uint32_t lua_r6_fd_h(int fd);                               /* 0: not open */
 uint32_t lua_r6_fd_size(int fd);
 uint32_t lua_r6_fd_del(int fd);                             /* the handle (0: not open) */
+
+/* ======== M16.1 (spec m16/m161 2.7, 5.6, 6, 8.2 Ue3 / Ue4 / Ue10 / Ue11, 8.3 B1) ======== */
+/* lua.c: the script of a state */
+#define LUA_R6F_REC    1                /* the script sent movie REC (6.3): r6_script_end's hint (R-4) */
+#define LUA_R6F_TVW    2                /* the script switched "Tv writes" ON (K4): r6_script_end's hint */
+#define LUA_R6F_BLOCK  4                /* menu.block(true) is set: cleared at the real end (R-4) */
+uint32_t lua_r6_gen(lua_State * L);     /* the generation of the script of L (Ue11; 0: no living script) */
+void lua_r6_flag(lua_State * L, int flag, int on);  /* LUA_R6F_* of the script of L */
+int  lua_r6_psave(lua_State * L, int d);    /* a task's powersave_prohibit (+1) / powersave_permit (-1): R-4 permits the open ones;
+                                         * review R2-10: 1 = counted (-1: only while > 0, so a task anchor after R-4 permits nothing twice) */
+void lua_r6_mark_dead(lua_State * L);   /* an unprotected Lua error in a task of the script: no more Lua code on L (Ue3) */
+/* the bits of lua_r6_once (one console line per script) */
+enum { LUA_R6_ONCE_PRIO_UP, LUA_R6_ONCE_PRIO_DOWN, LUA_R6_ONCE_EXPO, LUA_R6_ONCE_REC, LUA_R6_ONCE_DISPLAY, LUA_R6_ONCE_PSAVE };
+
+/* 2.7 (R-13): fn(arg) with the script's semaphore given back as task.yield does (only in a waiting task, R6TC_SYNC, and only if no
+ * other task of this script yields: else it stays held, F10); the Lua stack must be unchanged after it */
+int  lua_r6_wait(lua_State * L, int (*fn)(void *), void * arg);
+/* one facade call through lua_r6_wait */
+enum { LR6_SHOOT, LR6_BURST, LR6_BULB, LR6_WAITJOBS, LR6_TV, LR6_CMD, LR6_GUI, LR6_MENUSET, LR6_LVWAIT };
+struct lua_r6_call
+{
+    int op, a, b, c;                    /* the arguments of op (see lua_r6_do_fn) */
+    const char * s1, * s2, * s3;        /* menu.set: menu, entry, the string value (or NULL) */
+    uint32_t gen, seq;                  /* the script's generation (set by lua_r6_do); a picture's job number */
+    int done, r;                        /* pictures made (burst); the result */
+    char why[64];                       /* the facade's text */
+};
+int  lua_r6_do(lua_State * L, struct lua_r6_call * c);   /* returns c->r */
+int  luaopen_r6(lua_State * L);         /* the library "r6" (5.6) */
+extern int r6_iv_running(void);         /* the core (r6_interval.c): an Interval series / Motion run is running or queued */
+
+/* Ue4 (SB-01, SL-12): the umm critical section across both cores, nesting on one core (umm_malloc_cfg.h) */
+uint32_t lua_r6_umm_enter(void);
+void lua_r6_umm_exit(uint32_t old);
+
+/* Ue3: the anchor of a Lua task (lua_task.c lua_run_task): lua_r6_park and lua_r6_abort end the task through it */
+struct lua_r6_tanchor { jmp_buf jb; lua_State * L; };
+int  lua_r6_tanchor_set(struct lua_r6_tanchor * a, lua_State * L);   /* 1 = registered (16 slots by task id), 0 = table full */
+void lua_r6_tanchor_clear(struct lua_r6_tanchor * a);
+int  lua_r6_may_wait(lua_State * L);    /* review R2-3: 1 = an anchor of L in this task (main chunk, task.create task): it may give back */
+int  lua_r6_umm_once_begin(void);       /* review R2-8 (umm_malloc.c umm_init): 1 = this caller builds the heap */
+void lua_r6_umm_once_end(int built);    /* after umm_init published umm_heap (built 1) or found no block (0: a later call tries again) */
+
+/* B1 (lua/ldo.c): the task that runs this code */
+uint32_t lua_r6_tid(void);
 
 #endif

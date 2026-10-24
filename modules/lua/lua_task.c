@@ -27,6 +27,100 @@ struct lua_task_func
 static int luaCB_card_index(lua_State * L);
 static int luaCB_card_newindex(lua_State * L);
 
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 8.2 Ue3): an anchor per Lua task (16 slots by task id, lua_r6.c): lua_r6_park (a dead or closed script at a
+ * take) and lua_r6_abort (an unprotected error in this task: the script is dead) jump back here; the task then permits its
+ * powersave_prohibit, cancels its open jobs (r6_script_task_end, SL-2), frees its record and ends. Without a free slot as M16.0.
+ * M16.0 (spec m16/m160 3.5): the task was counted by luaCB_task_create (lua_set_cant_unload) before it started. */
+static void lua_run_task(struct lua_task_func * lua_task_func)
+{
+    if(lua_task_func)
+    {
+        lua_State * L = lua_task_func->L;
+        const uint32_t gen = lua_r6_gen(L);
+        struct lua_r6_tanchor a;
+        volatile int psave = 0;
+        int anchored = lua_r6_tanchor_set(&a, L);
+        if (anchored)
+        {
+            if (setjmp(a.jb))                   /* review R2-12: setjmp as the whole controlling expression (C11 7.13.1.1) */
+            {
+                if (psave && lua_r6_psave(L, -1)) powersave_permit();   /* review R2-10: not again after R-4's permits */
+                lua_r6_tanchor_clear(&a);
+                r6_script_task_end(gen);
+                printf("[Lua] task of a dead script ended.\n");
+                free(lua_task_func);
+                return;
+            }
+        }
+        struct semaphore * sem = NULL;
+        if (lua_take_semaphore(L, 0, &sem) == 0)
+        {
+            ASSERT(sem);
+            if (lua_get_cant_yield(L) == -1)
+            {
+                /* main task was unloaded? continuing would be use after free */
+                fprintf(stderr, "[%s] will not start new tasks.\n", lua_get_script_filename(L));
+                goto skip;
+            }
+
+            if(lua_rawgeti(L, LUA_REGISTRYINDEX, lua_task_func->function_ref) == LUA_TFUNCTION)
+            {
+                if (lua_task_func->disable_psave)
+                {
+                    powersave_prohibit();
+                    psave = 1;
+                    lua_r6_psave(L, 1);
+                }
+
+                printf("[%s] task starting.\n", lua_get_script_filename(L));
+
+                if(docall(L, 0, 0))
+                {
+                    fprintf(stderr, "[%s] task error:\n%s\n", lua_get_script_filename(L), lua_tostring(L, -1));
+                    lua_save_last_error(L);
+#ifdef CONFIG_R6_LUA
+                    lua_pop(L, 1);          /* M16.1: the message off the shared stack (a waiting task of this script checks its top) */
+#endif
+                }
+                luaL_unref(L, LUA_REGISTRYINDEX, lua_task_func->function_ref);
+
+                printf("[%s] task exiting.\n", lua_get_script_filename(L));
+
+                if (lua_task_func->disable_psave)
+                {
+                    powersave_permit();
+                    psave = 0;
+                    lua_r6_psave(L, -1);
+                }
+
+                r6_script_task_end(gen);       /* SL-2: this task's own open jobs (a picture it gave up at a backstop) */
+
+                /* If all tasks started by the script are finished
+                 * _before_ the main task ends, the script can be unloaded.
+                 * Note: lua_set_cant_unload keeps a counter of tasks
+                 * (number of calls LUA_TASK_UNLOAD_MASK)
+                 */
+                lua_set_cant_unload(L, 0, LUA_TASK_UNLOAD_MASK);
+            }
+            else
+            {
+                /* should be covered in luaCB_task_create */
+                ASSERT(0);
+            }
+
+        skip:
+            give_semaphore(sem);
+        }
+        else
+        {
+            printf("[Lua] semaphore error: run task\n");
+        }
+        if (anchored) lua_r6_tanchor_clear(&a);
+        free(lua_task_func);
+    }
+}
+#else
 static void lua_run_task(struct lua_task_func * lua_task_func)
 {
     if(lua_task_func)
@@ -45,11 +139,9 @@ static void lua_run_task(struct lua_task_func * lua_task_func)
             
             if(lua_rawgeti(L, LUA_REGISTRYINDEX, lua_task_func->function_ref) == LUA_TFUNCTION)
             {
-#ifndef CONFIG_R6_LUA
                 /* script created a task;
                  * it can't be unloaded while this task is running */
                 lua_set_cant_unload(L, 1, LUA_TASK_UNLOAD_MASK);
-#endif
 
                 if (lua_task_func->disable_psave)
                 {
@@ -96,6 +188,8 @@ static void lua_run_task(struct lua_task_func * lua_task_func)
     }
 }
 
+#endif
+
 /***
  Creates a new task. It will begin executing when you return or call task.yield().
  
@@ -126,7 +220,7 @@ static int luaCB_task_create(lua_State * L)
     if (priority < pmin || priority > pmax)
     {
         int up = priority < pmin;
-        if (lua_r6_once(L, up ? 0 : 1))
+        if (lua_r6_once(L, up ? LUA_R6_ONCE_PRIO_UP : LUA_R6_ONCE_PRIO_DOWN))
         {
             printf("[%s] task.create: priority 0x%x %s to 0x%x\n", lua_get_script_filename(L), priority, up ? "raised" : "lowered",
                 up ? pmin : pmax);
@@ -142,6 +236,10 @@ static int luaCB_task_create(lua_State * L)
         stack = s < smin ? (int) smin : s > smax ? (int) smax : (int) s;
         if (stack != stack_size) st->stack_clamped++;
     }
+
+    /* M16.1 (spec m16/m161 7.3): the powersave lock is a no-op on the R6 (PROP_ICU_AUTO_POWEROFF is not written, M16.2) */
+    if (disable_psave && lua_r6_once(L, LUA_R6_ONCE_PSAVE))
+        printf("[%s] task.create: disable_powersave has no effect on R6 (M16.2)\n", lua_get_script_filename(L));
 
     struct lua_task_func * func = malloc(sizeof(struct lua_task_func));
     if(!func) return luaL_error(L, "malloc error\n");
@@ -205,6 +303,11 @@ static int luaCB_task_create(lua_State * L)
 static int luaCB_task_yield(lua_State * L)
 {
     LUA_PARAM_INT(duration, 1);
+#ifdef CONFIG_R6_LUA
+    /* review R2-3: only where an anchor ends the wait (the main chunk, a task.create task); a callback (GuiMainTask, menu_task,
+     * clock_task, lua_prop_task, shoot_task) would block its task and, if the script died meanwhile, park it for good */
+    if (!lua_r6_may_wait(L)) return luaL_error(L, "task.yield: only in the main chunk or a task.create task");
+#endif
 
     /* hack: figure out whether we might be interrupting
      * somebody else who called task.yield() */

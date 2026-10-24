@@ -67,7 +67,11 @@ int get_interval_time()
  * its start, r6_interval.c), so nothing changes while one runs */
 void set_interval_time(int seconds)
 {
+#ifdef CONFIG_R6_SCRIPT
+    if (r6_iv_running() || _r6iv_scr_busy())   /* M16.1 (spec m16/m161 2.6): also while a script job is open */
+#else
     if (r6_iv_running())
+#endif
     {
         printf("[R6] set_interval_time(%d): Interval runs, unchanged\n", seconds);
         return;
@@ -122,6 +126,8 @@ int take_screenshot(char * filename, uint32_t mode)
     return 0;
 }
 
+#endif /* CONFIG_R6_MODSUP (the atomics below: also for M16.1's script slot, spec m16/m161 2.5) */
+#if defined(CONFIG_R6_MODSUP) || defined(CONFIG_R6_IV_SCRIPT)
 /* ======== 4.9: atomics, CPU ======== */
 
 /* noinline (both): ldrex / strex / dmb stay in these two functions (stage gate G5) */
@@ -139,6 +145,8 @@ int r6_cpu_id(void)
 {
     return get_cpu_id();                                   /* MPIDR & 3 (src/arm-mcr.h) */
 }
+#endif
+#ifdef CONFIG_R6_MODSUP
 
 static void r6tk_inc(volatile uint32_t * p)
 {
@@ -158,10 +166,18 @@ static struct r6tk_end r6tk_endr[R6TK_RING];        /* trampoline ends (a slot p
 static volatile uint32_t r6tk_end_n = 0;
 static volatile uint32_t r6tk_cnt[6];               /* created, MEM, UNK, BUSY, ARG, ended */
 static uint16_t r6tk_seq = 0;                       /* running number (under the lock) */
+#ifdef CONFIG_R6_SCRIPT
+static volatile uint32_t r6tk_odd = 0;              /* M16.1 (R2-06): odd returns of Canon's task_create mapped to R6TK_REFUSED */
+#endif
 static int r6tk_nb_t = 0, r6tk_nb_any = 0;          /* NotifyBox rate: at most one per 2 s */
 
 /* a trampoline slot: tid = the task (set at its start), so a task maps to its decision (seq) */
-struct r6tk_tr { void (*entry)(void *); void * arg; uint32_t stack; volatile uint32_t tid; uint16_t seq; volatile uint8_t used; char name[16]; };
+struct r6tk_tr { void (*entry)(void *); void * arg; uint32_t stack; volatile uint32_t tid; uint16_t seq; volatile uint8_t used; char name[16];
+#ifdef CONFIG_R6_SCRIPT
+#define R6TK_TOP_SLACK 512                  /* M16.1 (Ue9): the task top lies at most this above the trampoline sp */
+    volatile uint32_t sp_top;            /* M16.1 (Ue9): sp at the trampoline's entry; the stack lies below it (r6_stack_left) */
+#endif
+};
 static struct r6tk_tr r6tk_trs[R6TK_TRAMP];
 
 int __attribute__((noinline)) r6tk_lock(int ms)
@@ -195,6 +211,12 @@ static void r6tk_tramp(void * p)
     struct r6tk_end e;
     void (*entry)(void *) = r->entry;
     void * arg = r->arg;
+#ifdef CONFIG_R6_SCRIPT
+    uint32_t sp0;
+    __asm__ volatile ("mov %0, sp" : "=r" (sp0));
+    r->sp_top = sp0;                     /* M16.1 (Ue9): before tid, so a slot with tid has it */
+    r6_barrier();
+#endif
     r->tid = get_current_task_id();
     e.t0 = get_ms_clock();
     e.stack = r->stack;
@@ -213,6 +235,9 @@ static void r6tk_tramp(void * p)
     do k = r6tk_end_n; while (!r6_cas32(&r6tk_end_n, k, k + 1));
     r6tk_endr[k % R6TK_RING] = e;
     r6tk_inc(&r6tk_cnt[5]);
+#ifdef CONFIG_R6_SCRIPT
+    r->sp_top = 0;
+#endif
     r->tid = 0;
     r6_barrier();
     r->used = 0;
@@ -283,6 +308,10 @@ uint32_t __attribute__((noinline)) r6_task_try_create_ex(const char * name, uint
             /* the only task_create of the wrapper (one call site) */
             ret = task_create(name, prio, stack, r ? (void *) r6tk_tramp : entry, r ? (void *) r : arg);
             if ((ret & 1) && r) r->used = 0;          /* not created (Canon would assert instead) */
+#ifdef CONFIG_R6_SCRIPT
+            /* M16.1 (spec m16/m161 8.3, R2-06): any odd return of Canon's task_create is "not created": R6TK_REFUSED for every caller */
+            if ((ret & 1) && ret != R6TK_REFUSED) { printf("[R6] task %s: task_create returned 0x%x\n", d.name, (int) ret); ret = R6TK_REFUSED; r6tk_odd++; }
+#endif
         }
     }
     else
@@ -388,12 +417,38 @@ int __attribute__((noinline)) r6_stack_left(void)
 {
     uint32_t sp;
     __asm__ volatile ("mov %0, sp" : "=r" (sp));
+#ifdef CONFIG_R6_SCRIPT
+    /* M16.1 (spec m16/m161 8.2 Ue9): a task of the wrapper first: the trampoline slot whose stack holds sp (its top at most
+     * R6TK_TOP_SLACK above the sp the trampoline saw: the rest is counted short, never long); then the [0x1028] way */
+    for (int i = 0; i < R6TK_TRAMP; i++)
+    {
+        const struct r6tk_tr * r = &r6tk_trs[i];
+        uint32_t top = r->sp_top, n = r->stack ? r->stack : R6TK_DEFSTACK;
+        if (!r->used || !r->tid || !top || n <= R6TK_TOP_SLACK) continue;
+        uint32_t lo = top + R6TK_TOP_SLACK - n;
+        if (sp >= lo && sp <= top) return sp - lo;
+    }
+#endif
     struct task * t = current_task;                   /* data stub 0x1028, read only */
     if (!r6_fy_ram_ok((uint32_t) t, 0x24)) return -1; /* the record up to stackSize */
     uint32_t lo = t->stackStartAddr, n = t->stackSize;
     if (sp < lo || sp > lo + n) return -1;            /* not this task's stack (also current_task of the other core) */
     return sp - lo;
 }
+
+#ifdef CONFIG_R6_SCRIPT
+/* M16.1 (spec m16/m161 11, MK8): the living tasks of the wrapper (tskmon's high-water marks in the LVP log); i = slot; 1 = in use */
+int _r6tk_live(int i, uint32_t * tid, uint32_t * stack, char * name)
+{
+    if (i < 0 || i >= R6TK_TRAMP || !r6tk_trs[i].used || !r6tk_trs[i].tid) return 0;
+    *tid = r6tk_trs[i].tid;
+    *stack = r6tk_trs[i].stack;
+    memcpy(name, r6tk_trs[i].name, 16);
+    name[15] = 0;
+    return 1;
+}
+uint32_t _r6tk_odd(void) { return r6tk_odd; }
+#endif
 
 static void r6_modsup_init()
 {

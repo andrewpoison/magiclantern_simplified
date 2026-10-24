@@ -20,4 +20,10 @@ int lp_sys_query(struct r6_sysq * q);
  * r6_task_try_create); without exactly one such line no module is linked. Kept here, so module.c's own data stays as it was. */
 extern int r6_alias_seen, r6_alias_ok;
 
+#ifdef CONFIG_R6_SCRIPT
+/* M16.1 (spec m16/m161 11): the living wrapper tasks (LVP tsk.hw), the odd task_create returns (R2-06); names _: not exported */
+int _r6tk_live(int i, uint32_t * tid, uint32_t * stack, char * name);
+uint32_t _r6tk_odd(void);
+#endif
+
 #endif

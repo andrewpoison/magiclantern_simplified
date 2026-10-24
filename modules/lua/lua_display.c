@@ -16,27 +16,47 @@
 #include <powersave.h>
 
 #include "lua_common.h"
+#ifdef CONFIG_R6_LUA
+#include "lua_r6.h"             /* M16.1 (spec m16/m161): the core facade r6_api_abi.h */
+#endif
 
 
 /***
  Turn the display on
  @function on
  */
+#ifdef CONFIG_R6_LUA
+/* M16.1 (spec m16/m161 6.6): a no-op until M16.2, one console line per script */
+static int luaCB_display_on(lua_State * L)
+{
+    if (lua_r6_once(L, LUA_R6_ONCE_DISPLAY)) printf("[%s] display.on / display.off: no-op on R6 (M16.2)\n", lua_get_script_filename(L));
+    return 0;
+}
+#else
 static int luaCB_display_on(lua_State * L)
 {
     display_on();
     return 0;
 }
+#endif
 
 /***
  Turn the display off
  @function off
  */
+#ifdef CONFIG_R6_LUA
+static int luaCB_display_off(lua_State * L)
+{
+    if (lua_r6_once(L, LUA_R6_ONCE_DISPLAY)) printf("[%s] display.on / display.off: no-op on R6 (M16.2)\n", lua_get_script_filename(L));
+    return 0;
+}
+#else
 static int luaCB_display_off(lua_State * L)
 {
     display_off();
     return 0;
 }
+#endif
 
 /***
  Take a screenshot

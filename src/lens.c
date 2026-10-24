@@ -904,9 +904,20 @@ void lens_wait_readytotakepic(int wait)
     if (NOT_RECORDING) info_led_off();
 }
 
+#ifdef CONFIG_R6_SCRIPT
+/* R6.190 M16.1: volatile because the bolted mlu_lock_mirror_if_needed below no longer reads it: GCC would drop the variable and
+ * its store in PROP_LAST_JOB_STATE (code and data of lens.o stay as before, G4b) */
+static volatile int mirror_locked = 0;
+#else
 static int mirror_locked = 0;
+#endif
 int mlu_lock_mirror_if_needed() // called by lens_take_picture; returns 0 if success, 1 if camera took a picture instead of locking mirror
 {
+#ifdef CONFIG_R6_SCRIPT
+    /* R6.190 M16.1 (spec m16/m161 3.1, A11, SB-13): the second bolt, as the branch without mirror lock-up; never call("Release") */
+    printf("[R6] no Release (M8.0b); use take_a_pic\n");
+    return 0;
+#endif
     #ifdef CONFIG_5DC
     if (get_mlu()) set_mlu(0); // can't trigger shutter with MLU active, so just turn it off
     return 0;
@@ -1043,6 +1054,12 @@ lens_take_picture(
     int should_af
 )
 {
+#ifdef CONFIG_R6_SCRIPT
+    /* R6.190 M16.1 (spec m16/m161 3.1, A11, SB-13): the second bolt, before ml_taking_pic = 1: no call("Release") (M8.0b hang);
+     * every picture goes through take_a_pic to r6_iv_task */
+    printf("[R6] no Release (M8.0b); use take_a_pic\n");
+    return -1;
+#endif
     if (ml_taking_pic)
     {
         return -1;

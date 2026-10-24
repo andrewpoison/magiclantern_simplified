@@ -1195,15 +1195,37 @@ static unsigned short int umm_assimilate_down( unsigned short int c, unsigned sh
 /* ------------------------------------------------------------------------- */
 
 void umm_init( void ) {
-  /* init heap pointer and size, and memset it to 0 */
-  umm_heap = (umm_block *)UMM_MALLOC_CFG__HEAP_ADDR;
 #ifdef CONFIG_R6_LUA
-  /* M16.0 (spec m16/m160 5.2): no heap block: no memset(NULL); the callers return NULL, a later call tries again */
-  if (umm_heap == NULL) {
+  /* M16.1 (review R2-8): once across both cores (lua_r6.c: 0 -> 1 building -> 2 built, r6_cas32): the blank heap is built through a
+   * local pointer and published (umm_heap) only after a barrier; a caller that loses the race finds umm_heap NULL (its call returns
+   * NULL). M16.0 (spec m16/m160 5.2): no heap block: no memset(NULL), umm_heap stays NULL, a later call tries again */
+  if (!lua_r6_umm_once_begin()) return;
+  umm_block * h = (umm_block *)UMM_MALLOC_CFG__HEAP_ADDR;
+  if (h == NULL) {
     umm_numblocks = 0;
+    lua_r6_umm_once_end(0);
     return;
   }
-#endif
+  memset(h, 0x00, UMM_MALLOC_CFG__HEAP_SIZE);
+  {
+    /* the blank heap structure below, on h: block 0 -> 1, block 1 the one free block up to the last, the last ends the chain */
+    const unsigned short int block_last = UMM_MALLOC_CFG__HEAP_SIZE / sizeof(umm_block) - 1;
+    h[0].header.used.next = 1;
+    h[0].body.free.next = 1;
+    h[1].header.used.next = block_last | UMM_FREELIST_MASK;
+    h[1].body.free.next = 0;
+    h[1].header.used.prev = 0;
+    h[1].body.free.prev = 0;
+    h[block_last].header.used.next = 0;
+    h[block_last].header.used.prev = 1;
+  }
+  umm_numblocks = (UMM_MALLOC_CFG__HEAP_SIZE / sizeof(umm_block));
+  r6_barrier();                      /* the blank heap (and umm_numblocks) before the pointer */
+  umm_heap = h;
+  lua_r6_umm_once_end(1);
+#else
+  /* init heap pointer and size, and memset it to 0 */
+  umm_heap = (umm_block *)UMM_MALLOC_CFG__HEAP_ADDR;
   umm_numblocks = (UMM_MALLOC_CFG__HEAP_SIZE / sizeof(umm_block));
   memset(umm_heap, 0x00, UMM_MALLOC_CFG__HEAP_SIZE);
 
@@ -1254,6 +1276,7 @@ void umm_init( void ) {
     UMM_NBLOCK(block_last) = 0;
     UMM_PBLOCK(block_last) = block_1th;
   }
+#endif
 }
 
 /* ------------------------------------------------------------------------ */

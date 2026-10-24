@@ -450,6 +450,26 @@ static int null_event_handler(struct event * event) { return 1; }
 int handle_module_keys(struct event * event) __attribute__((weak,alias("null_event_handler")));
 int handle_flexinfo_keys(struct event * event) __attribute__((weak,alias("null_event_handler")));
 
+#ifdef CONFIG_R6_SCRIPT
+/* R6.190 M16.1 (spec m16/m161 2.3, A17, MB-3, MB-9): the origin mark of the event GuiMainTask handles: R6GO_FAKE for FAKE_BTN
+ * (fake_simple_button: key.press, menu.open, ML's own translations), else R6GO_KEY (a real press; on the R6 never FAKE, V2a-1);
+ * R6GO_SCRIPT while the facade runs an R6 command. The previous mark comes back after the event. MLEV_R6_SCRIPT runs the posted GUI
+ * job of r6_api.c and is consumed (an ML event never reaches Canon). The chain below is unchanged (one exit through this wrapper) */
+#include "r6_api.h"
+static volatile int __attribute__((section(".bss"))) r6_gui_org_v = R6GO_NONE;   /* own anchor block: the old offsets stay (G4b) */
+int _r6_gui_org(void) { return r6_gui_org_v; }
+int _r6_gui_org_set(int org) { int o = r6_gui_org_v; r6_gui_org_v = org; return o; }
+int _r6_hcebf(struct event * event);
+int handle_common_events_by_feature(struct event * event)
+{
+    int org = _r6_gui_org_set(IS_FAKE(event) ? R6GO_FAKE : R6GO_KEY);
+    int r = _r6api_gui_event(event) ? 0 : _r6_hcebf(event);
+    _r6_gui_org_set(org);
+    return r;
+}
+#define handle_common_events_by_feature _r6_hcebf
+#endif
+
 int handle_common_events_by_feature(struct event * event)
 {
     // common to most cameras
@@ -505,6 +525,9 @@ int handle_common_events_by_feature(struct event * event)
     if (handle_zoom_overlay(event) == 0) return 0;
     #endif
 
+#ifdef CONFIG_R6_SCRIPT
+    uint32_t r6_sel0 = _r6_menu_sel_seq();   /* M16.1 (MB-3): a Lua keypress handler may move the cursor in here */
+#endif
     if (handle_module_keys(event) == 0) return 0;
     if (handle_flexinfo_keys(event) == 0) return 0;
 
@@ -525,6 +548,9 @@ int handle_common_events_by_feature(struct event * event)
     #endif
 
     if (handle_ml_menu_erase(event) == 0) return 0;
+#ifdef CONFIG_R6_SCRIPT
+    if (_r6_menu_sel_seq() != r6_sel0) _r6_gui_org_set(R6GO_FAKE);   /* M16.1 (MB-3): a script moved the cursor: FAKE for the rest */
+#endif
     if (handle_ml_menu_keys(event) == 0) return 0;
     
     #ifdef CONFIG_DIGIC_POKE
